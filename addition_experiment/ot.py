@@ -13,6 +13,10 @@ from . import _env  # noqa: F401
 
 from pyvene import VanillaIntervention
 from scipy.spatial.distance import cdist
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - fallback only when tqdm is unavailable
+    tqdm = None
 
 from variable_width_mlp import VariableWidthMLPForClassification, logits_from_output
 
@@ -23,6 +27,14 @@ from .constants import (
 from .metrics import metrics_from_logits
 from .pair_bank import PairBank
 from .pyvene_utils import CanonicalSite, build_intervenable, enumerate_canonical_sites, run_intervenable_logits
+
+
+def _format_hparam_value(value: float, decimals: int = 6) -> str:
+    """Format sweep hyperparameters with compact but stable decimal output."""
+    text = f"{float(value):.{int(decimals)}f}".rstrip("0")
+    if text.endswith("."):
+        return text + "0"
+    return text
 
 
 @dataclass(frozen=True)
@@ -45,6 +57,7 @@ class OTConfig:
     top_k_values: tuple[int, ...] | None = None
     lambda_values: tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
     selection_verbose: bool = True
+    calibration_progress_interval: int = 250
 
 
 def collect_base_logits(
@@ -428,7 +441,7 @@ def evaluate_soft_transport_interventions(
                 "variable": variable,
                 "split": evaluation_bank.split,
                 "seed": evaluation_bank.seed,
-                "site_label": f"soft:k{int(top_k)},l{float(strength):g}",
+                "site_label": f"soft:k{int(top_k)},l{_format_hparam_value(float(strength))}",
                 "top_k": int(top_k),
                 "lambda": float(strength),
                 "top_site_label": top_site["site_label"] if top_site is not None else None,
@@ -446,7 +459,7 @@ def evaluate_soft_transport_interventions(
 
 
 def summarize_candidate_records(records: list[dict[str, object]]) -> dict[str, float]:
-    """Compute macro metrics for one calibration candidate."""
+    """Compute average metrics for one calibration candidate."""
     if not records:
         return {"exact_acc": 0.0, "mean_shared_digits": 0.0}
     exact_acc = sum(float(record["exact_acc"]) for record in records) / len(records)
@@ -489,11 +502,14 @@ def select_transport_hyperparameters(
 ) -> dict[str, object]:
     """Select the best (top-k, lambda) pair independently for each variable."""
     top_k_values = resolve_top_k_values(config.top_k_values, len(sites))
+    candidates_per_variable = len(top_k_values) * len(config.lambda_values)
+    total_candidates = len(target_vars) * candidates_per_variable
 
     if config.selection_verbose:
         print(
             f"{method_name.upper()} calibration "
-            f"| candidates_per_variable={len(top_k_values) * len(config.lambda_values)} "
+            f"| candidates_per_variable={candidates_per_variable} "
+            f"| total_candidates={total_candidates} "
             f"| top_k_values={top_k_values} "
             f"| lambdas={tuple(float(value) for value in config.lambda_values)}"
         )
@@ -509,38 +525,53 @@ def select_transport_hyperparameters(
         best_candidate = None
         variable_candidates = []
         top_site_label = rankings[variable][0]["site_label"] if rankings[variable] else "n/a"
-        for top_k in top_k_values:
-            truncated_transport = truncate_transport_rows(
-                variable_transport,
-                top_k,
-                renormalize=True,
+        progress_bar = None
+        if config.selection_verbose and tqdm is not None:
+            progress_bar = tqdm(
+                total=candidates_per_variable,
+                desc=f"{method_name.upper()} [{variable}]",
+                unit="candidate",
+                dynamic_ncols=True,
+                leave=True,
             )
-            for strength in config.lambda_values:
-                calibration_results, _ = evaluate_soft_transport_interventions(
-                    method_name=method_name,
-                    model=model,
-                    evaluation_bank=calibration_bank,
-                    sites=sites,
-                    transport_weights=truncated_transport,
-                    rankings=variable_rankings,
-                    target_vars=(variable,),
-                    top_k_by_variable={variable: int(top_k)},
-                    lambda_by_variable={variable: float(strength)},
-                    batch_size=batch_size,
-                    device=device,
+        try:
+            for top_k in top_k_values:
+                truncated_transport = truncate_transport_rows(
+                    variable_transport,
+                    top_k,
+                    renormalize=True,
                 )
-                calibration_record = calibration_results[0]
-                candidate = {
-                    "variable": variable,
-                    "top_k": int(top_k),
-                    "lambda": float(strength),
-                    "exact_acc": float(calibration_record["exact_acc"]),
-                    "mean_shared_digits": float(calibration_record["mean_shared_digits"]),
-                    "result": calibration_record,
-                }
-                variable_candidates.append(candidate)
-                if choose_better_variable_candidate(candidate, best_candidate):
-                    best_candidate = candidate
+                for strength in config.lambda_values:
+                    calibration_results, _ = evaluate_soft_transport_interventions(
+                        method_name=method_name,
+                        model=model,
+                        evaluation_bank=calibration_bank,
+                        sites=sites,
+                        transport_weights=truncated_transport,
+                        rankings=variable_rankings,
+                        target_vars=(variable,),
+                        top_k_by_variable={variable: int(top_k)},
+                        lambda_by_variable={variable: float(strength)},
+                        batch_size=batch_size,
+                        device=device,
+                    )
+                    calibration_record = calibration_results[0]
+                    candidate = {
+                        "variable": variable,
+                        "top_k": int(top_k),
+                        "lambda": float(strength),
+                        "exact_acc": float(calibration_record["exact_acc"]),
+                        "mean_shared_digits": float(calibration_record["mean_shared_digits"]),
+                        "result": calibration_record,
+                    }
+                    variable_candidates.append(candidate)
+                    if choose_better_variable_candidate(candidate, best_candidate):
+                        best_candidate = candidate
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
 
         if best_candidate is None:
             raise RuntimeError(f"Failed to select transport hyperparameters for {method_name}:{variable}")
@@ -552,22 +583,22 @@ def select_transport_hyperparameters(
 
         if config.selection_verbose:
             print(
-                f"{method_name.upper()} [{variable}] selected "
+                f"{method_name.upper()} [{variable}] calibration best "
                 f"| top_k={int(best_candidate['top_k'])} "
-                f"| lambda={float(best_candidate['lambda']):g} "
+                f"| lambda={_format_hparam_value(float(best_candidate['lambda']))} "
                 f"| top_site={top_site_label} "
                 f"| exact={float(best_candidate['exact_acc']):.4f} "
                 f"| shared={float(best_candidate['mean_shared_digits']):.4f}"
             )
 
-    macro_metrics = summarize_candidate_records(selected_results)
+    average_metrics = summarize_candidate_records(selected_results)
     return {
         "selected_top_k_by_variable": selected_top_k_by_variable,
         "selected_lambda_by_variable": selected_lambda_by_variable,
         "results": selected_results,
         "search_records": search_records,
-        "macro_calibration_exact_acc": macro_metrics["exact_acc"],
-        "macro_calibration_mean_shared_digits": macro_metrics["mean_shared_digits"],
+        "average_calibration_exact_acc": average_metrics["exact_acc"],
+        "average_calibration_mean_shared_digits": average_metrics["mean_shared_digits"],
     }
 
 
@@ -582,6 +613,15 @@ def run_alignment_pipeline(
     """Run OT, GW, or FGW end to end on shared pair-bank splits."""
     device = torch.device(device)
     sites = enumerate_canonical_sites(model, resolution=config.resolution)
+    if config.selection_verbose:
+        print(
+            f"{str(config.method).upper()} training "
+            f"| fit_examples={fit_bank.size} "
+            f"| calibration_examples={calibration_bank.size} "
+            f"| holdout_examples={holdout_bank.size} "
+            f"| sites={len(sites)} "
+            f"| target_vars={len(config.target_vars)}"
+        )
     base_logits = collect_base_logits(model, fit_bank.base_inputs, config.batch_size, device)
     variable_signatures = build_variable_signatures(
         fit_bank,
@@ -640,6 +680,12 @@ def run_alignment_pipeline(
     else:
         raise ValueError(f"Unsupported alignment method {config.method}")
 
+    if config.selection_verbose:
+        print(
+            f"{str(config.method).upper()} training complete "
+            f"| transport_shape={tuple(int(dim) for dim in transport.shape)}"
+        )
+
     rankings = build_rankings(transport, sites, config.target_vars, config.ranking_k)
     normalized_transport = normalize_transport_rows(transport)
     selection_payload = select_transport_hyperparameters(
@@ -667,23 +713,27 @@ def run_alignment_pipeline(
         [selected_top_k_by_variable[variable] for variable in config.target_vars],
         renormalize=True,
     )
-    results, layer_masks_by_variable = evaluate_soft_transport_interventions(
-        method_name=config.method,
-        model=model,
-        evaluation_bank=holdout_bank,
-        sites=sites,
-        transport_weights=selected_transport,
-        rankings=rankings,
-        target_vars=config.target_vars,
-        top_k_by_variable=selected_top_k_by_variable,
-        lambda_by_variable=selected_lambda_by_variable,
-        batch_size=config.batch_size,
-        device=device,
-    )
     calibration_results_by_variable = {
         str(record["variable"]): record for record in selection_payload["results"]
     }
-    for record in results:
+    results = []
+    layer_masks_by_variable = {}
+    for variable_index, variable in enumerate(config.target_vars):
+        variable_results, variable_layer_masks = evaluate_soft_transport_interventions(
+            method_name=config.method,
+            model=model,
+            evaluation_bank=holdout_bank,
+            sites=sites,
+            transport_weights=selected_transport[variable_index : variable_index + 1],
+            rankings={str(variable): rankings[str(variable)]},
+            target_vars=(str(variable),),
+            top_k_by_variable={str(variable): selected_top_k_by_variable[str(variable)]},
+            lambda_by_variable={str(variable): selected_lambda_by_variable[str(variable)]},
+            batch_size=config.batch_size,
+            device=device,
+        )
+        layer_masks_by_variable.update(variable_layer_masks)
+        record = variable_results[0]
         calibration_record = calibration_results_by_variable.get(str(record["variable"]), {})
         record["selection_exact_acc"] = float(calibration_record.get("exact_acc", 0.0))
         record["selection_mean_shared_digits"] = float(
@@ -693,6 +743,15 @@ def run_alignment_pipeline(
         record["calibration_mean_shared_digits"] = float(
             calibration_record.get("mean_shared_digits", 0.0)
         )
+        if config.selection_verbose:
+            print(
+                f"{str(config.method).upper()} [{record['variable']}] selected {record['site_label']} "
+                f"| calibration_exact={float(record['calibration_exact_acc']):.4f} "
+                f"| calibration_shared={float(record['calibration_mean_shared_digits']):.4f} "
+                f"| holdout_exact={float(record['exact_acc']):.4f} "
+                f"| holdout_shared={float(record['mean_shared_digits']):.4f}"
+            )
+        results.append(record)
 
     return {
         "method": config.method,
@@ -711,8 +770,8 @@ def run_alignment_pipeline(
         "selected_hyperparameters": {
             "top_k_by_variable": selected_top_k_by_variable,
             "lambda_by_variable": selected_lambda_by_variable,
-            "macro_calibration_exact_acc": float(selection_payload["macro_calibration_exact_acc"]),
-            "macro_calibration_mean_shared_digits": float(selection_payload["macro_calibration_mean_shared_digits"]),
+            "average_calibration_exact_acc": float(selection_payload["average_calibration_exact_acc"]),
+            "average_calibration_mean_shared_digits": float(selection_payload["average_calibration_mean_shared_digits"]),
         },
         "calibration_sweep": selection_payload["search_records"],
         "layer_masks_by_variable": {

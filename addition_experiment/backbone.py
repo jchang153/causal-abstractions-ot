@@ -160,6 +160,8 @@ def train_backbone(
 
     loss_history = []
     validation_history = []
+    perfect_validation_streak = 0
+    stopping_reason = None
     if train_config.verbose:
         print(
             "Backbone training "
@@ -169,8 +171,8 @@ def train_backbone(
             f"| hidden_dims={tuple(train_config.hidden_dims)} "
             f"| epochs={train_config.train_epochs}"
         )
-    model.train()
     for epoch in range(train_config.train_epochs):
+        model.train()
         running_loss = 0.0
         for batch_inputs, batch_labels in loader:
             batch_inputs = batch_inputs.to(device)
@@ -193,12 +195,25 @@ def train_backbone(
             device=device,
         )
         validation_history.append(epoch_validation_metrics)
+        if float(epoch_validation_metrics["exact_acc"]) >= 1.0:
+            perfect_validation_streak += 1
+        else:
+            perfect_validation_streak = 0
         if train_config.verbose:
             print(
                 f"Epoch {epoch + 1}/{train_config.train_epochs} "
                 f"| train_loss={epoch_loss:.4f} "
                 f"| val_exact_acc={epoch_validation_metrics['exact_acc']:.4f}"
             )
+        if perfect_validation_streak >= 5:
+            stopping_reason = (
+                "perfect_validation_exact_acc "
+                ">= 1.0000 "
+                "for 5 epochs"
+            )
+            if train_config.verbose:
+                print(f"Stopping early | reason={stopping_reason}")
+            break
 
     factual_metrics = validation_history[-1] if validation_history else evaluate_factual_model(
         model=model,
@@ -218,6 +233,9 @@ def train_backbone(
         "train_loss_history": loss_history,
         "validation_history": validation_history,
         "factual_validation_metrics": factual_metrics,
+        "epochs_ran": len(loss_history),
+        "stopped_early": stopping_reason is not None,
+        "stopping_reason": stopping_reason,
         "checkpoint_path": str(checkpoint_path),
     }
 

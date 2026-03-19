@@ -75,7 +75,7 @@ def save_comparison_plots(
     fig.savefig(shared_path, dpi=200)
     plt.close(fig)
 
-    summary_path = plot_dir / "macro_summary.png"
+    summary_path = plot_dir / "average_summary.png"
     fig, ax = plt.subplots(figsize=(8, 4.5), constrained_layout=True)
     summary_methods = [str(record["method"]).upper() for record in summary]
     summary_exact = [float(record["exact_acc"]) for record in summary]
@@ -84,7 +84,7 @@ def save_comparison_plots(
     ax.bar(summary_x - 0.18, summary_exact, width=0.36, label="Exact")
     ax.bar(summary_x + 0.18, summary_shared, width=0.36, label="Shared digits")
     ax.set_xticks(summary_x, summary_methods)
-    ax.set_title("Macro summary across abstract variables")
+    ax.set_title("Average summary across abstract variables")
     ax.legend(loc="best")
     fig.savefig(summary_path, dpi=200)
     plt.close(fig)
@@ -93,7 +93,7 @@ def save_comparison_plots(
         "plot_dir": str(plot_dir),
         "exact_accuracy": str(exact_path),
         "shared_digits": str(shared_path),
-        "macro_summary": str(summary_path),
+        "average_summary": str(summary_path),
     }
 
     transport_methods = []

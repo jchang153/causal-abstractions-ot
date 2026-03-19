@@ -2,6 +2,7 @@ deprecated/
 __pycache__/
 addition_experiment/__pycache__/
 tests/__pycache__/
+models/
 results/
 .DS_Store
 

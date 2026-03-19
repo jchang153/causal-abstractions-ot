@@ -90,7 +90,7 @@ def _build_summary_lines(
     for method in config.methods:
         summary_lines.append(format_method_selection_summary(method_selections[method]))
         summary_lines.append("")
-    summary_lines.append("Macro Summary")
+    summary_lines.append("Average Summary")
     for record in summary_records:
         summary_lines.append(
             f"{str(record['method']).upper()}: "
@@ -138,7 +138,8 @@ def run_comparison_with_model(
     method_payloads: dict[str, dict[str, object]] = {}
     method_runtime_seconds: dict[str, float] = {}
     all_records: list[dict[str, object]] = []
-    for method in config.methods:
+    for method_index, method in enumerate(config.methods, start=1):
+        print(f"[{method_index}/{len(config.methods)}] Starting {method.upper()}")
         method_start_time = perf_counter()
         if method in {"gw", "ot", "fgw"}:
             payload = run_alignment_pipeline(
@@ -223,7 +224,7 @@ def run_comparison_with_model(
     factual_metrics = dict(backbone_meta.get("factual_validation_metrics", {}))
     print(f"Backbone factual validation accuracy: {float(factual_metrics.get('exact_acc', 0.0)):.4f}")
     print_results_table(all_records, "Counterfactual Test Results")
-    print_results_table(summary_records, "Method Macro Summary")
+    print_results_table(summary_records, "Method Average Summary")
     print(f"Wrote comparison results to {Path(config.output_path).resolve()}")
     print(f"Wrote comparison summary to {Path(config.summary_path).resolve()}")
     return payload

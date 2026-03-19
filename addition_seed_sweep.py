@@ -16,10 +16,10 @@ from addition_experiment.seed_sweep import (
 )
 
 
-SEEDS = (41, 42, 43)
+SEEDS = (41, 42, 43, 44, 45)
 DEVICE = "cuda"
 RUN_TIMESTAMP = os.environ.get("RESULTS_TIMESTAMP") or datetime.now().strftime("%Y%m%d_%H%M%S")
-RUN_DIR = Path("results") / f"{RUN_TIMESTAMP}_seed_sweep"
+RUN_DIR = Path("results") / f"{RUN_TIMESTAMP}"
 CHECKPOINT_PATH_TEMPLATE = "models/addition_mlp_seed{seed}.pt"
 OUTPUT_PATH = RUN_DIR / "addition_seed_sweep_results.json"
 SUMMARY_PATH = RUN_DIR / "addition_seed_sweep_summary.txt"
@@ -30,23 +30,23 @@ FACTUAL_TRAIN_SIZE = 30000
 FACTUAL_VALIDATION_SIZE = 4000
 HIDDEN_DIMS = (192, 192, 192, 192)
 TARGET_VARS = ("S1", "C1", "S2", "C2")
-LEARNING_RATE = 2e-3
+LEARNING_RATE = 5e-4
 EPOCHS = 100
 TRAIN_BATCH_SIZE = 256
 EVAL_BATCH_SIZE = 256
 
-TRAIN_PAIR_SIZE = 1000
+TRAIN_PAIR_SIZE = 100
 CALIBRATION_PAIR_SIZE = 1000
 TEST_PAIR_SIZE = 5000
 
 BATCH_SIZE = 128
 RESOLUTION = 1
 FGW_ALPHA = 0.5
-OT_TOP_K_VALUES = None
-OT_LAMBDAS = tuple(np.linspace(0.25, 4.0, 16))
+OT_TOP_K_VALUES = tuple(range(1,100))
+OT_LAMBDAS = tuple(np.arange(0.1, 2.0 + 1e-9, 0.1))
 
 DAS_MAX_EPOCHS = 1000
-DAS_MIN_EPOCHS = 10
+DAS_MIN_EPOCHS = 5
 DAS_PLATEAU_PATIENCE = 1
 DAS_PLATEAU_REL_DELTA = 1e-2
 DAS_LEARNING_RATE = 1e-3
@@ -118,6 +118,18 @@ def load_or_train_backbone(problem, device, seed: int, checkpoint_path: Path):
     return model, backbone_meta, "loaded"
 
 
+def print_loaded_backbone_validation(backbone_meta: dict[str, object]) -> None:
+    """Print the factual validation accuracy for a reused checkpoint."""
+    factual_metrics = dict(backbone_meta.get("factual_validation_metrics", {}))
+    exact_acc = float(factual_metrics.get("exact_acc", 0.0))
+    num_examples = int(factual_metrics.get("num_examples", 0))
+    print(
+        "Loaded backbone factual validation "
+        f"| exact_acc={exact_acc:.4f} "
+        f"| num_examples={num_examples}"
+    )
+
+
 def main() -> None:
     problem = load_addition_problem(run_checks=True)
     device = resolve_device(DEVICE)
@@ -133,6 +145,8 @@ def main() -> None:
             seed=seed,
             checkpoint_path=checkpoint_path,
         )
+        if backbone_source == "loaded":
+            print_loaded_backbone_validation(backbone_meta)
         comparison = run_comparison_with_model(
             problem=problem,
             model=model,

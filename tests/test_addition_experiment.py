@@ -18,7 +18,7 @@ from addition_experiment.pair_bank import build_pair_bank
 from addition_experiment.pyvene_utils import build_intervenable, enumerate_canonical_sites, run_intervenable_logits
 from addition_experiment.runtime import write_json
 from addition_experiment.scm import load_addition_problem
-from addition_experiment.seed_sweep import build_seed_sweep_payload
+from addition_experiment.seed_sweep import build_seed_sweep_payload, format_seed_sweep_summary
 
 
 class AdditionExperimentTests(unittest.TestCase):
@@ -225,7 +225,7 @@ class AdditionExperimentTests(unittest.TestCase):
                 payload = json.load(handle)
             self.assertEqual(len(payload["results"]), 16)
 
-    def test_seed_sweep_aggregation_summarizes_macro_metrics(self) -> None:
+    def test_seed_sweep_aggregation_summarizes_average_metrics(self) -> None:
         payload = build_seed_sweep_payload(
             [
                 {
@@ -305,6 +305,11 @@ class AdditionExperimentTests(unittest.TestCase):
         self.assertAlmostEqual(variable_summary[("gw", "S1")]["exact_acc_mean"], 0.30)
         self.assertAlmostEqual(variable_summary[("gw", "S1")]["exact_acc_std"], 0.10)
         self.assertAlmostEqual(variable_summary[("das", "C1")]["mean_shared_digits_mean"], 1.55)
+
+        summary_text = format_seed_sweep_summary(payload)
+        self.assertIn("Per-Variable Summary Across Seeds", summary_text)
+        self.assertIn("DAS [S1]: exact=0.4000 +/- 0.0500, shared=1.3500 +/- 0.0500", summary_text)
+        self.assertIn("GW [C1]: exact=0.3000 +/- 0.0000, shared=1.1000 +/- 0.0000", summary_text)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Console reporting helpers for per-variable and macro experiment summaries."""
+"""Console reporting helpers for per-variable and average experiment summaries."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def print_results_table(records: list[dict[str, object]], title: str) -> None:
     for record in records:
         print(
             f"{str(record['method']):<8} "
-            f"{str(record.get('variable', 'macro')):<8} "
+            f"{str(record.get('variable', 'average')):<8} "
             f"{float(record['exact_acc']):>8.4f} "
             f"{float(record['mean_shared_digits']):>8.4f} "
             f"{float(record.get('selection_exact_acc', 0.0)):>10.4f} "
@@ -43,7 +43,7 @@ def print_results_table(records: list[dict[str, object]], title: str) -> None:
 
 
 def summarize_method_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Average per-variable metrics into one macro summary per method."""
+    """Average per-variable metrics into one average summary per method."""
     grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
     for record in records:
         grouped[str(record["method"])].append(record)
