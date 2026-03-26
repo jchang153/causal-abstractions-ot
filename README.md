@@ -9,14 +9,12 @@ methods on the same held-out counterfactual test split.
 
 - `addition_train.py`
   - Trains the base MLP and writes a checkpoint plus factual validation metrics.
-- `addition_compare.py`
-  - Runs the shared end-to-end alignment/evaluation pipeline.
-  - Set `METHODS` at the top of the file to any subset of `("gw", "ot", "fgw", "das")`.
-  - Loads an existing checkpoint from `models/addition_mlp.pt`.
-  - Writes a compact JSON result, a plain-text summary, and comparison plots into a timestamped run folder under `results/`.
-- `addition_seed_sweep.py`
+- `addition_run.py`
   - Trains or reuses one checkpoint per seed, then runs the full comparison pipeline for each seed.
   - Writes per-seed comparison artifacts plus one aggregate JSON/text summary and cross-seed plots for both accuracy and method runtime.
+- `addition_run_gradient.py`
+  - Trains or reuses one checkpoint per seed, then runs OT/GW/FGW with gradient-based single-layer policy search.
+  - Optimizes a continuous within-layer cutoff and intervention strength on the calibration bank, then evaluates a hard single-layer top-k policy on holdout.
 
 These scripts are meant to be edited directly. The config block near the top of
 each file is the intended control surface.
@@ -58,7 +56,7 @@ each file is the intended control surface.
   - Shared implementation modules for SCMs, pair banks, metrics, pyvene
     utilities, GW/OT/FGW alignment, DAS, plotting, and backbone training.
 - `models/`
-  - Shared checkpoint location for `addition_mlp.pt`.
+  - Shared checkpoint location for `addition_mlp_seed<seed>.pt`.
 - `results/`
   - Timestamped run folders containing compact JSON outputs, plain-text summaries, and generated plots.
 - `paper/`
@@ -75,11 +73,17 @@ each file is the intended control surface.
 python addition_train.py
 ```
 
-3. Edit the config block in `addition_compare.py`.
+3. Edit the config block in `addition_run.py`.
 4. Run:
 
 ```bash
-python addition_compare.py
+python addition_run.py
+```
+
+For the gradient-based transport-policy workflow, edit the config block in `addition_run_gradient.py` and run:
+
+```bash
+python addition_run_gradient.py
 ```
 
 5. Inspect:
@@ -87,18 +91,12 @@ python addition_compare.py
   - plain-text summaries under `results/<timestamp>/`
   - plot images directly under `results/<timestamp>/`
 
-For multi-seed runs, edit the config block in `addition_seed_sweep.py` and run:
-
-```bash
-python addition_seed_sweep.py
-```
-
 This keeps all hyperparameters fixed except `seed`, trains a different backbone
 for each seed, reuses `models/addition_mlp_seed<seed>.pt` if present unless
 `RETRAIN_BACKBONES = True`, and writes aggregate cross-seed plots into the
 top-level sweep run directory.
 
-To run only some methods, edit `METHODS` in `addition_compare.py`, for example:
+To run only some methods, edit `METHODS` in `addition_run.py`, for example:
 
 ```python
 METHODS = ("ot",)
