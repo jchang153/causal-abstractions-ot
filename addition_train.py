@@ -5,16 +5,16 @@ from addition_experiment.runtime import resolve_device
 from addition_experiment.scm import load_addition_problem
 
 
-SEED = 44
+SEED = 2
 DEVICE = "cuda"
 CHECKPOINT_PATH = Path(f"models/addition_mlp_seed{SEED}.pt")
 
 TRAIN_SIZE = 30000
 VALIDATION_SIZE = 4000
-HIDDEN_DIMS = (192, 192, 192, 192)
+HIDDEN_DIMS = (16,16,16)
 TARGET_VARS = ("S1", "C1", "S2", "C2")
 LEARNING_RATE = 1e-3
-EPOCHS = 200
+EPOCHS = 500
 TRAIN_BATCH_SIZE = 256
 EVAL_BATCH_SIZE = 256
 

@@ -255,12 +255,29 @@ def load_backbone(
         )
 
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
-    eval_config = train_config or AdditionTrainConfig()
-    if not checkpoint_matches_train_config(checkpoint, eval_config):
-        raise ValueError(
-            f"Checkpoint at {checkpoint_path} does not match the requested model spec. "
-            "Run addition_train.py to regenerate models/addition_mlp.pt for the current config."
+    if train_config is None:
+        checkpoint_model_config = checkpoint.get("model_config", {})
+        checkpoint_metadata = checkpoint.get("metadata", {})
+        if not isinstance(checkpoint_model_config, dict) or not isinstance(checkpoint_metadata, dict):
+            raise ValueError(
+                f"Checkpoint at {checkpoint_path} is missing model_config or metadata needed for inference."
+            )
+        eval_config = AdditionTrainConfig(
+            seed=int(checkpoint_metadata.get("seed", 42)),
+            hidden_dims=tuple(int(dim) for dim in checkpoint_model_config.get("hidden_dims", [])),
+            input_dim=int(checkpoint_model_config.get("input_dim", INPUT_DIM)),
+            num_classes=int(checkpoint_model_config.get("num_classes", NUM_CLASSES)),
+            dropout=float(checkpoint_model_config.get("dropout", DEFAULT_DROPOUT)),
+            activation=str(checkpoint_model_config.get("activation", DEFAULT_ACTIVATION)),
+            abstract_variables=tuple(checkpoint_metadata.get("abstract_variables", DEFAULT_TARGET_VARS)),
         )
+    else:
+        eval_config = train_config
+        if not checkpoint_matches_train_config(checkpoint, eval_config):
+            raise ValueError(
+                f"Checkpoint at {checkpoint_path} does not match the requested model spec. "
+                "Run addition_train.py to regenerate models/addition_mlp.pt for the current config."
+            )
 
     model, config, checkpoint = load_variable_width_mlp_checkpoint(str(checkpoint_path), device)
     x_validation, y_validation = build_factual_tensors(

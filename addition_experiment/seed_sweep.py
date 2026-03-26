@@ -353,6 +353,30 @@ def format_seed_sweep_summary(payload: dict[str, object]) -> str:
         "std_exact="
         f"{float(backbone_summary.get('exact_acc_std', 0.0)):.4f}"
     )
+    seed_runs = list(payload.get("seed_runs", []))
+    if seed_runs:
+        first_run = dict(seed_runs[0])
+        comparison = dict(first_run.get("comparison", {}))
+        banks = dict(comparison.get("banks", {}))
+        if banks:
+            lines.append("")
+            lines.append("Pair Bank Split Stats")
+            for split_name in ("train", "calibration", "test"):
+                bank = dict(banks.get(split_name, {}))
+                stats = dict(bank.get("pair_stats", {}))
+                if not stats:
+                    continue
+                lines.append(
+                    f"{split_name} pair bank | total_pairs={int(stats.get('total_pairs', 0))} "
+                    f"| changed_any={int(stats.get('changed_any_count', 0))} "
+                    f"| unchanged_any={int(stats.get('unchanged_any_count', 0))}"
+                )
+                for variable, variable_stats in dict(stats.get("per_variable", {})).items():
+                    lines.append(
+                        f"{split_name} pair bank [{variable}] | changed={int(variable_stats.get('changed_count', 0))} "
+                        f"| unchanged={int(variable_stats.get('unchanged_count', 0))} "
+                        f"| changed_rate={float(variable_stats.get('changed_rate', 0.0)):.4f}"
+                    )
     lines.append("")
     lines.append("Method Average Across Seeds")
     for record in payload.get("method_summary_across_seeds", []):
