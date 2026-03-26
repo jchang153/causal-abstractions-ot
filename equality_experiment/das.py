@@ -167,9 +167,7 @@ def choose_better_result(candidate: dict[str, object], incumbent: dict[str, obje
     """Decide whether a candidate beats the current DAS incumbent."""
     if incumbent is None:
         return True
-    candidate_key = (float(candidate["selection_exact_acc"]), float(candidate["selection_mean_shared_digits"]))
-    incumbent_key = (float(incumbent["selection_exact_acc"]), float(incumbent["selection_mean_shared_digits"]))
-    return candidate_key > incumbent_key
+    return float(candidate["selection_exact_acc"]) > float(incumbent["selection_exact_acc"])
 
 
 def run_das_search_for_variable(
@@ -240,9 +238,7 @@ def run_das_search_for_variable(
             "layer": spec.layer,
             "subspace_dim": spec.subspace_dim,
             "selection_exact_acc": calibration_metrics["exact_acc"],
-            "selection_mean_shared_digits": calibration_metrics["mean_shared_digits"],
             "calibration_exact_acc": calibration_metrics["exact_acc"],
-            "calibration_mean_shared_digits": calibration_metrics["mean_shared_digits"],
             "train_epochs_ran": len(loss_history),
             "train_loss_history": loss_history,
         }
