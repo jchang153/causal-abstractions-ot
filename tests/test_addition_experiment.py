@@ -12,10 +12,25 @@ from pyvene import RotatedSpaceIntervention, VanillaIntervention
 
 from addition_experiment.backbone import AdditionTrainConfig, train_backbone
 from addition_experiment.das import DASConfig, run_das_pipeline
+from addition_experiment.ot_gradient import (
+    OTGradientConfig,
+    build_site_projection_matrix,
+    continuous_cutoff_to_top_k,
+    ranked_cutoff_gates,
+    run_alignment_gradient_pipeline,
+)
 from addition_experiment.ot import OTConfig, run_alignment_pipeline, truncate_transport_rows
 from addition_experiment.metrics import labels_to_digits, shared_digit_counts
-from addition_experiment.pair_bank import build_pair_bank
-from addition_experiment.pyvene_utils import build_intervenable, enumerate_canonical_sites, run_intervenable_logits
+from addition_experiment.pair_bank import (
+    _compute_policy_positive_mask,
+    build_pair_bank,
+    build_pair_bank_from_digits,
+)
+from addition_experiment.pyvene_utils import (
+    build_intervenable,
+    enumerate_canonical_sites,
+    run_intervenable_logits,
+)
 from addition_experiment.runtime import write_json
 from addition_experiment.scm import load_addition_problem
 from addition_experiment.seed_sweep import build_seed_sweep_payload, format_seed_sweep_summary
@@ -63,6 +78,35 @@ class AdditionExperimentTests(unittest.TestCase):
         np.testing.assert_allclose(truncated[1], np.array([4.0 / 9.0, 3.0 / 9.0, 2.0 / 9.0, 0.0]), atol=1e-8)
         np.testing.assert_allclose(truncated.sum(axis=1), np.ones(2), atol=1e-8)
 
+    def test_gradient_cutoff_gate_is_monotone_and_rounds_cleanly(self) -> None:
+        gates = ranked_cutoff_gates(
+            cutoff=torch.tensor(2.0),
+            num_sites=5,
+            temperature=0.1,
+            device=torch.device("cpu"),
+        ).detach().cpu().numpy()
+
+        self.assertGreater(gates[0], gates[1])
+        self.assertGreater(gates[1], gates[2])
+        self.assertGreater(gates[2], gates[3])
+        self.assertEqual(continuous_cutoff_to_top_k(0.2, 5), 1)
+        self.assertEqual(continuous_cutoff_to_top_k(2.49, 5), 2)
+        self.assertEqual(continuous_cutoff_to_top_k(2.51, 5), 3)
+        self.assertEqual(continuous_cutoff_to_top_k(8.0, 5), 5)
+
+    def test_gradient_projection_stays_in_selected_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = str(Path(temp_dir) / "mini_model.pt")
+            _, model, _ = self._load_small_model(checkpoint_path)
+            layer_one_sites = enumerate_canonical_sites(model, resolution=1, layers=(1,))
+            projection = build_site_projection_matrix(
+                layer_one_sites,
+                layer_width=int(model.config.hidden_dims[1]),
+                device=torch.device("cpu"),
+            )
+            self.assertEqual(tuple(projection.shape), (int(model.config.hidden_dims[1]), int(model.config.hidden_dims[1])))
+            self.assertTrue(torch.allclose(projection.sum(dim=1), torch.ones(projection.shape[0])))
+
     def test_problem_checks_and_pair_bank_determinism(self) -> None:
         problem = load_addition_problem(run_checks=True)
         bank_a = build_pair_bank(problem, size=16, seed=123, split="test", verify_with_scm=True)
@@ -75,6 +119,105 @@ class AdditionExperimentTests(unittest.TestCase):
         self.assertTrue(torch.equal(bank_a.base_labels, bank_b.base_labels))
         for variable in ("S1", "C1", "S2", "C2"):
             self.assertTrue(torch.equal(bank_a.cf_labels_by_var[variable], bank_b.cf_labels_by_var[variable]))
+
+    def test_pair_bank_mixed_with_full_positive_fraction_returns_only_changed_any_pairs(self) -> None:
+        problem = load_addition_problem(run_checks=False)
+        bank = build_pair_bank(
+            problem,
+            size=24,
+            seed=321,
+            split="train",
+            target_vars=("C1", "C2"),
+            pair_policy="mixed",
+            mixed_positive_fraction=1.0,
+            pair_pool_size=32,
+        )
+
+        self.assertTrue(bank.changed_any.all().item())
+        self.assertEqual(bank.pair_stats["total_pairs"], 24)
+        self.assertEqual(bank.pair_stats["changed_any_count"], 24)
+        self.assertEqual(bank.pair_stats["unchanged_any_count"], 0)
+
+    def test_pair_bank_mixed_balances_changed_any_buckets(self) -> None:
+        problem = load_addition_problem(run_checks=False)
+        bank = build_pair_bank(
+            problem,
+            size=25,
+            seed=654,
+            split="calibration",
+            target_vars=("C1", "C2"),
+            pair_policy="mixed",
+            pair_pool_size=48,
+        )
+
+        self.assertEqual(bank.pair_stats["total_pairs"], 25)
+        self.assertEqual(bank.pair_stats["changed_any_count"], 13)
+        self.assertEqual(bank.pair_stats["unchanged_any_count"], 12)
+
+    def test_pair_bank_mixed_respects_positive_fraction(self) -> None:
+        problem = load_addition_problem(run_checks=False)
+        bank = build_pair_bank(
+            problem,
+            size=20,
+            seed=655,
+            split="calibration",
+            target_vars=("C1", "C2"),
+            pair_policy="mixed",
+            mixed_positive_fraction=0.3,
+            pair_pool_size=48,
+        )
+
+        self.assertEqual(bank.pair_stats["total_pairs"], 20)
+        self.assertEqual(bank.pair_stats["changed_any_count"], 6)
+        self.assertEqual(bank.pair_stats["unchanged_any_count"], 14)
+
+    def test_pair_bank_per_variable_changed_counts_are_tracked(self) -> None:
+        problem = load_addition_problem(run_checks=False)
+        base_digits = np.asarray(
+            [
+                [1, 2, 3, 4],
+                [1, 2, 3, 4],
+                [9, 9, 9, 1],
+                [9, 9, 4, 4],
+            ],
+            dtype=np.int64,
+        )
+        source_digits = np.asarray(
+            [
+                [9, 9, 0, 0],
+                [1, 1, 9, 1],
+                [8, 9, 9, 1],
+                [1, 1, 9, 1],
+            ],
+            dtype=np.int64,
+        )
+        bank = build_pair_bank_from_digits(
+            problem,
+            base_digits=base_digits,
+            source_digits=source_digits,
+            seed=777,
+            split="test",
+            target_vars=("C1", "C2"),
+            pair_policy="unfiltered",
+        )
+
+        self.assertEqual(bank.changed_by_var["C1"].tolist(), [True, False, False, True])
+        self.assertEqual(bank.changed_by_var["C2"].tolist(), [False, True, False, True])
+        self.assertEqual(bank.changed_any.tolist(), [True, True, False, True])
+        self.assertEqual(bank.pair_stats["changed_any_count"], 3)
+        self.assertEqual(bank.pair_stats["unchanged_any_count"], 1)
+        self.assertEqual(bank.pair_stats["per_variable"]["C1"]["changed_count"], 2)
+        self.assertEqual(bank.pair_stats["per_variable"]["C1"]["unchanged_count"], 2)
+        self.assertEqual(bank.pair_stats["per_variable"]["C2"]["changed_count"], 2)
+        self.assertEqual(bank.pair_stats["per_variable"]["C2"]["unchanged_count"], 2)
+
+    def test_pair_bank_policy_target_c1_only_marks_correct_examples(self) -> None:
+        changed_by_var = {
+            "C1": np.asarray([True, False, True, False], dtype=bool),
+            "C2": np.asarray([False, True, True, False], dtype=bool),
+        }
+        mask = _compute_policy_positive_mask(changed_by_var, "C1_only")
+        self.assertEqual(mask.tolist(), [True, False, False, False])
 
     def test_pyvene_intervention_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -224,6 +367,46 @@ class AdditionExperimentTests(unittest.TestCase):
             with open(output_path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             self.assertEqual(len(payload["results"]), 16)
+
+    def test_small_gradient_compare_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = str(Path(temp_dir) / "mini_model.pt")
+            problem, model, _ = self._load_small_model(checkpoint_path)
+            train_bank = build_pair_bank(problem, size=12, seed=2001, split="train")
+            calibration_bank = build_pair_bank(problem, size=12, seed=2002, split="calibration")
+            test_bank = build_pair_bank(problem, size=12, seed=2003, split="test")
+
+            payload = run_alignment_gradient_pipeline(
+                model=model,
+                fit_bank=train_bank,
+                calibration_bank=calibration_bank,
+                holdout_bank=test_bank,
+                device="cpu",
+                config=OTGradientConfig(
+                    method="ot",
+                    batch_size=6,
+                    ranking_k=2,
+                    resolution=2,
+                    target_vars=("S1", "C1"),
+                    policy_learning_rate=1e-2,
+                    policy_epochs=2,
+                    policy_temperature=0.5,
+                    selection_verbose=False,
+                ),
+            )
+
+            self.assertEqual(payload["selection_objective"], "calibration_cross_entropy")
+            self.assertEqual(payload["final_evaluation_policy"], "hard_single_layer_top_k")
+            self.assertEqual(len(payload["results"]), 2)
+            self.assertEqual(sorted(payload["selected_hyperparameters"]["selected_layer_by_variable"].keys()), ["C1", "S1"])
+            for record in payload["results"]:
+                self.assertIn("selected_layer", record)
+                self.assertIn("continuous_cutoff", record)
+                self.assertIn("selection_cross_entropy", record)
+                selected_layer = int(record["selected_layer"])
+                layer_masses = dict(record.get("layer_mass_by_layer", {}))
+                nonzero_layers = [key for key, value in layer_masses.items() if float(value) > 1e-8]
+                self.assertEqual(nonzero_layers, [f"L{selected_layer}"])
 
     def test_seed_sweep_aggregation_summarizes_average_metrics(self) -> None:
         payload = build_seed_sweep_payload(
