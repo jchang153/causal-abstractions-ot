@@ -54,11 +54,35 @@ class OTConfig:
     resolution: int = DEFAULT_ALIGNMENT_RESOLUTION
     alpha: float = 0.5
     tau: float = 1.0
+    uot_reg_m: float = 1.0
     target_vars: tuple[str, ...] = DEFAULT_TARGET_VARS
     top_k_values: tuple[int, ...] | None = None
     lambda_values: tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
     selection_verbose: bool = True
     calibration_progress_interval: int = 250
+    signature_mode: str = "prob_delta"
+
+
+def _resolve_bank_for_variable(
+    bank_or_banks: PairBank | dict[str, PairBank],
+    variable: str,
+) -> PairBank:
+    if isinstance(bank_or_banks, dict):
+        return bank_or_banks[variable]
+    return bank_or_banks
+
+
+def _binary_margin(logits: torch.Tensor) -> torch.Tensor:
+    """Compute signed binary logit margin logit_1 - logit_0."""
+    if logits.shape[-1] != 2:
+        raise ValueError(f"Expected binary logits with shape [N, 2], got {tuple(logits.shape)}")
+    return logits[:, 1] - logits[:, 0]
+
+
+def _transition_masks(base_labels: torch.Tensor, cf_labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    to_one = ((base_labels == 0) & (cf_labels == 1)).to(torch.float32)
+    to_zero = ((base_labels == 1) & (cf_labels == 0)).to(torch.float32)
+    return to_one, to_zero
 
 
 def collect_base_logits(
@@ -85,10 +109,12 @@ def collect_site_signatures(
     base_logits: torch.Tensor,
     batch_size: int,
     device: torch.device,
+    signature_mode: str = "prob_delta",
 ) -> torch.Tensor:
     """Measure each canonical site's intervention effect signature."""
     signatures = []
     base_prob = torch.softmax(base_logits, dim=-1)
+    base_margin = _binary_margin(base_logits)
     for site in sites:
         intervenable = build_intervenable(
             model=model,
@@ -111,8 +137,20 @@ def collect_site_signatures(
             batch_size=batch_size,
             device=device,
         )
-        site_effect = (torch.softmax(site_logits, dim=-1) - base_prob).permute(1, 0).contiguous()
-        signatures.append(site_effect.reshape(-1))
+        if signature_mode == "prob_delta":
+            site_effect = (torch.softmax(site_logits, dim=-1) - base_prob).permute(1, 0).contiguous()
+            signatures.append(site_effect.reshape(-1))
+        else:
+            site_margin = _binary_margin(site_logits)
+            delta_margin = site_margin - base_margin
+            if signature_mode == "margin_delta":
+                signatures.append(delta_margin.reshape(-1))
+            elif signature_mode == "transition_margin":
+                first = torch.clamp(delta_margin, min=0.0)
+                second = torch.clamp(-delta_margin, min=0.0)
+                signatures.append(torch.cat([first, second], dim=0))
+            else:
+                raise ValueError(f"Unsupported signature_mode={signature_mode}")
     return torch.stack(signatures, dim=0)
 
 
@@ -120,14 +158,30 @@ def build_variable_signatures(
     bank: PairBank,
     num_classes: int,
     target_vars: tuple[str, ...],
+    signature_mode: str = "prob_delta",
 ) -> torch.Tensor:
     """Build abstract-variable effect signatures from SCM labels."""
     base_onehot = F.one_hot(bank.base_labels, num_classes=num_classes).to(torch.float32)
     signatures = []
     for variable in target_vars:
-        cf_onehot = F.one_hot(bank.cf_labels_by_var[variable], num_classes=num_classes).to(torch.float32)
-        effect = (cf_onehot - base_onehot).permute(1, 0).contiguous()
-        signatures.append(effect.reshape(-1))
+        cf_labels = bank.cf_labels_by_var[variable]
+        cf_onehot = F.one_hot(cf_labels, num_classes=num_classes).to(torch.float32)
+        if signature_mode == "prob_delta":
+            effect = (cf_onehot - base_onehot).permute(1, 0).contiguous()
+            signatures.append(effect.reshape(-1))
+        else:
+            base_margin = (2.0 * bank.base_labels.to(torch.float32)) - 1.0
+            cf_margin = (2.0 * cf_labels.to(torch.float32)) - 1.0
+            delta_margin = cf_margin - base_margin
+            if signature_mode == "margin_delta":
+                signatures.append(delta_margin.reshape(-1))
+            elif signature_mode == "transition_margin":
+                to_one, to_zero = _transition_masks(bank.base_labels, cf_labels)
+                first = to_one
+                second = to_zero
+                signatures.append(torch.cat([first, second], dim=0))
+            else:
+                raise ValueError(f"Unsupported signature_mode={signature_mode}")
     return torch.stack(signatures, dim=0)
 
 
@@ -243,6 +297,43 @@ def solve_ot_transport(
     return last_transport, {
         "method": "ot_degenerate",
         "tau_used": config.tau,
+        "epsilon_config": config.epsilon,
+    }
+
+
+def solve_uot_transport(
+    cost_cross: np.ndarray,
+    p: np.ndarray,
+    q: np.ndarray,
+    config: OTConfig,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Solve the entropic unbalanced optimal transport problem on direct costs."""
+    last_transport = None
+    for multiplier in config.epsilon_retry_multipliers:
+        regularization = config.tau * multiplier
+        transport = ot.unbalanced.sinkhorn_unbalanced(
+            p,
+            q,
+            cost_cross,
+            reg=regularization,
+            reg_m=float(config.uot_reg_m),
+            numItermax=config.max_iter,
+            stopThr=config.tol,
+            verbose=config.verbose,
+        )
+        last_transport = transport
+        if np.isfinite(transport).all() and float(np.sum(transport)) > 0.0:
+            return transport, {
+                "method": "uot",
+                "regularization_used": regularization,
+                "tau_used": config.tau,
+                "uot_reg_m": float(config.uot_reg_m),
+                "epsilon_config": config.epsilon,
+            }
+    return last_transport, {
+        "method": "uot_degenerate",
+        "tau_used": config.tau,
+        "uot_reg_m": float(config.uot_reg_m),
         "epsilon_config": config.epsilon,
     }
 
@@ -511,7 +602,7 @@ def choose_better_variable_candidate(
 def select_transport_hyperparameters(
     method_name: str,
     model: VariableWidthMLPForClassification,
-    calibration_bank: PairBank,
+    calibration_bank: PairBank | dict[str, PairBank],
     sites: list[CanonicalSite],
     normalized_transport: np.ndarray,
     rankings: dict[str, list[dict[str, object]]],
@@ -565,7 +656,7 @@ def select_transport_hyperparameters(
                     calibration_results, _ = evaluate_soft_transport_interventions(
                         method_name=method_name,
                         model=model,
-                        evaluation_bank=calibration_bank,
+                        evaluation_bank=_resolve_bank_for_variable(calibration_bank, variable),
                         sites=sites,
                         transport_weights=truncated_transport,
                         rankings=variable_rankings,
@@ -622,8 +713,8 @@ def select_transport_hyperparameters(
 def run_alignment_pipeline(
     model: VariableWidthMLPForClassification,
     fit_bank: PairBank,
-    calibration_bank: PairBank,
-    holdout_bank: PairBank,
+    calibration_bank: PairBank | dict[str, PairBank],
+    holdout_bank: PairBank | dict[str, PairBank],
     device: torch.device | str,
     config: OTConfig,
 ) -> dict[str, object]:
@@ -634,8 +725,8 @@ def run_alignment_pipeline(
         print(
             f"{str(config.method).upper()} training "
             f"| fit_examples={fit_bank.size} "
-            f"| calibration_examples={calibration_bank.size} "
-            f"| holdout_examples={holdout_bank.size} "
+            f"| calibration_examples={_resolve_bank_for_variable(calibration_bank, config.target_vars[0]).size} "
+            f"| holdout_examples={_resolve_bank_for_variable(holdout_bank, config.target_vars[0]).size} "
             f"| sites={len(sites)}"
         )
 
@@ -647,11 +738,13 @@ def run_alignment_pipeline(
         base_logits=base_logits,
         batch_size=config.batch_size,
         device=device,
+        signature_mode=config.signature_mode,
     )
     variable_signatures = build_variable_signatures(
         bank=fit_bank,
         num_classes=int(model.config.num_classes),
         target_vars=tuple(config.target_vars),
+        signature_mode=config.signature_mode,
     )
     cost_var, cost_site = build_geometry_costs(
         variable_signatures=variable_signatures,
@@ -673,6 +766,8 @@ def run_alignment_pipeline(
         )
         if config.method == "ot":
             transport, transport_meta = solve_ot_transport(cost_cross, p, q, config)
+        elif config.method == "uot":
+            transport, transport_meta = solve_uot_transport(cost_cross, p, q, config)
         elif config.method == "fgw":
             transport, transport_meta = solve_fgw_transport(cost_cross, cost_var, cost_site, p, q, config)
         else:
@@ -706,19 +801,27 @@ def run_alignment_pipeline(
         top_k=per_variable_top_k,
         renormalize=True,
     )
-    final_results, layer_masks = evaluate_soft_transport_interventions(
-        method_name=str(config.method),
-        model=model,
-        evaluation_bank=holdout_bank,
-        sites=sites,
-        transport_weights=truncated_transport,
-        rankings=rankings,
-        target_vars=tuple(config.target_vars),
-        top_k_by_variable=selected_top_k_by_variable,
-        lambda_by_variable=selected_lambda_by_variable,
-        batch_size=config.batch_size,
-        device=device,
-    )
+    final_results = []
+    layer_masks = {}
+    for variable in config.target_vars:
+        variable_index = config.target_vars.index(variable)
+        variable_transport = truncated_transport[variable_index : variable_index + 1]
+        variable_rankings = {variable: rankings[variable]}
+        variable_results, variable_masks = evaluate_soft_transport_interventions(
+            method_name=str(config.method),
+            model=model,
+            evaluation_bank=_resolve_bank_for_variable(holdout_bank, variable),
+            sites=sites,
+            transport_weights=variable_transport,
+            rankings=variable_rankings,
+            target_vars=(variable,),
+            top_k_by_variable={variable: selected_top_k_by_variable[variable]},
+            lambda_by_variable={variable: selected_lambda_by_variable[variable]},
+            batch_size=config.batch_size,
+            device=device,
+        )
+        final_results.extend(variable_results)
+        layer_masks.update(variable_masks)
 
     for record in final_results:
         variable = str(record["variable"])
@@ -754,12 +857,19 @@ def run_alignment_pipeline(
 
     return {
         "fit_bank": fit_bank.metadata(),
-        "calibration_bank": calibration_bank.metadata(),
-        "holdout_bank": holdout_bank.metadata(),
+        "calibration_bank": {
+            variable: _resolve_bank_for_variable(calibration_bank, variable).metadata()
+            for variable in config.target_vars
+        } if isinstance(calibration_bank, dict) else calibration_bank.metadata(),
+        "holdout_bank": {
+            variable: _resolve_bank_for_variable(holdout_bank, variable).metadata()
+            for variable in config.target_vars
+        } if isinstance(holdout_bank, dict) else holdout_bank.metadata(),
         "target_vars": list(config.target_vars),
         "sites": [site.label for site in sites],
         "transport": transport.tolist(),
         "transport_meta": transport_meta,
+        "signature_mode": config.signature_mode,
         "rankings": rankings,
         "selected_hyperparameters": {
             "top_k_by_variable": selected_top_k_by_variable,

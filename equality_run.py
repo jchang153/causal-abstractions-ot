@@ -19,9 +19,9 @@ RUN_DIR = Path("results") / f"{RUN_TIMESTAMP}_equality"
 CHECKPOINT_PATH = Path(f"models/equality_mlp_seed{SEED}.pt")
 OUTPUT_PATH = RUN_DIR / "equality_run_results.json"
 SUMMARY_PATH = RUN_DIR / "equality_run_summary.txt"
-RETRAIN_BACKBONE = False
+RETRAIN_BACKBONE = True
 
-METHODS = ("ot",)#("das", "ot")#, "gw", "fgw", "das")
+METHODS = ("ot", "das")
 TARGET_VARS = ("WX", "YZ")
 OT_METHODS = tuple(method for method in METHODS if method in {"ot", "gw", "fgw"})
 NON_OT_METHODS = tuple(method for method in METHODS if method not in {"ot", "gw", "fgw"})
@@ -63,9 +63,9 @@ BATCH_SIZE = 128
 
 RESOLUTION = 1
 FGW_ALPHA = 0.5
-OT_EPSILONS = (0.1, 0.3, 0.5)
+OT_EPSILONS = (0.05,)
 OT_TAUS = (1.0,)
-OT_TOP_K_VALUES = tuple(range(1, 10))
+OT_TOP_K_VALUES = tuple(range(1, 11))
 OT_LAMBDAS = tuple(np.arange(0.1, 2.0 + 1e-9, 0.1))
 
 DAS_MAX_EPOCHS = 1000

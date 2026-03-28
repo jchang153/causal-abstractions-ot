@@ -61,6 +61,8 @@ class CompareExperimentConfig:
     fgw_alpha: float = 0.5
     ot_epsilon: float = 5e-2
     ot_tau: float = 1.0
+    uot_reg_m: float = 1.0
+    signature_mode: str = "prob_delta"
     ot_top_k_values: tuple[int, ...] | None = None
     ot_lambdas: tuple[float, ...] = (1.0,)
     das_max_epochs: int = 1
@@ -126,6 +128,8 @@ def _build_summary_lines(
         f"fgw_alpha: {float(config.fgw_alpha):.4f}",
         f"ot_epsilon: {float(config.ot_epsilon):.6f}",
         f"ot_tau: {float(config.ot_tau):.6f}",
+        f"uot_reg_m: {float(config.uot_reg_m):.6f}",
+        f"signature_mode: {config.signature_mode}",
         "ot_top_k_values: "
         + ("None" if config.ot_top_k_values is None else ", ".join(str(int(value)) for value in config.ot_top_k_values)),
         "ot_lambdas: " + ", ".join(f"{float(value):.6f}" for value in config.ot_lambdas),
@@ -264,7 +268,7 @@ def run_comparison_with_banks(
     for method_index, method in enumerate(config.methods, start=1):
         print(f"[{method_index}/{len(config.methods)}] Starting {method.upper()}")
         method_start_time = perf_counter()
-        if method in {"gw", "ot", "fgw"}:
+        if method in {"gw", "ot", "uot", "fgw"}:
             payload = run_alignment_pipeline(
                 model=model,
                 fit_bank=train_bank,
@@ -278,6 +282,8 @@ def run_comparison_with_banks(
                     alpha=config.fgw_alpha,
                     epsilon=config.ot_epsilon,
                     tau=config.ot_tau,
+                    uot_reg_m=config.uot_reg_m,
+                    signature_mode=getattr(config, "signature_mode", "prob_delta"),
                     target_vars=tuple(config.target_vars),
                     top_k_values=config.ot_top_k_values,
                     lambda_values=config.ot_lambdas,

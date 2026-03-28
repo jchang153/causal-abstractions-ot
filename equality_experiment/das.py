@@ -36,6 +36,15 @@ class DASConfig:
     verbose: bool = True
 
 
+def _resolve_bank_for_variable(
+    bank_or_banks: PairBank | dict[str, PairBank],
+    variable: str,
+) -> PairBank:
+    if isinstance(bank_or_banks, dict):
+        return bank_or_banks[variable]
+    return bank_or_banks
+
+
 def iter_search_specs(
     model: VariableWidthMLPForClassification,
     config: DASConfig,
@@ -174,15 +183,17 @@ def run_das_search_for_variable(
     model: VariableWidthMLPForClassification,
     variable: str,
     train_bank: PairBank,
-    calibration_bank: PairBank,
-    holdout_bank: PairBank,
+    calibration_bank: PairBank | dict[str, PairBank],
+    holdout_bank: PairBank | dict[str, PairBank],
     device: torch.device,
     config: DASConfig,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     """Search DAS candidates for one abstract variable and keep the best one."""
     specs = iter_search_specs(model, config)
     train_dataset = PairBankVariableDataset(train_bank, variable)
-    calibration_dataset = PairBankVariableDataset(calibration_bank, variable)
+    variable_calibration_bank = _resolve_bank_for_variable(calibration_bank, variable)
+    variable_holdout_bank = _resolve_bank_for_variable(holdout_bank, variable)
+    calibration_dataset = PairBankVariableDataset(variable_calibration_bank, variable)
 
     best_record = None
     best_intervenable = None
@@ -194,7 +205,7 @@ def run_das_search_for_variable(
             f"| candidates={len(specs)} "
             f"| train_examples={len(train_dataset)} "
             f"| calibration_examples={len(calibration_dataset)} "
-            f"| holdout_examples={holdout_bank.size}"
+            f"| holdout_examples={variable_holdout_bank.size}"
         )
     for index, spec in enumerate(specs, start=1):
         intervention = RotatedSpaceIntervention(embed_dim=int(model.config.hidden_dims[spec.layer]))
@@ -232,8 +243,8 @@ def run_das_search_for_variable(
         record = {
             "method": "das",
             "variable": variable,
-            "split": calibration_bank.split,
-            "seed": calibration_bank.seed,
+            "split": variable_calibration_bank.split,
+            "seed": variable_calibration_bank.seed,
             "site_label": spec.label,
             "layer": spec.layer,
             "subspace_dim": spec.subspace_dim,
@@ -261,7 +272,7 @@ def run_das_search_for_variable(
     if best_record is None or best_intervenable is None or best_spec is None:
         raise RuntimeError(f"Failed to select a DAS candidate for {variable}")
 
-    holdout_dataset = PairBankVariableDataset(holdout_bank, variable)
+    holdout_dataset = PairBankVariableDataset(variable_holdout_bank, variable)
     holdout_metrics = evaluate_rotated_intervention(
         intervenable=best_intervenable,
         dataset=holdout_dataset,
@@ -271,8 +282,8 @@ def run_das_search_for_variable(
     )
     result_record = {
         **best_record,
-        "split": holdout_bank.split,
-        "seed": holdout_bank.seed,
+        "split": variable_holdout_bank.split,
+        "seed": variable_holdout_bank.seed,
         **holdout_metrics,
     }
     return result_record, all_records
@@ -281,8 +292,8 @@ def run_das_search_for_variable(
 def run_das_pipeline(
     model: VariableWidthMLPForClassification,
     train_bank: PairBank,
-    calibration_bank: PairBank,
-    holdout_bank: PairBank,
+    calibration_bank: PairBank | dict[str, PairBank],
+    holdout_bank: PairBank | dict[str, PairBank],
     device: torch.device | str,
     config: DASConfig,
 ) -> dict[str, object]:
@@ -305,8 +316,14 @@ def run_das_pipeline(
 
     return {
         "train_bank": train_bank.metadata(),
-        "calibration_bank": calibration_bank.metadata(),
-        "holdout_bank": holdout_bank.metadata(),
+        "calibration_bank": {
+            variable: _resolve_bank_for_variable(calibration_bank, variable).metadata()
+            for variable in config.target_vars
+        } if isinstance(calibration_bank, dict) else calibration_bank.metadata(),
+        "holdout_bank": {
+            variable: _resolve_bank_for_variable(holdout_bank, variable).metadata()
+            for variable in config.target_vars
+        } if isinstance(holdout_bank, dict) else holdout_bank.metadata(),
         "target_vars": list(config.target_vars),
         "training_stopping_rule": {
             "type": "plateau_on_train_loss",
