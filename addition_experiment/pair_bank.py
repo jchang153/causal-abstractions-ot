@@ -114,6 +114,122 @@ def _sample_unique_digit_rows(size: int, seed: int) -> np.ndarray:
     return digits
 
 
+def _sample_alternative_digit(current: int, rng: np.random.Generator) -> int:
+    """Sample one digit different from `current`."""
+    candidate = int(rng.integers(0, 9))
+    if candidate >= current:
+        candidate += 1
+    return candidate
+
+
+def _choose_digit_with_sum_constraint(
+    *,
+    fixed_digit: int,
+    current_digit: int,
+    require_carry: bool,
+    rng: np.random.Generator,
+) -> int | None:
+    """Pick a replacement digit that flips whether `digit + fixed_digit` carries."""
+    if require_carry:
+        low = max(0, 10 - fixed_digit)
+        candidates = [digit for digit in range(low, 10) if digit != current_digit]
+    else:
+        high = min(9, 9 - fixed_digit)
+        candidates = [digit for digit in range(0, high + 1) if digit != current_digit]
+    if not candidates:
+        return None
+    return int(candidates[int(rng.integers(0, len(candidates)))])
+
+
+def _make_c1_flip_source(base_digits: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Construct a near-base source whose ones-digit carry flips."""
+    source = np.array(base_digits, copy=True)
+    a1, b1 = int(source[0]), int(source[1])
+    base_c1 = (a1 + b1) // 10
+    require_carry = base_c1 == 0
+
+    replacement = _choose_digit_with_sum_constraint(
+        fixed_digit=b1,
+        current_digit=a1,
+        require_carry=require_carry,
+        rng=rng,
+    )
+    if replacement is not None:
+        source[0] = replacement
+        return source
+
+    replacement = _choose_digit_with_sum_constraint(
+        fixed_digit=a1,
+        current_digit=b1,
+        require_carry=require_carry,
+        rng=rng,
+    )
+    if replacement is not None:
+        source[1] = replacement
+        return source
+
+    source[0] = _sample_alternative_digit(a1, rng)
+    return source
+
+
+def _make_c2_flip_source(base_digits: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Construct a near-base source whose tens-digit carry flips while preserving ones digits."""
+    source = np.array(base_digits, copy=True)
+    a2, b2 = int(source[2]), int(source[3])
+    c1 = (int(source[0]) + int(source[1])) // 10
+    base_c2 = (a2 + b2 + c1) // 10
+    require_carry = base_c2 == 0
+
+    replacement = _choose_digit_with_sum_constraint(
+        fixed_digit=b2 + c1,
+        current_digit=a2,
+        require_carry=require_carry,
+        rng=rng,
+    )
+    if replacement is not None:
+        source[2] = replacement
+        return source
+
+    replacement = _choose_digit_with_sum_constraint(
+        fixed_digit=a2 + c1,
+        current_digit=b2,
+        require_carry=require_carry,
+        rng=rng,
+    )
+    if replacement is not None:
+        source[3] = replacement
+        return source
+
+    source[2] = _sample_alternative_digit(a2, rng)
+    return source
+
+
+def _generate_structured_sources_for_base(
+    base_digits: np.ndarray,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Generate MIB-style local source variations around one base example."""
+    base = np.asarray(base_digits, dtype=np.int64).reshape(-1)
+    if base.shape[0] != 4:
+        raise ValueError(f"Expected one base digit row shaped [4], got {base.shape}")
+
+    sources: list[np.ndarray] = []
+
+    random_source = np.array([int(rng.integers(0, 10)) for _ in range(4)], dtype=np.int64)
+    if np.array_equal(random_source, base):
+        random_source[0] = _sample_alternative_digit(int(base[0]), rng)
+    sources.append(random_source)
+
+    for digit_index in range(4):
+        source = np.array(base, copy=True)
+        source[digit_index] = _sample_alternative_digit(int(base[digit_index]), rng)
+        sources.append(source)
+
+    sources.append(_make_c1_flip_source(base, rng))
+    sources.append(_make_c2_flip_source(base, rng))
+    return sources
+
+
 def _compute_changed_flags(
     base_labels: np.ndarray,
     cf_labels_by_var: dict[str, np.ndarray],
@@ -350,6 +466,66 @@ def build_pair_bank(
     candidate_source_states = compute_states_for_digits(candidate_source_digits)
     candidate_cf_labels_np = compute_counterfactual_labels(candidate_base_states, candidate_source_states)
     changed_by_var_np, changed_any_np = _compute_changed_flags(
+        base_labels=candidate_base_states["O"],
+        cf_labels_by_var=candidate_cf_labels_np,
+        policy_vars=pair_policy_vars,
+    )
+    positive_mask = _compute_policy_positive_mask(changed_by_var_np, pair_policy_target)
+    selected_indices = _select_pair_indices(
+        positive_mask=positive_mask,
+        size=size,
+        pair_policy=pair_policy,
+        mixed_positive_fraction=mixed_positive_fraction,
+        rng=rng,
+    )
+
+    return build_pair_bank_from_digits(
+        problem,
+        base_digits=candidate_base_digits[selected_indices],
+        source_digits=candidate_source_digits[selected_indices],
+        seed=seed,
+        split=split,
+        target_vars=target_vars,
+        pair_policy_vars=pair_policy_vars,
+        pair_policy=pair_policy,
+        pair_policy_target=pair_policy_target,
+        mixed_positive_fraction=mixed_positive_fraction,
+        pair_pool_size=resolved_pool_size,
+        verify_with_scm=verify_with_scm,
+    )
+
+
+def build_structured_pair_bank(
+    problem: AdditionProblem,
+    size: int,
+    seed: int,
+    split: str,
+    target_vars: tuple[str, ...] = DEFAULT_TARGET_VARS,
+    pair_policy_vars: tuple[str, ...] = PAIR_POLICY_VARS,
+    pair_policy: str = "unfiltered",
+    pair_policy_target: str = DEFAULT_PAIR_POLICY_TARGET,
+    mixed_positive_fraction: float = 0.5,
+    pair_pool_size: int | None = None,
+    verify_with_scm: bool = False,
+) -> PairBank:
+    """Create a pair bank using structured local source perturbations around each base."""
+    rng = np.random.default_rng(seed)
+    resolved_pool_size = max(size, int(pair_pool_size) if pair_pool_size is not None else size)
+    base_pool = _sample_unique_digit_rows(resolved_pool_size, seed + 17)
+
+    candidate_base_rows: list[np.ndarray] = []
+    candidate_source_rows: list[np.ndarray] = []
+    for base_digits in base_pool:
+        for source_digits in _generate_structured_sources_for_base(base_digits, rng):
+            candidate_base_rows.append(np.array(base_digits, copy=True))
+            candidate_source_rows.append(np.array(source_digits, copy=True))
+
+    candidate_base_digits = np.asarray(candidate_base_rows, dtype=np.int64)
+    candidate_source_digits = np.asarray(candidate_source_rows, dtype=np.int64)
+    candidate_base_states = compute_states_for_digits(candidate_base_digits)
+    candidate_source_states = compute_states_for_digits(candidate_source_digits)
+    candidate_cf_labels_np = compute_counterfactual_labels(candidate_base_states, candidate_source_states)
+    changed_by_var_np, _changed_any_np = _compute_changed_flags(
         base_labels=candidate_base_states["O"],
         cf_labels_by_var=candidate_cf_labels_np,
         policy_vars=pair_policy_vars,
