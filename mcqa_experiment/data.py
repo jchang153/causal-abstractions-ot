@@ -439,22 +439,23 @@ def load_filtered_mcqa_pipeline(
     device: str | None = None,
     batch_size: int = 16,
     dataset_size: int | None = None,
+    hf_token: str | None = None,
 ) -> tuple[object, object, MCQACausalModel, list[TokenPosition], dict[str, list[dict[str, object]]]]:
     """Load Gemma-2-2B, copy the MCQA task setup, and filter to correct examples."""
     import transformers
 
     torch_device = resolve_device(device)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name, token=hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     dtype = torch.float16 if torch_device.type in {"cuda", "mps"} else torch.float32
-    model = transformers.AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+    model = transformers.AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, token=hf_token)
     model.to(torch_device)
     model.eval()
     causal_model = MCQACausalModel()
     token_positions = get_token_positions(tokenizer, causal_model)
-    public_datasets = load_public_mcqa_datasets(size=dataset_size)
+    public_datasets = load_public_mcqa_datasets(size=dataset_size, hf_token=hf_token)
     filtered_datasets = filter_correct_examples(
         model=model,
         tokenizer=tokenizer,
