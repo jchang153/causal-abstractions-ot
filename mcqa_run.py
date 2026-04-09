@@ -20,7 +20,7 @@ SUMMARY_PATH = RUN_DIR / "mcqa_run_summary.txt"
 MODEL_NAME = "google/gemma-2-2b"
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 PROMPT_HF_LOGIN = True
-METHODS = ["das", "ot"]
+METHODS = ["das"] #, "ot"]
 TARGET_VARS = ["answer_pointer"] #, "answer"]
 COUNTERFACTUAL_NAMES = ["answerPosition", "randomLetter", "answerPosition_randomLetter"]
 
