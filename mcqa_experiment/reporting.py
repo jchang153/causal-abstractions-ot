@@ -42,6 +42,24 @@ def format_summary(
     for split, payload in sorted(data_metadata.items()):
         lines.append(f"{split}: {payload}")
     lines.append("")
+    lines.append("pair bank summary:")
+    for split, split_metadata in sorted(data_metadata.items()):
+        if isinstance(split_metadata, dict) and split_metadata:
+            sample_stats = next(iter(split_metadata.values()))
+            lines.append(
+                f"{split} pair bank | total_pairs={int(sample_stats.get('size', 0))} "
+                f"| datasets={sample_stats.get('dataset_names', [])}"
+            )
+            for variable, variable_stats in sorted(split_metadata.items()):
+                total_pairs = int(variable_stats.get("size", 0))
+                changed_count = int(variable_stats.get("changed_count", 0))
+                unchanged_count = max(0, total_pairs - changed_count)
+                lines.append(
+                    f"{split} pair bank [{variable}] | changed={changed_count} "
+                    f"| unchanged={unchanged_count} "
+                    f"| changed_rate={float(variable_stats.get('changed_rate', 0.0)):.4f}"
+                )
+    lines.append("")
     lines.append("method summary:")
     for record in summary_records:
         lines.append(f"{str(record['method']).upper()}: exact={float(record['exact_acc']):.4f}")

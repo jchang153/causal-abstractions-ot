@@ -77,6 +77,22 @@ def main() -> None:
         target_vars=tuple(TARGET_VARS),
     )
     print(f"[run] built splits={list(banks_by_split.keys())}")
+    for split, split_metadata in sorted(data_metadata.items()):
+        if isinstance(split_metadata, dict) and split_metadata:
+            sample_stats = next(iter(split_metadata.values()))
+            print(
+                f"{split} pair bank | total_pairs={int(sample_stats.get('size', 0))} "
+                f"| datasets={sample_stats.get('dataset_names', [])}"
+            )
+            for variable, variable_stats in sorted(split_metadata.items()):
+                total_pairs = int(variable_stats.get("size", 0))
+                changed_count = int(variable_stats.get("changed_count", 0))
+                unchanged_count = max(0, total_pairs - changed_count)
+                print(
+                    f"{split} pair bank [{variable}] | changed={changed_count} "
+                    f"| unchanged={unchanged_count} "
+                    f"| changed_rate={float(variable_stats.get('changed_rate', 0.0)):.4f}"
+                )
     selected_layers = list(range(int(model.config.num_hidden_layers))) if LAYERS == "auto" else list(LAYERS)
     print(f"[run] selected_layers={selected_layers}")
     all_payloads = []
