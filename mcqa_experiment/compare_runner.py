@@ -37,6 +37,7 @@ class CompareExperimentConfig:
     das_plateau_rel_delta: float = 5e-3
     das_learning_rate: float = 1e-3
     das_subspace_dims: tuple[int, ...] | None = None
+    das_store_candidate_holdout_metrics: bool = True
     resolution: int | None = 1
     layers: tuple[int, ...] | None = None
     token_position_ids: tuple[str, ...] | None = None
@@ -117,6 +118,7 @@ def run_comparison(
                         plateau_rel_delta=config.das_plateau_rel_delta,
                         learning_rate=config.das_learning_rate,
                         subspace_dims=config.das_subspace_dims,
+                        store_candidate_holdout_metrics=config.das_store_candidate_holdout_metrics,
                     ),
                 )
             else:

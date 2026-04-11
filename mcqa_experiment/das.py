@@ -24,6 +24,7 @@ class DASConfig:
     plateau_rel_delta: float = 5e-3
     learning_rate: float = 1e-3
     subspace_dims: tuple[int, ...] | None = None
+    store_candidate_holdout_metrics: bool = True
     verbose: bool = True
 
 
@@ -196,6 +197,18 @@ def run_das_pipeline(
                 tokenizer=tokenizer,
                 return_details=False,
             )
+            holdout_metrics_for_candidate = None
+            if config.store_candidate_holdout_metrics:
+                holdout_metrics_for_candidate = evaluate_das_candidate(
+                    model=model,
+                    bank=holdout_bank,
+                    site=site,
+                    intervention=intervention,
+                    batch_size=config.batch_size,
+                    device=device,
+                    tokenizer=tokenizer,
+                    return_details=False,
+                )
             record = {
                 "method": "das",
                 "variable": train_bank.target_var,
@@ -209,13 +222,20 @@ def run_das_pipeline(
                 "train_epochs_ran": len(loss_history),
                 "train_loss_history": loss_history,
             }
+            if holdout_metrics_for_candidate is not None:
+                record["holdout_exact_acc"] = float(holdout_metrics_for_candidate["exact_acc"])
+                if "decoded_answer_acc" in holdout_metrics_for_candidate:
+                    record["holdout_decoded_answer_acc"] = float(holdout_metrics_for_candidate["decoded_answer_acc"])
             search_records.append(record)
             if config.verbose:
-                print(
+                message = (
                     f"[DAS] calibration variable={train_bank.target_var} site={site.label} "
                     f"dim={int(subspace_dim)} epochs={len(loss_history)} "
                     f"exact_acc={float(calibration_metrics['exact_acc']):.4f}"
                 )
+                if holdout_metrics_for_candidate is not None:
+                    message += f" holdout_exact_acc={float(holdout_metrics_for_candidate['exact_acc']):.4f}"
+                print(message)
             if best is None or float(record["selection_exact_acc"]) > float(best["selection_exact_acc"]):
                 best = record
                 best_intervention = intervention

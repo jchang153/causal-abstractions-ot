@@ -28,7 +28,7 @@ COUNTERFACTUAL_NAMES = ["answerPosition", "randomLetter", "answerPosition_random
 LAYERS = "auto"
 TOKEN_POSITION_IDS = ["last_token"] # "correct_symbol", "correct_symbol_period", 
 
-BATCH_SIZE = 8
+BATCH_SIZE = 32
 DATASET_SIZE = None  # Use the full public HF train/validation/test splits before factual filtering.
 
 RESOLUTION = 64 # gemma-2-2b has 2304 hidden layer size
