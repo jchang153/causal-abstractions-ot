@@ -308,7 +308,14 @@ def _infer_next_token_ids(model, input_ids: torch.Tensor, attention_mask: torch.
             use_cache=False,
         )
     logits = outputs.logits
-    last_indices = attention_mask.sum(dim=1).to(torch.long) - 1
+    # Prompts are left-padded in this pipeline, so the final real prompt token
+    # always sits at the last sequence column for every batch element.
+    last_indices = torch.full(
+        (logits.shape[0],),
+        logits.shape[1] - 1,
+        dtype=torch.long,
+        device=logits.device,
+    )
     batch_indices = torch.arange(logits.shape[0], device=logits.device)
     return logits[batch_indices, last_indices].argmax(dim=-1)
 
