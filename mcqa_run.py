@@ -29,9 +29,9 @@ MCQA_DATASET_CONFIG = None
 # MCQA_DATASET_CONFIG = "4_answer_choices"
 DATASET_SIZE = 2000  # Cap raw rows loaded from the dataset before factual filtering.
 SPLIT_SEED = 0
-TRAIN_POOL_SIZE = 400
-CALIBRATION_POOL_SIZE = 200
-TEST_POOL_SIZE = 200
+TRAIN_POOL_SIZE = 200
+CALIBRATION_POOL_SIZE = 100
+TEST_POOL_SIZE = 100
 
 # Experiment
 METHODS = ["ot"]
@@ -41,13 +41,13 @@ COUNTERFACTUAL_NAMES = ["answerPosition", "randomLetter", "answerPosition_random
 LAYERS = "auto"
 TOKEN_POSITION_IDS = ["last_token"] # "correct_symbol", "correct_symbol_period", 
 
-BATCH_SIZE = 500 
+BATCH_SIZE = 64 
 
 RESOLUTION = 64 # gemma-2-2b has 2304 hidden layer size
-OT_EPSILONS = [0.01, 0.1, 1.0, 5.0, 10.0]
+OT_EPSILONS = [2**k for k in range(-5, 4)]
 UOT_BETA_ABSTRACTS = [0.1, 1.0]
 UOT_BETA_NEURALS = [0.1, 1.0]
-SIGNATURE_MODES = ["whole_vocab_kl_t1"]#"answer_logit_delta"
+SIGNATURE_MODES = ["whole_vocab_kl_t1", "answer_logit_delta"]
 OT_TOP_K_VALUES = list(range(1, 11))
 OT_LAMBDAS = [round(value * 0.1, 1) for value in range(1, 31)]
 
