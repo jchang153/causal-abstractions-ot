@@ -25,6 +25,7 @@ _DATASET_CONFIG_UNSET = object()
 
 CANONICAL_ANSWER_STRINGS = (" A", " B", " C", " D")
 CANONICAL_ANSWER_LABELS = ("A", "B", "C", "D")
+ALPHABET_LABELS = tuple(chr(codepoint) for codepoint in range(ord("A"), ord("Z") + 1))
 
 
 class MCQACausalModel:
@@ -102,6 +103,8 @@ class MCQAPairBank:
     symbol_variant_token_ids: torch.Tensor
     source_symbol_token_ids: torch.Tensor
     source_symbol_variant_token_ids: torch.Tensor
+    alphabet_token_ids: torch.Tensor
+    alphabet_variant_token_ids: torch.Tensor
     canonical_answer_token_ids: torch.Tensor
     answer_token_ids: torch.Tensor
     base_answer_token_ids: torch.Tensor
@@ -143,6 +146,8 @@ class MCQAPairDataset(torch.utils.data.Dataset):
             "symbol_variant_token_ids": self.bank.symbol_variant_token_ids[index],
             "source_symbol_token_ids": self.bank.source_symbol_token_ids[index],
             "source_symbol_variant_token_ids": self.bank.source_symbol_variant_token_ids[index],
+            "alphabet_token_ids": self.bank.alphabet_token_ids[index],
+            "alphabet_variant_token_ids": self.bank.alphabet_variant_token_ids[index],
             "answer_token_id": self.bank.answer_token_ids[index],
             "base_answer_token_id": self.bank.base_answer_token_ids[index],
             "base_positions": {key: value[index] for key, value in self.bank.base_position_by_id.items()},
@@ -410,6 +415,13 @@ def _encode_symbol_token_variants(symbol: str, tokenizer) -> tuple[int, int]:
     return (variant_ids[0], variant_ids[1])
 
 
+def _alphabet_index(symbol: str) -> int:
+    normalized = normalize_answer_text(symbol)
+    if len(normalized) != 1 or normalized not in ALPHABET_LABELS:
+        raise ValueError(f"Expected uppercase alphabet symbol, got {symbol!r}")
+    return ALPHABET_LABELS.index(normalized)
+
+
 def build_pair_banks(
     *,
     tokenizer,
@@ -477,6 +489,14 @@ def build_pair_banks(
             ],
             dtype=torch.long,
         )
+        alphabet_variant_token_ids = torch.tensor(
+            [
+                [_encode_symbol_token_variants(letter, tokenizer) for letter in ALPHABET_LABELS]
+                for _ in base_inputs
+            ],
+            dtype=torch.long,
+        )
+        alphabet_token_ids = alphabet_variant_token_ids[:, :, 0]
         answer_token_ids = torch.tensor(
             [_encode_symbol_token(str(source_output["answer"]).strip(), tokenizer) for source_output in source_outputs],
             dtype=torch.long,
@@ -485,8 +505,8 @@ def build_pair_banks(
             [_encode_symbol_token(str(base_output["answer"]).strip(), tokenizer) for base_output in base_outputs],
             dtype=torch.long,
         )
-        answer_pointer_labels = torch.tensor(
-            [int(source_output["answer_pointer"]) for source_output in source_outputs],
+        answer_label_indices = torch.tensor(
+            [_alphabet_index(str(source_output["answer"])) for source_output in source_outputs],
             dtype=torch.long,
         )
         changed_pointer = torch.tensor(
@@ -506,10 +526,10 @@ def build_pair_banks(
         banks: dict[str, MCQAPairBank] = {}
         for target_var in target_vars:
             if target_var == "answer_pointer":
-                labels = answer_pointer_labels
+                labels = answer_label_indices
                 changed_mask = changed_pointer
             elif target_var == "answer":
-                labels = answer_pointer_labels
+                labels = answer_label_indices
                 changed_mask = changed_answer
             else:
                 raise ValueError(f"Unsupported MCQA target variable {target_var}")
@@ -532,6 +552,8 @@ def build_pair_banks(
                 symbol_variant_token_ids=symbol_variant_token_ids,
                 source_symbol_token_ids=source_symbol_token_ids,
                 source_symbol_variant_token_ids=source_symbol_variant_token_ids,
+                alphabet_token_ids=alphabet_token_ids,
+                alphabet_variant_token_ids=alphabet_variant_token_ids,
                 canonical_answer_token_ids=canonical_answer_token_ids,
                 answer_token_ids=answer_token_ids,
                 base_answer_token_ids=base_answer_token_ids,
