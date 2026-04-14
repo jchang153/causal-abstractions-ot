@@ -179,12 +179,35 @@ def choose_better_result(candidate: dict[str, object], incumbent: dict[str, obje
     return float(candidate["selection_exact_acc"]) > float(incumbent["selection_exact_acc"])
 
 
+def _serialize_rotation_parameters(intervenable) -> dict[str, object]:
+    """Extract the learned DAS rotation parameters in JSON-serializable form."""
+    rotations = []
+    for key, intervention in intervenable.interventions.items():
+        rotate_layer = getattr(intervention, "rotate_layer", None)
+        if rotate_layer is None:
+            continue
+        state = {
+            name: value.detach().cpu().tolist()
+            for name, value in rotate_layer.state_dict().items()
+        }
+        rotations.append(
+            {
+                "intervention_key": str(key),
+                "module": type(rotate_layer).__name__,
+                "weight": rotate_layer.weight.detach().cpu().tolist(),
+                "state_dict": state,
+            }
+        )
+    return {"rotations": rotations}
+
+
 def run_das_search_for_variable(
     model: VariableWidthMLPForClassification,
     variable: str,
     train_bank: PairBank,
     calibration_bank: PairBank | dict[str, PairBank],
     holdout_bank: PairBank | dict[str, PairBank],
+    invariant_holdout_bank: PairBank | dict[str, PairBank] | None,
     device: torch.device,
     config: DASConfig,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
@@ -284,8 +307,19 @@ def run_das_search_for_variable(
         **best_record,
         "split": variable_holdout_bank.split,
         "seed": variable_holdout_bank.seed,
+        "selected_rotation": _serialize_rotation_parameters(best_intervenable),
         **holdout_metrics,
     }
+    if invariant_holdout_bank is not None:
+        invariant_dataset = PairBankVariableDataset(_resolve_bank_for_variable(invariant_holdout_bank, variable), variable)
+        invariant_metrics = evaluate_rotated_intervention(
+            intervenable=best_intervenable,
+            dataset=invariant_dataset,
+            spec=best_spec,
+            batch_size=config.batch_size,
+            device=device,
+        )
+        result_record["invariant_exact_acc"] = float(invariant_metrics["exact_acc"])
     return result_record, all_records
 
 
@@ -296,6 +330,7 @@ def run_das_pipeline(
     holdout_bank: PairBank | dict[str, PairBank],
     device: torch.device | str,
     config: DASConfig,
+    invariant_holdout_bank: PairBank | dict[str, PairBank] | None = None,
 ) -> dict[str, object]:
     """Run DAS for every abstract variable on shared pair-bank splits."""
     device = torch.device(device)
@@ -308,6 +343,7 @@ def run_das_pipeline(
             train_bank=train_bank,
             calibration_bank=calibration_bank,
             holdout_bank=holdout_bank,
+            invariant_holdout_bank=invariant_holdout_bank,
             device=device,
             config=config,
         )
@@ -324,6 +360,10 @@ def run_das_pipeline(
             variable: _resolve_bank_for_variable(holdout_bank, variable).metadata()
             for variable in config.target_vars
         } if isinstance(holdout_bank, dict) else holdout_bank.metadata(),
+        "invariant_holdout_bank": {
+            variable: _resolve_bank_for_variable(invariant_holdout_bank, variable).metadata()
+            for variable in config.target_vars
+        } if isinstance(invariant_holdout_bank, dict) else (invariant_holdout_bank.metadata() if invariant_holdout_bank is not None else None),
         "target_vars": list(config.target_vars),
         "training_stopping_rule": {
             "type": "plateau_on_train_loss",

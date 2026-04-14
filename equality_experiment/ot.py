@@ -1106,10 +1106,54 @@ def run_alignment_pipeline(
     holdout_bank: PairBank | dict[str, PairBank],
     device: torch.device | str,
     config: OTConfig,
+    invariant_holdout_bank: PairBank | dict[str, PairBank] | None = None,
+    prepared: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Run OT, GW, or FGW end to end on shared pair-bank splits."""
     device = torch.device(device)
-    sites = enumerate_canonical_sites(model, resolution=config.resolution)
+    if prepared is None:
+        sites = enumerate_canonical_sites(model, resolution=config.resolution)
+        base_logits = collect_base_logits(model, fit_bank.base_inputs, config.batch_size, device)
+        site_signatures = collect_site_signatures(
+            model=model,
+            bank=fit_bank,
+            sites=sites,
+            base_logits=base_logits,
+            batch_size=config.batch_size,
+            device=device,
+            signature_mode=config.signature_mode,
+        )
+        variable_signatures = build_variable_signatures(
+            bank=fit_bank,
+            num_classes=int(model.config.num_classes),
+            target_vars=tuple(config.target_vars),
+            signature_mode=config.signature_mode,
+        )
+        cost_var, cost_site = build_geometry_costs(
+            variable_signatures=variable_signatures,
+            site_signatures=site_signatures,
+            metric=config.geometry_metric,
+            normalize=config.normalize_cost_matrices,
+        )
+        cost_cross = (
+            _squared_euclidean_cost(variable_signatures, site_signatures).detach().cpu().numpy()
+            if config.method in {"ot", "uot"}
+            else build_cross_cost(
+                variable_signatures=variable_signatures,
+                site_signatures=site_signatures,
+                metric=config.geometry_metric,
+                normalize=config.normalize_cost_matrices,
+            )
+        )
+        prepared = {
+            "sites": sites,
+            "site_signatures": site_signatures,
+            "variable_signatures": variable_signatures,
+            "cost_var": cost_var,
+            "cost_site": cost_site,
+            "cost_cross": cost_cross,
+        }
+    sites = prepared["sites"]
     if config.selection_verbose:
         print(
             f"{str(config.method).upper()} training "
@@ -1118,44 +1162,17 @@ def run_alignment_pipeline(
             f"| holdout_examples={_resolve_bank_for_variable(holdout_bank, config.target_vars[0]).size} "
             f"| sites={len(sites)}"
         )
-
-    base_logits = collect_base_logits(model, fit_bank.base_inputs, config.batch_size, device)
-    site_signatures = collect_site_signatures(
-        model=model,
-        bank=fit_bank,
-        sites=sites,
-        base_logits=base_logits,
-        batch_size=config.batch_size,
-        device=device,
-        signature_mode=config.signature_mode,
-    )
-    variable_signatures = build_variable_signatures(
-        bank=fit_bank,
-        num_classes=int(model.config.num_classes),
-        target_vars=tuple(config.target_vars),
-        signature_mode=config.signature_mode,
-    )
-    cost_var, cost_site = build_geometry_costs(
-        variable_signatures=variable_signatures,
-        site_signatures=site_signatures,
-        metric=config.geometry_metric,
-        normalize=config.normalize_cost_matrices,
-    )
+    site_signatures = prepared["site_signatures"]
+    variable_signatures = prepared["variable_signatures"]
+    cost_var = prepared["cost_var"]
+    cost_site = prepared["cost_site"]
     p = np.ones(variable_signatures.shape[0], dtype=np.float64) / float(variable_signatures.shape[0])
     q = np.ones(site_signatures.shape[0], dtype=np.float64) / float(site_signatures.shape[0])
 
     if config.method == "gw":
         transport, transport_meta = solve_gw_transport(cost_var, cost_site, p, q, config)
     else:
-        if config.method in {"ot", "uot"}:
-            cost_cross = _squared_euclidean_cost(variable_signatures, site_signatures).detach().cpu().numpy()
-        else:
-            cost_cross = build_cross_cost(
-                variable_signatures=variable_signatures,
-                site_signatures=site_signatures,
-                metric=config.geometry_metric,
-                normalize=config.normalize_cost_matrices,
-            )
+        cost_cross = prepared["cost_cross"]
         if config.method == "ot":
             transport, transport_meta = solve_ot_transport(variable_signatures, site_signatures, config)
         elif config.method == "uot":
@@ -1176,6 +1193,14 @@ def run_alignment_pipeline(
                 variable: _resolve_bank_for_variable(holdout_bank, variable).metadata()
                 for variable in config.target_vars
             } if isinstance(holdout_bank, dict) else holdout_bank.metadata(),
+            "invariant_holdout_bank": (
+                {
+                    variable: _resolve_bank_for_variable(invariant_holdout_bank, variable).metadata()
+                    for variable in config.target_vars
+                }
+                if isinstance(invariant_holdout_bank, dict)
+                else (invariant_holdout_bank.metadata() if invariant_holdout_bank is not None else None)
+            ),
             "target_vars": list(config.target_vars),
             "sites": [site.label for site in sites],
             "transport": transport.tolist() if isinstance(transport, np.ndarray) else None,
@@ -1255,6 +1280,31 @@ def run_alignment_pipeline(
         record["continuous_cutoff"] = None
         record["calibration_exact_acc"] = float(calibration_record["exact_acc"])
 
+    if invariant_holdout_bank is not None:
+        invariant_results = []
+        for variable in config.target_vars:
+            variable_index = config.target_vars.index(variable)
+            variable_transport = truncated_transport[variable_index : variable_index + 1]
+            variable_rankings = {variable: rankings[variable]}
+            variable_results, _ = evaluate_soft_transport_interventions(
+                method_name=str(config.method),
+                model=model,
+                evaluation_bank=_resolve_bank_for_variable(invariant_holdout_bank, variable),
+                sites=sites,
+                transport_weights=variable_transport,
+                rankings=variable_rankings,
+                target_vars=(variable,),
+                top_k_by_variable={variable: selected_top_k_by_variable[variable]},
+                lambda_by_variable={variable: selected_lambda_by_variable[variable]},
+                batch_size=config.batch_size,
+                device=device,
+            )
+            invariant_results.extend(variable_results)
+        invariant_by_variable = {str(record["variable"]): record for record in invariant_results}
+        for record in final_results:
+            invariant_record = invariant_by_variable.get(str(record["variable"]))
+            record["invariant_exact_acc"] = float(invariant_record["exact_acc"]) if invariant_record is not None else 0.0
+
     layer_candidate_summaries = {}
     for variable, candidates in calibration_selection["search_records"].items():
         top_site_label = rankings[variable][0]["site_label"] if rankings[variable] else "n/a"
@@ -1285,6 +1335,14 @@ def run_alignment_pipeline(
             variable: _resolve_bank_for_variable(holdout_bank, variable).metadata()
             for variable in config.target_vars
         } if isinstance(holdout_bank, dict) else holdout_bank.metadata(),
+        "invariant_holdout_bank": (
+            {
+                variable: _resolve_bank_for_variable(invariant_holdout_bank, variable).metadata()
+                for variable in config.target_vars
+            }
+            if isinstance(invariant_holdout_bank, dict)
+            else (invariant_holdout_bank.metadata() if invariant_holdout_bank is not None else None)
+        ),
         "target_vars": list(config.target_vars),
         "sites": [site.label for site in sites],
         "transport": transport.tolist(),

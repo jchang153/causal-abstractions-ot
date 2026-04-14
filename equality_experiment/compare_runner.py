@@ -7,6 +7,8 @@ from pathlib import Path
 from time import perf_counter
 
 from .ot import OTConfig, run_alignment_pipeline
+from .ot import build_cross_cost, build_geometry_costs, build_variable_signatures, collect_base_logits, collect_site_signatures
+from .pyvene_utils import enumerate_canonical_sites
 
 from .backbone import EqualityTrainConfig, load_backbone
 from .constants import (
@@ -125,6 +127,7 @@ def _build_summary_lines(
     train_bank,
     calibration_bank,
     test_bank,
+    invariant_test_bank,
     method_payloads: dict[str, dict[str, object]],
     method_runtime_seconds: dict[str, float],
     summary_records: list[dict[str, object]],
@@ -195,6 +198,8 @@ def _build_summary_lines(
     _extend_bank_summary_lines(summary_lines, train_bank)
     _extend_bank_summary_lines(summary_lines, calibration_bank)
     _extend_bank_summary_lines(summary_lines, test_bank)
+    if invariant_test_bank is not None:
+        _extend_bank_summary_lines(summary_lines, invariant_test_bank)
     summary_lines.append("")
     for method in config.methods:
         summary_lines.append(format_method_selection_summary(method_selections[method]))
@@ -203,7 +208,8 @@ def _build_summary_lines(
     for record in summary_records:
         summary_lines.append(
             f"{str(record['method']).upper()}: "
-            f"exact={float(record['exact_acc']):.4f}, "
+            f"sensitive_exact={float(record['exact_acc']):.4f}, "
+            f"invariant_exact={float(record.get('invariant_exact_acc', 0.0)):.4f}, "
             f"runtime_s={float(method_runtime_seconds.get(str(record['method']), 0.0)):.2f}"
         )
     candidate_sections = []
@@ -287,6 +293,8 @@ def run_comparison_with_banks(
     train_bank,
     calibration_bank,
     test_bank,
+    invariant_test_bank=None,
+    transport_prepare_cache: dict[tuple[object, ...], dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Run the shared OT/DAS alignment evaluation from prebuilt pair-bank splits."""
 
@@ -297,34 +305,91 @@ def run_comparison_with_banks(
         print(f"[{method_index}/{len(config.methods)}] Starting {method.upper()}")
         method_start_time = perf_counter()
         if method in {"gw", "ot", "uot", "fgw"}:
+            ot_config = OTConfig(
+                method=method,
+                batch_size=config.batch_size,
+                resolution=config.resolution,
+                alpha=config.fgw_alpha,
+                epsilon=config.ot_epsilon,
+                tau=config.ot_tau,
+                uot_beta_abstract=config.uot_beta_abstract,
+                uot_beta_neural=config.uot_beta_neural,
+                solver_backend=config.transport_solver_backend,
+                signature_mode=getattr(config, "signature_mode", "prob_delta"),
+                target_vars=tuple(config.target_vars),
+                top_k_values=config.ot_top_k_values,
+                lambda_values=config.ot_lambdas,
+            )
+            prepared = None
+            prepare_runtime_seconds = 0.0
+            if transport_prepare_cache is not None:
+                cache_key = (
+                    int(config.resolution),
+                    str(getattr(config, "signature_mode", "prob_delta")),
+                    tuple(config.target_vars),
+                    int(config.batch_size),
+                )
+                prepared = transport_prepare_cache.get(cache_key)
+                if prepared is None:
+                    prepare_start_time = perf_counter()
+                    sites = enumerate_canonical_sites(model, resolution=ot_config.resolution)
+                    base_logits = collect_base_logits(model, train_bank.base_inputs, ot_config.batch_size, device)
+                    site_signatures = collect_site_signatures(
+                        model=model,
+                        bank=train_bank,
+                        sites=sites,
+                        base_logits=base_logits,
+                        batch_size=ot_config.batch_size,
+                        device=device,
+                        signature_mode=ot_config.signature_mode,
+                    )
+                    variable_signatures = build_variable_signatures(
+                        bank=train_bank,
+                        num_classes=int(model.config.num_classes),
+                        target_vars=tuple(ot_config.target_vars),
+                        signature_mode=ot_config.signature_mode,
+                    )
+                    cost_var, cost_site = build_geometry_costs(
+                        variable_signatures=variable_signatures,
+                        site_signatures=site_signatures,
+                        metric=ot_config.geometry_metric,
+                        normalize=ot_config.normalize_cost_matrices,
+                    )
+                    cost_cross = build_cross_cost(
+                        variable_signatures=variable_signatures,
+                        site_signatures=site_signatures,
+                        metric=ot_config.geometry_metric,
+                        normalize=ot_config.normalize_cost_matrices,
+                    )
+                    prepared = {
+                        "sites": sites,
+                        "site_signatures": site_signatures,
+                        "variable_signatures": variable_signatures,
+                        "cost_var": cost_var,
+                        "cost_site": cost_site,
+                        "cost_cross": cost_cross,
+                        "prepare_runtime_seconds": float(perf_counter() - prepare_start_time),
+                    }
+                    transport_prepare_cache[cache_key] = prepared
+                prepare_runtime_seconds = float(prepared.get("prepare_runtime_seconds", 0.0))
             payload = run_alignment_pipeline(
                 model=model,
                 fit_bank=train_bank,
                 calibration_bank=calibration_bank,
                 holdout_bank=test_bank,
+                invariant_holdout_bank=invariant_test_bank,
                 device=device,
-                config=OTConfig(
-                    method=method,
-                    batch_size=config.batch_size,
-                    resolution=config.resolution,
-                    alpha=config.fgw_alpha,
-                    epsilon=config.ot_epsilon,
-                    tau=config.ot_tau,
-                    uot_beta_abstract=config.uot_beta_abstract,
-                    uot_beta_neural=config.uot_beta_neural,
-                    solver_backend=config.transport_solver_backend,
-                    signature_mode=getattr(config, "signature_mode", "prob_delta"),
-                    target_vars=tuple(config.target_vars),
-                    top_k_values=config.ot_top_k_values,
-                    lambda_values=config.ot_lambdas,
-                ),
+                config=ot_config,
+                prepared=prepared,
             )
+            payload["signature_prepare_runtime_seconds"] = float(prepare_runtime_seconds)
         elif method == "das":
             payload = run_das_pipeline(
                 model=model,
                 train_bank=train_bank,
                 calibration_bank=calibration_bank,
                 holdout_bank=test_bank,
+                invariant_holdout_bank=invariant_test_bank,
                 device=device,
                 config=DASConfig(
                     batch_size=config.batch_size,
@@ -341,11 +406,16 @@ def run_comparison_with_banks(
         else:
             raise ValueError(f"Unsupported method {method}")
         runtime_seconds = perf_counter() - method_start_time
-        payload["runtime_seconds"] = float(runtime_seconds)
+        reported_runtime_seconds = float(runtime_seconds) + float(payload.get("signature_prepare_runtime_seconds", 0.0))
+        payload["runtime_seconds"] = reported_runtime_seconds
+        payload["wall_runtime_seconds"] = float(runtime_seconds)
         method_payloads[method] = payload
-        method_runtime_seconds[method] = float(runtime_seconds)
+        method_runtime_seconds[method] = reported_runtime_seconds
         all_records.extend(payload["results"])
-        print(f"{method.upper()} runtime: {float(runtime_seconds):.2f}s")
+        print(
+            f"{method.upper()} runtime: {float(reported_runtime_seconds):.2f}s "
+            f"(wall={float(runtime_seconds):.2f}s, signatures={float(payload.get('signature_prepare_runtime_seconds', 0.0)):.2f}s)"
+        )
         print()
 
     summary_records = summarize_method_records(all_records)
@@ -370,6 +440,7 @@ def run_comparison_with_banks(
         train_bank=train_bank,
         calibration_bank=calibration_bank,
         test_bank=test_bank,
+        invariant_test_bank=invariant_test_bank,
         method_payloads=method_payloads,
         method_runtime_seconds=method_runtime_seconds,
         summary_records=summary_records,
@@ -389,10 +460,12 @@ def run_comparison_with_banks(
             "train": _bank_metadata(train_bank),
             "calibration": _bank_metadata(calibration_bank),
             "test": _bank_metadata(test_bank),
+            "invariant_test": _bank_metadata(invariant_test_bank) if invariant_test_bank is not None else None,
         },
         "results": all_records,
         "method_summary": summary_records,
         "method_selections": method_selections,
+        "method_payloads": method_payloads,
         "method_runtime_seconds": method_runtime_seconds,
     }
 

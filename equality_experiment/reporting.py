@@ -26,7 +26,7 @@ def print_results_table(records: list[dict[str, object]], title: str) -> None:
         print("(no records)")
         return
 
-    header = f"{'method':<8} {'variable':<8} {'exact':>8} {'select/cal':>10} {'site/config':<24}"
+    header = f"{'method':<8} {'variable':<8} {'sens':>8} {'inv':>8} {'select/cal':>10} {'site/config':<24}"
     print(header)
     print("-" * len(header))
     for record in records:
@@ -34,6 +34,7 @@ def print_results_table(records: list[dict[str, object]], title: str) -> None:
             f"{str(record['method']):<8} "
             f"{str(record.get('variable', 'average')):<8} "
             f"{float(record['exact_acc']):>8.4f} "
+            f"{float(record.get('invariant_exact_acc', 0.0)):>8.4f} "
             f"{float(record.get('selection_exact_acc', 0.0)):>10.4f} "
             f"{_format_site_config(record):<24}"
         )
@@ -48,10 +49,12 @@ def summarize_method_records(records: list[dict[str, object]]) -> list[dict[str,
     summaries = []
     for method, method_records in sorted(grouped.items()):
         exact_avg = sum(float(record["exact_acc"]) for record in method_records) / len(method_records)
+        invariant_exact_avg = sum(float(record.get("invariant_exact_acc", 0.0)) for record in method_records) / len(method_records)
         summaries.append(
             {
                 "method": method,
                 "exact_acc": exact_avg,
+                "invariant_exact_acc": invariant_exact_avg,
             }
         )
     return summaries
@@ -80,6 +83,7 @@ def build_method_selection_summary(method: str, payload: dict[str, object]) -> d
                     "lambda": record.get("lambda"),
                     "calibration_exact_acc": record.get("calibration_exact_acc", 0.0),
                     "exact_acc": record["exact_acc"],
+                    "invariant_exact_acc": record.get("invariant_exact_acc", 0.0),
                 }
                 for record in payload.get("results", [])
             ],
@@ -98,6 +102,7 @@ def build_method_selection_summary(method: str, payload: dict[str, object]) -> d
                     "train_epochs_ran": record.get("train_epochs_ran"),
                     "calibration_exact_acc": record.get("calibration_exact_acc", 0.0),
                     "exact_acc": record["exact_acc"],
+                    "invariant_exact_acc": record.get("invariant_exact_acc", 0.0),
                 }
                 for record in payload.get("results", [])
             ],
@@ -154,7 +159,8 @@ def format_method_selection_summary(summary: dict[str, object]) -> str:
                 f"{variable}: layer={selected_layer}, top_k={top_k}, cutoff={continuous_cutoff}, "
                 f"lambda={lambda_value}, top_site={record.get('top_site_label')}, "
                 f"cal_exact={float(record.get('calibration_exact_acc', 0.0)):.4f}, "
-                f"test_exact={float(record['exact_acc']):.4f}"
+                f"test_exact={float(record['exact_acc']):.4f}, "
+                f"invariant_test_exact={float(record.get('invariant_exact_acc', 0.0)):.4f}"
             )
         return "\n".join(lines)
 
@@ -169,7 +175,8 @@ def format_method_selection_summary(summary: dict[str, object]) -> str:
             f"{record['variable']}: site={record['site_label']}, layer={record.get('layer')}, "
             f"subspace_dim={record.get('subspace_dim')}, epochs_ran={record.get('train_epochs_ran')}, "
             f"cal_exact={float(record.get('calibration_exact_acc', 0.0)):.4f}, "
-            f"test_exact={float(record['exact_acc']):.4f}"
+            f"test_exact={float(record['exact_acc']):.4f}, "
+            f"invariant_test_exact={float(record.get('invariant_exact_acc', 0.0)):.4f}"
         )
     return "\n".join(lines)
 

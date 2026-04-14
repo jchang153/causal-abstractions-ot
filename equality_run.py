@@ -6,10 +6,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 from equality_experiment.backbone import EqualityTrainConfig, load_backbone, train_backbone
 from equality_experiment.compare_runner import CompareExperimentConfig, run_comparison_with_banks
-from equality_experiment.pair_bank import build_pair_bank
+from equality_experiment.pair_bank import PairBank, build_pair_bank
 from equality_experiment.plots import get_method_color
 from equality_experiment.reporting import format_method_selection_summary, write_text_report
 from equality_experiment.runtime import ensure_parent_dir, resolve_device, write_json
@@ -24,7 +25,7 @@ OUTPUT_PATH = RUN_DIR / "equality_run_results.json"
 SUMMARY_PATH = RUN_DIR / "equality_run_summary.txt"
 RETRAIN_BACKBONE = False
 
-METHODS = ["ot"] #, "uot", "das"]
+METHODS = ["ot","uot","das"]
 TARGET_VARS = ["WX", "YZ"]
 TRANSPORT_METHODS = tuple(method for method in METHODS if method in {"ot", "uot", "gw", "fgw"})
 NON_TRANSPORT_METHODS = tuple(method for method in METHODS if method not in {"ot", "uot", "gw", "fgw"})
@@ -42,7 +43,7 @@ EVAL_BATCH_SIZE = 1024
 
 TRAIN_PAIR_SIZE = 1000
 CALIBRATION_PAIR_SIZE = 1000
-TEST_PAIR_SIZE = 1000
+TEST_PAIR_SIZE = 5000
 
 # `*_PAIR_POLICY_TARGET` can be one of:
 #   - "any", "WX", "YZ", "both", "C1_only", "C2_only"
@@ -51,20 +52,27 @@ TRAIN_PAIR_POLICY_TARGET = "any"
 TRAIN_MIXED_POSITIVE_FRACTION = 0.5
 TRAIN_PAIR_POOL_SIZE = 2048
 
-CALIBRATION_PAIR_POLICY = "mixed"
-CALIBRATION_PAIR_POLICY_TARGET = "WX"
-CALIBRATION_MIXED_POSITIVE_FRACTION = 1.0
 CALIBRATION_PAIR_POOL_SIZE = 2048
+# Calibration strategy options:
+# - "shared_wx_positive": one shared calibration bank containing only pairs where WX is sensitive.
+# - "shared_yz_positive": one shared calibration bank containing only pairs where YZ is sensitive.
+# - "shared_any_positive": one shared calibration bank containing only pairs where at least one target variable is sensitive.
+# - "shared_any_mixed50": one shared calibration bank targeted to any sensitivity with a 50/50 sensitive-invariant mix.
+# - "shared_both_positive": one shared calibration bank containing only pairs where both WX and YZ are sensitive.
+# - "shared_balanced_wx_yz_only": one shared calibration bank made by concatenating half WX-sensitive/YZ-invariant pairs and half YZ-sensitive/WX-invariant pairs.
+# - "separate_variable_positive": separate calibration banks for WX and YZ, each containing pairs where that variable is sensitive.
+# - "separate_variable_only": separate calibration banks containing WX-sensitive/YZ-invariant pairs and YZ-sensitive/WX-invariant pairs, respectively.
+# - "sensitive_test_eval": separate calibration banks for WX and YZ using the sensitive-test settings below.
+CALIBRATION_STRATEGY = "shared_balanced_wx_yz_only"
 
-TEST_PAIR_POLICY = "mixed"
-TEST_PAIR_POLICY_TARGET = "WX"
-TEST_MIXED_POSITIVE_FRACTION = 1.0
-TEST_PAIR_POOL_SIZE = 2048
-
-TARGETED_EVAL = True
-TARGETED_PAIR_POLICY = "mixed"
-TARGETED_MIXED_POSITIVE_FRACTION = 1.0
-TARGETED_PAIR_POOL_SIZE = 2048
+SENSITIVE_TEST_EVAL = True
+SENSITIVE_TEST_PAIR_POLICY = "mixed"
+SENSITIVE_TEST_MIXED_POSITIVE_FRACTION = 1.0
+SENSITIVE_TEST_PAIR_POOL_SIZE = 2048
+INVARIANT_TEST_EVAL = True
+INVARIANT_TEST_PAIR_POLICY = "mixed"
+INVARIANT_TEST_MIXED_POSITIVE_FRACTION = 0.0
+INVARIANT_TEST_PAIR_POOL_SIZE = 2048
 
 # shared evaluation batch size (for training DAS or for calibrating )
 BATCH_SIZE = 128
@@ -72,20 +80,21 @@ BATCH_SIZE = 128
 RESOLUTION = 1
 FGW_ALPHA = 0.5
 TRANSPORT_SOLVER_BACKEND = "custom"  # "custom" or "pot"
-OT_EPSILONS = [1.0, 3.0, 10.0, 15.0, 20.0]# [0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0]
+OT_EPSILONS = [5, 10, 20, 30] # [0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0]
 OT_TAUS = [1.0]
-UOT_BETA_ABSTRACTS = [0.1, 1.0]
-UOT_BETA_NEURALS = [0.1, 1.0]
+UOT_BETA_ABSTRACTS = [1e6]
+UOT_BETA_NEURALS = [0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
 SIGNATURE_MODES = ["prob_delta"]
 OT_TOP_K_VALUES = list(range(1, 21))
-OT_LAMBDAS = [round(x * 0.1, 1) for x in range(1, 81)]
+# OT_LAMBDAS = [round(x * 0.1, 1) for x in range(1, 81)]
+OT_LAMBDAS = [i for i in range(1, 81)]
 
 DAS_MAX_EPOCHS = 1000
 DAS_MIN_EPOCHS = 5
 DAS_PLATEAU_PATIENCE = 1
 DAS_PLATEAU_REL_DELTA = 1e-2
 DAS_LEARNING_RATE = 1e-3
-DAS_SUBSPACE_DIMS = [1, 4, 8, 12, 16]
+DAS_SUBSPACE_DIMS = [i+1 for i in range(16)]
 DAS_LAYERS = None
 
 
@@ -140,6 +149,206 @@ def _format_beta_tag(beta: float) -> str:
     return f"{float(beta):.6f}".rstrip("0").rstrip(".")
 
 
+def _pair_stats_from_bank(bank: PairBank) -> dict[str, object]:
+    """Recompute pair stats for a concatenated bank."""
+    per_variable = {}
+    for variable in bank.pair_policy_vars:
+        changed = int(bank.changed_by_var[variable].to(torch.int64).sum().item())
+        total = int(bank.size)
+        per_variable[variable] = {
+            "changed_count": changed,
+            "unchanged_count": total - changed,
+            "changed_rate": float(changed / total) if total else 0.0,
+        }
+    changed_any = int(bank.changed_any.to(torch.int64).sum().item())
+    total = int(bank.size)
+    return {
+        "total_pairs": total,
+        "changed_any_count": changed_any,
+        "unchanged_any_count": total - changed_any,
+        "changed_any_rate": float(changed_any / total) if total else 0.0,
+        "per_variable": per_variable,
+    }
+
+
+def _concat_pair_banks(
+    banks: list[PairBank],
+    *,
+    split: str,
+    seed: int,
+    pair_policy: str,
+    pair_policy_target: str,
+    mixed_positive_fraction: float,
+) -> PairBank:
+    """Concatenate multiple compatible pair banks into one logical bank."""
+    if not banks:
+        raise ValueError("Expected at least one bank to concatenate")
+    first = banks[0]
+    for bank in banks[1:]:
+        if bank.target_vars != first.target_vars:
+            raise ValueError("Mismatched target_vars across banks")
+        if bank.pair_policy_vars != first.pair_policy_vars:
+            raise ValueError("Mismatched pair_policy_vars across banks")
+
+    merged = PairBank(
+        split=split,
+        seed=seed,
+        base_rows=torch.cat([bank.base_rows for bank in banks], dim=0),
+        source_rows=torch.cat([bank.source_rows for bank in banks], dim=0),
+        base_inputs=torch.cat([bank.base_inputs for bank in banks], dim=0),
+        source_inputs=torch.cat([bank.source_inputs for bank in banks], dim=0),
+        base_labels=torch.cat([bank.base_labels for bank in banks], dim=0),
+        cf_labels_by_var={
+            variable: torch.cat([bank.cf_labels_by_var[variable] for bank in banks], dim=0)
+            for variable in first.target_vars
+        },
+        changed_by_var={
+            variable: torch.cat([bank.changed_by_var[variable] for bank in banks], dim=0)
+            for variable in first.pair_policy_vars
+        },
+        changed_any=torch.cat([bank.changed_any for bank in banks], dim=0),
+        pair_policy=pair_policy,
+        pair_policy_target=pair_policy_target,
+        mixed_positive_fraction=float(mixed_positive_fraction),
+        target_vars=first.target_vars,
+        pair_policy_vars=first.pair_policy_vars,
+        pair_pool_size=None,
+        pair_stats={},
+    )
+    return PairBank(
+        split=merged.split,
+        seed=merged.seed,
+        base_rows=merged.base_rows,
+        source_rows=merged.source_rows,
+        base_inputs=merged.base_inputs,
+        source_inputs=merged.source_inputs,
+        base_labels=merged.base_labels,
+        cf_labels_by_var=merged.cf_labels_by_var,
+        changed_by_var=merged.changed_by_var,
+        changed_any=merged.changed_any,
+        pair_policy=merged.pair_policy,
+        pair_policy_target=merged.pair_policy_target,
+        mixed_positive_fraction=merged.mixed_positive_fraction,
+        target_vars=merged.target_vars,
+        pair_policy_vars=merged.pair_policy_vars,
+        pair_pool_size=merged.pair_pool_size,
+        pair_stats=_pair_stats_from_bank(merged),
+    )
+
+
+def _build_shared_bank(
+    problem,
+    *,
+    size: int,
+    seed: int,
+    split: str,
+    target: str,
+    positive_fraction: float,
+    pair_pool_size: int,
+) -> PairBank:
+    """Build one shared bank using the standard mixed-pair constructor."""
+    return build_pair_bank(
+        problem,
+        size,
+        seed,
+        split,
+        target_vars=tuple(TARGET_VARS),
+        pair_policy="mixed",
+        pair_policy_target=target,
+        mixed_positive_fraction=positive_fraction,
+        pair_pool_size=pair_pool_size,
+    )
+
+
+def _build_calibration_bank(problem, seed: int):
+    """Build calibration banks using any strategy from the calibration sweep."""
+    strategy = str(CALIBRATION_STRATEGY)
+    base_seed = int(seed) + 300
+    if strategy in {"targeted_eval", "sensitive_test_eval"}:
+        return {
+            variable: _build_shared_bank(
+                problem,
+                size=CALIBRATION_PAIR_SIZE,
+                seed=base_seed + 1 + idx,
+                split=f"calibration_{variable.lower()}",
+                target=variable,
+                positive_fraction=SENSITIVE_TEST_MIXED_POSITIVE_FRACTION,
+                pair_pool_size=SENSITIVE_TEST_PAIR_POOL_SIZE,
+            )
+            for idx, variable in enumerate(TARGET_VARS)
+        }
+    if strategy == "shared_wx_positive":
+        return _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE, seed=base_seed + 1, split="calibration", target="WX", positive_fraction=1.0, pair_pool_size=CALIBRATION_PAIR_POOL_SIZE)
+    if strategy == "shared_yz_positive":
+        return _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE, seed=base_seed + 2, split="calibration", target="YZ", positive_fraction=1.0, pair_pool_size=CALIBRATION_PAIR_POOL_SIZE)
+    if strategy == "shared_any_positive":
+        return _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE, seed=base_seed + 3, split="calibration", target="any", positive_fraction=1.0, pair_pool_size=CALIBRATION_PAIR_POOL_SIZE)
+    if strategy == "shared_any_mixed50":
+        return _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE, seed=base_seed + 4, split="calibration", target="any", positive_fraction=0.5, pair_pool_size=CALIBRATION_PAIR_POOL_SIZE)
+    if strategy == "shared_both_positive":
+        return _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE, seed=base_seed + 5, split="calibration", target="both", positive_fraction=1.0, pair_pool_size=max(CALIBRATION_PAIR_POOL_SIZE, 8192))
+    if strategy == "shared_balanced_wx_yz_only":
+        wx_bank = _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE // 2, seed=base_seed + 6, split="calibration_wx_only", target="WX_only", positive_fraction=1.0, pair_pool_size=max(CALIBRATION_PAIR_POOL_SIZE, 4096))
+        yz_bank = _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE // 2, seed=base_seed + 7, split="calibration_yz_only", target="YZ_only", positive_fraction=1.0, pair_pool_size=max(CALIBRATION_PAIR_POOL_SIZE, 4096))
+        return _concat_pair_banks(
+            [wx_bank, yz_bank],
+            split="calibration",
+            seed=base_seed + 8,
+            pair_policy="mixed",
+            pair_policy_target="balanced_wx_yz_only",
+            mixed_positive_fraction=1.0,
+        )
+    if strategy == "separate_variable_positive":
+        return {
+            "WX": _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE, seed=base_seed + 9, split="calibration_wx", target="WX", positive_fraction=1.0, pair_pool_size=CALIBRATION_PAIR_POOL_SIZE),
+            "YZ": _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE, seed=base_seed + 10, split="calibration_yz", target="YZ", positive_fraction=1.0, pair_pool_size=CALIBRATION_PAIR_POOL_SIZE),
+        }
+    if strategy == "separate_variable_only":
+        return {
+            "WX": _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE, seed=base_seed + 11, split="calibration_wx_only", target="WX_only", positive_fraction=1.0, pair_pool_size=max(CALIBRATION_PAIR_POOL_SIZE, 4096)),
+            "YZ": _build_shared_bank(problem, size=CALIBRATION_PAIR_SIZE, seed=base_seed + 12, split="calibration_yz_only", target="YZ_only", positive_fraction=1.0, pair_pool_size=max(CALIBRATION_PAIR_POOL_SIZE, 4096)),
+        }
+    raise ValueError(f"Unsupported CALIBRATION_STRATEGY={strategy}")
+
+
+def _build_test_bank(problem, seed: int):
+    """Build the evaluation holdout bank(s)."""
+    return {
+        variable: build_pair_bank(
+            problem,
+            TEST_PAIR_SIZE,
+            int(seed) + 401 + idx,
+            "test",
+            target_vars=tuple(TARGET_VARS),
+            pair_policy=SENSITIVE_TEST_PAIR_POLICY,
+            pair_policy_target=variable,
+            mixed_positive_fraction=SENSITIVE_TEST_MIXED_POSITIVE_FRACTION,
+            pair_pool_size=SENSITIVE_TEST_PAIR_POOL_SIZE,
+        )
+        for idx, variable in enumerate(TARGET_VARS)
+    }
+
+
+def _build_invariant_test_bank(problem, seed: int):
+    """Build per-variable holdout banks containing only invariant examples."""
+    if not INVARIANT_TEST_EVAL:
+        return None
+    return {
+        variable: build_pair_bank(
+            problem,
+            TEST_PAIR_SIZE,
+            int(seed) + 501 + idx,
+            "test_invariant",
+            target_vars=tuple(TARGET_VARS),
+            pair_policy=INVARIANT_TEST_PAIR_POLICY,
+            pair_policy_target=variable,
+            mixed_positive_fraction=INVARIANT_TEST_MIXED_POSITIVE_FRACTION,
+            pair_pool_size=INVARIANT_TEST_PAIR_POOL_SIZE,
+        )
+        for idx, variable in enumerate(TARGET_VARS)
+    }
+
+
 def build_compare_config(
     seed: int,
     checkpoint_path: Path,
@@ -168,14 +377,14 @@ def build_compare_config(
         train_pair_policy_target=TRAIN_PAIR_POLICY_TARGET,
         train_mixed_positive_fraction=TRAIN_MIXED_POSITIVE_FRACTION,
         train_pair_pool_size=TRAIN_PAIR_POOL_SIZE,
-        calibration_pair_policy=CALIBRATION_PAIR_POLICY,
-        calibration_pair_policy_target=CALIBRATION_PAIR_POLICY_TARGET,
-        calibration_mixed_positive_fraction=CALIBRATION_MIXED_POSITIVE_FRACTION,
+        calibration_pair_policy="mixed",
+        calibration_pair_policy_target="strategy_defined",
+        calibration_mixed_positive_fraction=0.0,
         calibration_pair_pool_size=CALIBRATION_PAIR_POOL_SIZE,
-        test_pair_policy=TEST_PAIR_POLICY,
-        test_pair_policy_target=TEST_PAIR_POLICY_TARGET,
-        test_mixed_positive_fraction=TEST_MIXED_POSITIVE_FRACTION,
-        test_pair_pool_size=TEST_PAIR_POOL_SIZE,
+        test_pair_policy=SENSITIVE_TEST_PAIR_POLICY,
+        test_pair_policy_target="per_variable",
+        test_mixed_positive_fraction=SENSITIVE_TEST_MIXED_POSITIVE_FRACTION,
+        test_pair_pool_size=SENSITIVE_TEST_PAIR_POOL_SIZE,
         batch_size=BATCH_SIZE,
         resolution=RESOLUTION,
         fgw_alpha=FGW_ALPHA,
@@ -270,6 +479,10 @@ def _build_best_method_exact_table(
             str(record["variable"]): float(record.get("exact_acc", 0.0))
             for record in row["records"]
         }
+        invariant_by_variable = {
+            str(record["variable"]): float(record.get("invariant_exact_acc", 0.0))
+            for record in row["records"]
+        }
         source = dict(row["source"])
         if str(source.get("source_type")) == "fixed":
             source_label = "fixed"
@@ -288,6 +501,13 @@ def _build_best_method_exact_table(
             )
             + f"  {float(row['average_exact_acc']):>{average_width}.4f}"
             + f"  {source_label:<{source_width}}"
+        )
+        lines.append(
+            " " * (method_width + 2)
+            + "  ".join(
+                f"{variable}_inv={invariant_by_variable.get(variable, float('nan')):.4f}"
+                for variable in variable_columns
+            )
         )
     return table_records, "\n".join(lines)
 
@@ -352,6 +572,10 @@ def _build_transport_method_summary(method: str, sweep_records: list[dict[str, o
         str(record["variable"]): float(record.get("exact_acc", 0.0))
         for record in best_records
     }
+    best_invariant_by_variable = {
+        str(record["variable"]): float(record.get("invariant_exact_acc", 0.0))
+        for record in best_records
+    }
     lines.extend(
         [
             "Best Hyperparameters",
@@ -368,8 +592,10 @@ def _build_transport_method_summary(method: str, sweep_records: list[dict[str, o
             ]
         )
     lines.append(f"average_exact_acc: {float(best_summary.get('exact_acc', 0.0)):.4f}")
+    lines.append(f"average_invariant_exact_acc: {float(best_summary.get('invariant_exact_acc', 0.0)):.4f}")
     for variable in TARGET_VARS:
         lines.append(f"{variable}_exact_acc: {float(best_exact_by_variable.get(variable, 0.0)):.4f}")
+        lines.append(f"{variable}_invariant_exact_acc: {float(best_invariant_by_variable.get(variable, 0.0)):.4f}")
     method_selection = dict(best_comparison.get("method_selections", {}).get(method, {}))
     if method_selection:
         lines.extend(
@@ -401,8 +627,13 @@ def _build_transport_method_summary(method: str, sweep_records: list[dict[str, o
             str(item["variable"]): float(item.get("exact_acc", 0.0))
             for item in method_records
         }
+        invariant_by_variable = {
+            str(item["variable"]): float(item.get("invariant_exact_acc", 0.0))
+            for item in method_records
+        }
         bits = [
             f"avg={float(summary.get('exact_acc', 0.0)):.4f}",
+            f"avg_inv={float(summary.get('invariant_exact_acc', 0.0)):.4f}",
             f"sig={record.get('signature_mode')}",
             f"epsilon={float(record.get('ot_epsilon', 0.0)):.6f}",
             f"tau={float(record.get('ot_tau', 0.0)):.6f}",
@@ -417,6 +648,7 @@ def _build_transport_method_summary(method: str, sweep_records: list[dict[str, o
         bits.extend(
             [
                 f"{variable}={float(exact_by_variable.get(variable, 0.0)):.4f}"
+                f"/inv={float(invariant_by_variable.get(variable, 0.0)):.4f}"
                 for variable in TARGET_VARS
             ]
         )
@@ -504,6 +736,10 @@ def _build_aggregate_seed_summary(seed_payloads: list[dict[str, object]]) -> tup
                 str(item["variable"]): float(item.get("exact_acc", 0.0))
                 for item in method_records
             }
+            invariant_by_variable = {
+                str(item["variable"]): float(item.get("invariant_exact_acc", 0.0))
+                for item in method_records
+            }
             avg = float(
                 next(
                     (
@@ -514,11 +750,23 @@ def _build_aggregate_seed_summary(seed_payloads: list[dict[str, object]]) -> tup
                     0.0,
                 )
             )
+            invariant_avg = float(
+                next(
+                    (
+                        item.get("invariant_exact_acc", 0.0)
+                        for item in comparison.get("method_summary", [])
+                        if str(item.get("method")) == method
+                    ),
+                    0.0,
+                )
+            )
             method_to_seed_rows.setdefault(method, []).append(
                 {
                     "seed": seed,
                     "average_exact_acc": avg,
+                    "average_invariant_exact_acc": invariant_avg,
                     "exact_by_variable": exact_by_variable,
+                    "invariant_by_variable": invariant_by_variable,
                     "source": dict(record),
                 }
             )
@@ -528,19 +776,26 @@ def _build_aggregate_seed_summary(seed_payloads: list[dict[str, object]]) -> tup
     for method in sorted(method_to_seed_rows):
         rows = method_to_seed_rows[method]
         avg_values = np.asarray([float(row["average_exact_acc"]) for row in rows], dtype=float)
+        invariant_avg_values = np.asarray([float(row["average_invariant_exact_acc"]) for row in rows], dtype=float)
         variable_stats = {}
         for variable in TARGET_VARS:
             values = np.asarray([float(row["exact_by_variable"].get(variable, 0.0)) for row in rows], dtype=float)
+            invariant_values = np.asarray([float(row["invariant_by_variable"].get(variable, 0.0)) for row in rows], dtype=float)
             variable_stats[variable] = {
                 "mean": float(values.mean()) if values.size else 0.0,
                 "std": float(values.std()) if values.size else 0.0,
                 "values": [float(value) for value in values.tolist()],
+                "invariant_mean": float(invariant_values.mean()) if invariant_values.size else 0.0,
+                "invariant_std": float(invariant_values.std()) if invariant_values.size else 0.0,
+                "invariant_values": [float(value) for value in invariant_values.tolist()],
             }
         aggregate_rows.append(
             {
                 "method": method,
                 "average_exact_acc_mean": float(avg_values.mean()) if avg_values.size else 0.0,
                 "average_exact_acc_std": float(avg_values.std()) if avg_values.size else 0.0,
+                "average_invariant_exact_acc_mean": float(invariant_avg_values.mean()) if invariant_avg_values.size else 0.0,
+                "average_invariant_exact_acc_std": float(invariant_avg_values.std()) if invariant_avg_values.size else 0.0,
                 "variables": variable_stats,
                 "per_seed": rows,
             }
@@ -552,9 +807,17 @@ def _build_aggregate_seed_summary(seed_payloads: list[dict[str, object]]) -> tup
                 f"{variable} = {stats['mean']:.4f} ± {stats['std']:.4f} "
                 f"(per-seed: {', '.join(f'{value:.4f}' for value in stats['values'])})"
             )
+            lines.append(
+                f"{variable}_invariant = {stats['invariant_mean']:.4f} ± {stats['invariant_std']:.4f} "
+                f"(per-seed: {', '.join(f'{value:.4f}' for value in stats['invariant_values'])})"
+            )
         lines.append(
             f"average = {float(avg_values.mean()):.4f} ± {float(avg_values.std()):.4f} "
             f"(per-seed: {', '.join(f'{float(value):.4f}' for value in avg_values.tolist())})"
+        )
+        lines.append(
+            f"average_invariant = {float(invariant_avg_values.mean()):.4f} ± {float(invariant_avg_values.std()):.4f} "
+            f"(per-seed: {', '.join(f'{float(value):.4f}' for value in invariant_avg_values.tolist())})"
         )
         lines.append("")
     return {"methods": aggregate_rows}, "\n".join(lines).rstrip()
@@ -602,55 +865,10 @@ def _run_single_seed(seed: int) -> dict[str, object]:
         mixed_positive_fraction=TRAIN_MIXED_POSITIVE_FRACTION,
         pair_pool_size=TRAIN_PAIR_POOL_SIZE,
     )
-    if TARGETED_EVAL:
-        calibration_bank = {}
-        test_bank = {}
-        for idx, variable in enumerate(TARGET_VARS):
-            calibration_bank[variable] = build_pair_bank(
-                problem,
-                CALIBRATION_PAIR_SIZE,
-                int(seed) + 301 + idx,
-                "calibration",
-                target_vars=tuple(TARGET_VARS),
-                pair_policy=TARGETED_PAIR_POLICY,
-                pair_policy_target=variable,
-                mixed_positive_fraction=TARGETED_MIXED_POSITIVE_FRACTION,
-                pair_pool_size=TARGETED_PAIR_POOL_SIZE,
-            )
-            test_bank[variable] = build_pair_bank(
-                problem,
-                TEST_PAIR_SIZE,
-                int(seed) + 401 + idx,
-                "test",
-                target_vars=tuple(TARGET_VARS),
-                pair_policy=TARGETED_PAIR_POLICY,
-                pair_policy_target=variable,
-                mixed_positive_fraction=TARGETED_MIXED_POSITIVE_FRACTION,
-                pair_pool_size=TARGETED_PAIR_POOL_SIZE,
-            )
-    else:
-        calibration_bank = build_pair_bank(
-            problem,
-            CALIBRATION_PAIR_SIZE,
-            int(seed) + 301,
-            "calibration",
-            target_vars=tuple(TARGET_VARS),
-            pair_policy=CALIBRATION_PAIR_POLICY,
-            pair_policy_target=CALIBRATION_PAIR_POLICY_TARGET,
-            mixed_positive_fraction=CALIBRATION_MIXED_POSITIVE_FRACTION,
-            pair_pool_size=CALIBRATION_PAIR_POOL_SIZE,
-        )
-        test_bank = build_pair_bank(
-            problem,
-            TEST_PAIR_SIZE,
-            int(seed) + 401,
-            "test",
-            target_vars=tuple(TARGET_VARS),
-            pair_policy=TEST_PAIR_POLICY,
-            pair_policy_target=TEST_PAIR_POLICY_TARGET,
-            mixed_positive_fraction=TEST_MIXED_POSITIVE_FRACTION,
-            pair_pool_size=TEST_PAIR_POOL_SIZE,
-        )
+    calibration_bank = _build_calibration_bank(problem, int(seed))
+    test_bank = _build_test_bank(problem, int(seed))
+    invariant_test_bank = _build_invariant_test_bank(problem, int(seed))
+    transport_prepare_cache: dict[tuple[object, ...], dict[str, object]] = {}
 
     def _pair_bank_summary_lines(bank_or_banks) -> list[str]:
         if isinstance(bank_or_banks, dict):
@@ -706,30 +924,22 @@ def _run_single_seed(seed: int) -> dict[str, object]:
             f"calibration={CALIBRATION_PAIR_SIZE}, "
             f"test={TEST_PAIR_SIZE}"
         ),
-        f"targeted_eval: {TARGETED_EVAL}",
+        f"calibration_strategy: {CALIBRATION_STRATEGY}",
+        f"sensitive_test_eval: {SENSITIVE_TEST_EVAL}",
         f"train_pair_policy: {TRAIN_PAIR_POLICY}",
         f"train_pair_policy_target: {TRAIN_PAIR_POLICY_TARGET}",
         f"train_mixed_positive_fraction: {TRAIN_MIXED_POSITIVE_FRACTION}",
         f"train_pair_pool_size: {TRAIN_PAIR_POOL_SIZE}",
-        *(
-            [
-                f"targeted_pair_policy: {TARGETED_PAIR_POLICY}",
-                "targeted_pair_policy_target: per-variable positive pairs",
-                f"targeted_mixed_positive_fraction: {TARGETED_MIXED_POSITIVE_FRACTION}",
-                f"targeted_pair_pool_size: {TARGETED_PAIR_POOL_SIZE}",
-            ]
-            if TARGETED_EVAL
-            else [
-                f"calibration_pair_policy: {CALIBRATION_PAIR_POLICY}",
-                f"calibration_pair_policy_target: {CALIBRATION_PAIR_POLICY_TARGET}",
-                f"calibration_mixed_positive_fraction: {CALIBRATION_MIXED_POSITIVE_FRACTION}",
-                f"calibration_pair_pool_size: {CALIBRATION_PAIR_POOL_SIZE}",
-                f"test_pair_policy: {TEST_PAIR_POLICY}",
-                f"test_pair_policy_target: {TEST_PAIR_POLICY_TARGET}",
-                f"test_mixed_positive_fraction: {TEST_MIXED_POSITIVE_FRACTION}",
-                f"test_pair_pool_size: {TEST_PAIR_POOL_SIZE}",
-            ]
-        ),
+        f"calibration_pair_pool_size: {CALIBRATION_PAIR_POOL_SIZE}",
+        f"test_pair_policy: {SENSITIVE_TEST_PAIR_POLICY}",
+        "test_pair_policy_target: per-variable sensitive pairs",
+        f"test_mixed_positive_fraction: {SENSITIVE_TEST_MIXED_POSITIVE_FRACTION}",
+        f"test_pair_pool_size: {SENSITIVE_TEST_PAIR_POOL_SIZE}",
+        f"invariant_test_eval: {INVARIANT_TEST_EVAL}",
+        f"invariant_test_pair_policy: {INVARIANT_TEST_PAIR_POLICY}",
+        "invariant_test_pair_policy_target: per-variable invariant pairs",
+        f"invariant_test_mixed_positive_fraction: {INVARIANT_TEST_MIXED_POSITIVE_FRACTION}",
+        f"invariant_test_pair_pool_size: {INVARIANT_TEST_PAIR_POOL_SIZE}",
         f"batch_size: {BATCH_SIZE}",
         f"resolution: {RESOLUTION}",
         f"fgw_alpha: {FGW_ALPHA}",
@@ -746,6 +956,8 @@ def _run_single_seed(seed: int) -> dict[str, object]:
     main_summary_lines.extend(_pair_bank_summary_lines(train_bank))
     main_summary_lines.extend(_pair_bank_summary_lines(calibration_bank))
     main_summary_lines.extend(_pair_bank_summary_lines(test_bank))
+    if invariant_test_bank is not None:
+        main_summary_lines.extend(_pair_bank_summary_lines(invariant_test_bank))
     main_summary_lines.append("")
 
     static_runs = []
@@ -772,6 +984,8 @@ def _run_single_seed(seed: int) -> dict[str, object]:
                 train_bank=train_bank,
                 calibration_bank=calibration_bank,
                 test_bank=test_bank,
+                invariant_test_bank=invariant_test_bank,
+                transport_prepare_cache=transport_prepare_cache,
             )
             static_runs.append(
                 {
@@ -843,6 +1057,8 @@ def _run_single_seed(seed: int) -> dict[str, object]:
                 train_bank=train_bank,
                 calibration_bank=calibration_bank,
                 test_bank=test_bank,
+                invariant_test_bank=invariant_test_bank,
+                transport_prepare_cache=transport_prepare_cache,
             )
             epsilon_sweeps.append(
                 {
@@ -886,7 +1102,8 @@ def _run_single_seed(seed: int) -> dict[str, object]:
         "device": str(device),
         "checkpoint_path": str(checkpoint_path),
         "retrain_backbone": RETRAIN_BACKBONE,
-        "targeted_eval": TARGETED_EVAL,
+        "calibration_strategy": CALIBRATION_STRATEGY,
+        "sensitive_test_eval": SENSITIVE_TEST_EVAL,
         "ot_epsilons": [float(value) for value in OT_EPSILONS],
         "ot_taus": [float(value) for value in OT_TAUS],
         "uot_beta_abstracts": [float(value) for value in UOT_BETA_ABSTRACTS],
@@ -1002,7 +1219,8 @@ def main() -> None:
         "seeds": [int(seed) for seed in SEEDS],
         "device": str(resolve_device(DEVICE)),
         "retrain_backbone": RETRAIN_BACKBONE,
-        "targeted_eval": TARGETED_EVAL,
+        "calibration_strategy": CALIBRATION_STRATEGY,
+        "sensitive_test_eval": SENSITIVE_TEST_EVAL,
         "ot_epsilons": [float(value) for value in OT_EPSILONS],
         "ot_taus": [float(value) for value in OT_TAUS],
         "uot_beta_abstracts": [float(value) for value in UOT_BETA_ABSTRACTS],
