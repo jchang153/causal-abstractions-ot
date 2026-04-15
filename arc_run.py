@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+import os
+
+from huggingface_hub import login as hf_login
+
+from arc_experiment.compare_runner import CompareExperimentConfig, run_comparison
+from arc_experiment.data import build_pair_banks, load_filtered_arc_pipeline
+from arc_experiment.ot import OTConfig, prepare_alignment_artifacts
+from arc_experiment.runtime import resolve_device, write_json
+from arc_experiment.sites import enumerate_residual_sites
+
+
+DEVICE = "cuda"
+RUN_TIMESTAMP = os.environ.get("RESULTS_TIMESTAMP") or datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_DIR = Path("results") / f"{RUN_TIMESTAMP}_arc"
+OUTPUT_PATH = RUN_DIR / "arc_run_results.json"
+SUMMARY_PATH = RUN_DIR / "arc_run_summary.txt"
+SPLIT_PRINT_ORDER = ("train", "calibration", "test")
+
+MODEL_NAME = "google/gemma-2-2b"
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+PROMPT_HF_LOGIN = True
+
+ARC_DATASET_PATH = "mib-bench/arc"
+ARC_DATASET_CONFIG = None
+
+DATASET_SIZE = 4000
+SPLIT_SEED = 0
+TRAIN_POOL_SIZE = 800
+CALIBRATION_POOL_SIZE = 400
+TEST_POOL_SIZE = 400
+
+METHODS = ["ot"]
+TARGET_VARS = ["answer_pointer", "answer"]
+COUNTERFACTUAL_NAMES: list[str] = []
+
+LAYERS = "auto"
+TOKEN_POSITION_IDS = ["last_token"]
+
+BATCH_SIZE = 64
+
+RESOLUTIONS = [64]
+OT_EPSILONS = [2**k for k in range(-5, 4)]
+UOT_BETA_ABSTRACTS = [0.1, 1.0]
+UOT_BETA_NEURALS = [0.1, 1.0]
+SIGNATURE_MODES = ["whole_vocab_kl_t1", "answer_logit_delta"]
+OT_TOP_K_VALUES = list(range(1, 11))
+OT_LAMBDAS = [round(value * 0.1, 1) for value in range(1, 31)]
+
+DAS_MAX_EPOCHS = 1000
+DAS_MIN_EPOCHS = 5
+DAS_PLATEAU_PATIENCE = 1
+DAS_PLATEAU_REL_DELTA = 1e-3
+DAS_LEARNING_RATE = 1e-3
+DAS_SUBSPACE_DIMS = [576, 1152, 1728, 2304]
+
+
+def ensure_hf_login(token: str | None, prompt_login: bool) -> str | None:
+    if token:
+        hf_login(token=token, add_to_git_credential=False)
+        return token
+    if prompt_login:
+        hf_login(add_to_git_credential=False)
+    return token
+
+
+def main() -> None:
+    device = resolve_device(DEVICE)
+    hf_token = ensure_hf_login(HF_TOKEN, PROMPT_HF_LOGIN)
+
+    model, tokenizer, causal_model, token_positions, filtered_datasets = load_filtered_arc_pipeline(
+        model_name=MODEL_NAME,
+        device=DEVICE,
+        batch_size=BATCH_SIZE,
+        dataset_size=DATASET_SIZE,
+        hf_token=hf_token,
+        dataset_path=ARC_DATASET_PATH,
+        dataset_name=ARC_DATASET_CONFIG,
+    )
+
+    banks_by_split, data_metadata = build_pair_banks(
+        tokenizer=tokenizer,
+        causal_model=causal_model,
+        token_positions=token_positions,
+        datasets_by_name=filtered_datasets,
+        counterfactual_names=tuple(COUNTERFACTUAL_NAMES),
+        target_vars=tuple(TARGET_VARS),
+        split_seed=SPLIT_SEED,
+        train_pool_size=TRAIN_POOL_SIZE,
+        calibration_pool_size=CALIBRATION_POOL_SIZE,
+        test_pool_size=TEST_POOL_SIZE,
+    )
+
+    for split in SPLIT_PRINT_ORDER:
+        split_metadata = data_metadata.get(split)
+        if isinstance(split_metadata, dict) and split_metadata:
+            dataset_names = next(iter(split_metadata.values())).get("dataset_names", [])
+            print(f"{split} pair bank | datasets={dataset_names}")
+            for variable, variable_stats in sorted(split_metadata.items()):
+                total_pairs = int(variable_stats.get("size", 0))
+                changed_count = int(variable_stats.get("changed_count", 0))
+                unchanged_count = max(0, total_pairs - changed_count)
+                print(
+                    f"{split} pair bank [{variable}] | changed={changed_count} "
+                    f"| unchanged={unchanged_count} "
+                    f"| changed_rate={float(variable_stats.get('changed_rate', 0.0)):.4f}"
+                )
+
+    selected_layers = list(range(int(model.config.num_hidden_layers))) if LAYERS == "auto" else list(LAYERS)
+    token_position_ids = tuple(token_position.id for token_position in token_positions)
+
+    all_payloads = []
+    for method in METHODS:
+        for signature_mode in SIGNATURE_MODES:
+            for resolution in RESOLUTIONS:
+                prepared_ot_artifacts = None
+                if method in {"ot", "uot"} and TARGET_VARS:
+                    ot_sites = enumerate_residual_sites(
+                        num_layers=int(model.config.num_hidden_layers),
+                        hidden_size=int(model.config.hidden_size),
+                        token_position_ids=token_position_ids,
+                        resolution=int(resolution),
+                        layers=tuple(selected_layers),
+                        selected_token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
+                    )
+                    prepared_ot_artifacts = prepare_alignment_artifacts(
+                        model=model,
+                        fit_bank=banks_by_split["train"][TARGET_VARS[0]],
+                        sites=ot_sites,
+                        device=device,
+                        config=OTConfig(
+                            method=method,
+                            batch_size=BATCH_SIZE,
+                            epsilon=1.0,
+                            signature_mode=signature_mode,
+                            top_k_values=tuple(OT_TOP_K_VALUES),
+                            lambda_values=tuple(OT_LAMBDAS),
+                        ),
+                    )
+
+                epsilon_values = OT_EPSILONS if method in {"ot", "uot"} else [None]
+                for epsilon in epsilon_values:
+                    if method == "uot":
+                        for beta_abstract in UOT_BETA_ABSTRACTS:
+                            for beta_neural in UOT_BETA_NEURALS:
+                                config = CompareExperimentConfig(
+                                    model_name=MODEL_NAME,
+                                    output_path=RUN_DIR / (
+                                        f"arc_uot_res-{int(resolution)}_sig-{signature_mode}_eps-{float(epsilon):g}_"
+                                        f"ba-{beta_abstract:g}_bn-{beta_neural:g}.json"
+                                    ),
+                                    summary_path=RUN_DIR / (
+                                        f"arc_uot_res-{int(resolution)}_sig-{signature_mode}_eps-{float(epsilon):g}_"
+                                        f"ba-{beta_abstract:g}_bn-{beta_neural:g}.txt"
+                                    ),
+                                    methods=("uot",),
+                                    target_vars=tuple(TARGET_VARS),
+                                    batch_size=BATCH_SIZE,
+                                    ot_epsilon=float(epsilon),
+                                    uot_beta_abstract=float(beta_abstract),
+                                    uot_beta_neural=float(beta_neural),
+                                    signature_mode=signature_mode,
+                                    ot_top_k_values=tuple(OT_TOP_K_VALUES),
+                                    ot_lambdas=tuple(OT_LAMBDAS),
+                                    resolution=int(resolution),
+                                    layers=tuple(selected_layers),
+                                    token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
+                                )
+                                all_payloads.append(
+                                    run_comparison(
+                                        model=model,
+                                        tokenizer=tokenizer,
+                                        token_positions=token_positions,
+                                        banks_by_split=banks_by_split,
+                                        data_metadata=data_metadata,
+                                        device=device,
+                                        config=config,
+                                        prepared_ot_artifacts=prepared_ot_artifacts,
+                                    )
+                                )
+                    else:
+                        output_stem = f"arc_{method}_res-{int(resolution)}_sig-{signature_mode}"
+                        if epsilon is not None:
+                            output_stem = f"{output_stem}_eps-{float(epsilon):g}"
+                        config = CompareExperimentConfig(
+                            model_name=MODEL_NAME,
+                            output_path=RUN_DIR / f"{output_stem}.json",
+                            summary_path=RUN_DIR / f"{output_stem}.txt",
+                            methods=(method,),
+                            target_vars=tuple(TARGET_VARS),
+                            batch_size=BATCH_SIZE,
+                            ot_epsilon=float(epsilon) if epsilon is not None else 1.0,
+                            signature_mode=signature_mode,
+                            ot_top_k_values=tuple(OT_TOP_K_VALUES),
+                            ot_lambdas=tuple(OT_LAMBDAS),
+                            das_max_epochs=DAS_MAX_EPOCHS,
+                            das_min_epochs=DAS_MIN_EPOCHS,
+                            das_plateau_patience=DAS_PLATEAU_PATIENCE,
+                            das_plateau_rel_delta=DAS_PLATEAU_REL_DELTA,
+                            das_learning_rate=DAS_LEARNING_RATE,
+                            das_subspace_dims=tuple(DAS_SUBSPACE_DIMS),
+                            resolution=int(resolution),
+                            layers=tuple(selected_layers),
+                            token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
+                        )
+                        all_payloads.append(
+                            run_comparison(
+                                model=model,
+                                tokenizer=tokenizer,
+                                token_positions=token_positions,
+                                banks_by_split=banks_by_split,
+                                data_metadata=data_metadata,
+                                device=device,
+                                config=config,
+                                prepared_ot_artifacts=prepared_ot_artifacts,
+                            )
+                        )
+
+    write_json(OUTPUT_PATH, {"runs": all_payloads})
+    print(f"Wrote aggregate ARC run payload to {OUTPUT_PATH.resolve()}")
+
+
+if __name__ == "__main__":
+    main()

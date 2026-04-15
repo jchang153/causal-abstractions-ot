@@ -1,11 +1,12 @@
-# Causal Abstractions for Addition and Hierarchical Equality
+# Causal Abstractions for Addition, Equality, and ARC
 
 This repo is organized around Python experiment scripts rather than notebooks.
-It currently supports three task families:
+It currently supports four task families:
 
 - two-digit addition
 - three-bit binary addition with a fixed `C1` carry benchmark
 - hierarchical equality (the `WX`, `YZ`, `O` task)
+- ARC multiple-choice reasoning (transformer residual-stream localization)
 
 Both pipelines follow the same high-level pattern:
 
@@ -43,6 +44,12 @@ Both pipelines follow the same high-level pattern:
   - Trains or loads the equality MLP, builds one fixed set of train/calibration/test pair banks, and runs the comparison pipeline.
   - Supports OT-only sweeps over `epsilon` and Gibbs-kernel `tau` while reusing the same pair-bank splits across sweep points.
   - Writes outputs under `results/<timestamp>_equality/`.
+
+### ARC
+
+- `arc_run.py`
+  - Loads an LLM backbone, builds ARC counterfactual pair banks, and runs OT/UOT/DAS comparison sweeps.
+  - Writes outputs under `results/<timestamp>_arc/`.
 
 These scripts are meant to be edited directly. The config block near the top of
 each file is the intended control surface.
@@ -88,6 +95,17 @@ each file is the intended control surface.
 The equality task is implemented in `equality_experiment/` and is intended to
 mirror the notebook’s causal structure while using the same repo-style pipeline
 for single-variable DAS and OT/GW/FGW evaluation.
+
+### ARC Task
+
+- Input:
+  - Multiple-choice ARC prompts tokenized for a causal LM.
+- Abstract variables:
+  - `answer_pointer`, `answer`
+- Output:
+  - next-token prediction over option letters
+- Default backbone:
+  - Gemma-family causal LM in `arc_run.py`
 
 ## Methods Implemented
 
@@ -139,16 +157,24 @@ Top-level text summaries include:
 
 The equality pipeline does not report a separate `shared` metric.
 
+### ARC Metrics
+
+- `exact_acc`
+  - predicted option token matches the counterfactual ARC target
+
 ## Repository Layout
 
 - `addition_experiment/`
   - task-specific implementation for addition SCMs, pair banks, backbone training, OT/GW/FGW, DAS, reporting, and plotting
 - `equality_experiment/`
   - task-specific implementation for hierarchical equality
+- `arc_experiment/`
+  - task-specific implementation for ARC pair-bank construction, OT/UOT/DAS localization, and reporting
 - `models/`
   - checkpoint storage such as `addition_mlp_seed<seed>.pt` and `equality_mlp_seed<seed>.pt`
 - `results/`
-  - timestamped run folders like `results/<timestamp>_addition/` and `results/<timestamp>_equality/`
+- timestamped run folders like `results/<timestamp>_addition/` and `results/<timestamp>_equality/`
+  and `results/<timestamp>_arc/`
 - `paper/`
   - draft paper materials
 
@@ -213,6 +239,15 @@ python equality_run.py
 
 Depending on `RETRAIN_BACKBONE`, this will either train a fresh equality
 backbone or load `models/equality_mlp_seed<seed>.pt`.
+
+### ARC
+
+1. Edit the config block in `arc_run.py`.
+2. Run:
+
+```bash
+python arc_run.py
+```
 
 ## Notes on the Equality Pipeline
 
