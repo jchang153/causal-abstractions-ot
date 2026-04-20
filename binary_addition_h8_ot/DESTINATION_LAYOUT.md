@@ -12,6 +12,8 @@ causal-abstractions-ot/
     requirements_min.txt
     regular_shared_ot/
     anchored_ot/
+    das/
+    mib_baselines/
     scripts/
     experiments/
     results/
@@ -77,6 +79,13 @@ python scripts/run_h8_regular_shared_ot.py
 
 and compare the produced summary against:
 - `regular_shared_ot/best_result_compact.json`
+
+You can also smoke-test the added comparators:
+
+```bash
+python scripts/run_h8_anchorprefix_das.py
+python scripts/run_h8_mib_baselines.py
+```
 
 ## Optional follow-up after push
 
