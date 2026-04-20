@@ -1,0 +1,68 @@
+{
+  "source_artifact": "C:\\Users\\zgzg1\\Projects\\GW DAS\\eval\\codex_ot_h8_structured26_check\\h8__structured26__fit-all\\joint_endogenous_resolution_sweep_summary.json",
+  "config": {
+    "hidden_size": 8,
+    "abstract_mode": "all_endogenous",
+    "methods": "ot",
+    "source_policy": "structured_26_top3carry_c2x5_c3x7_no_random",
+    "normalize_signatures": true,
+    "fit_signature_mode": "all",
+    "fit_stratify_mode": "none",
+    "fit_family_profile": "all",
+    "cost_metric": "sq_l2",
+    "resolutions": "8,4,2,1",
+    "ot_epsilons": "0.003,0.01,0.03,0.1,0.3",
+    "top_k_grid": "1,2,4,8",
+    "lambda_grid": "0.25,0.5,1,2,4,8",
+    "selection_profiles": "combined:0.0;sensitivity_only:0.0",
+    "fit_bases": 128,
+    "calib_bases": 64,
+    "test_bases": 64
+  },
+  "best_trial": {
+    "method": "ot",
+    "resolution": 8,
+    "epsilon": 0.01,
+    "profile_key": "combined__floor_0"
+  },
+  "carry_subset": {
+    "mean_sensitivity": 0.7352974184089291,
+    "mean_invariance": 0.9009710221071846,
+    "mean_combined": 0.8181342202580568
+  },
+  "internal_carry_mean_combined": 0.7575122936774091,
+  "per_row": {
+    "C1": {
+      "combined": 0.7692793639987769,
+      "selected_sites": [
+        "h_0[0,1,2,3,4,5,6,7]"
+      ],
+      "top_k": 1,
+      "lambda": 1.0
+    },
+    "C2": {
+      "combined": 0.7745171495171495,
+      "selected_sites": [
+        "h_1[0,1,2,3,4,5,6,7]"
+      ],
+      "top_k": 1,
+      "lambda": 1.0
+    },
+    "C3": {
+      "combined": 0.7287403675163011,
+      "selected_sites": [
+        "h_2[0,1,2,3,4,5,6,7]"
+      ],
+      "top_k": 1,
+      "lambda": 1.0
+    },
+    "C4": {
+      "combined": 1.0,
+      "selected_sites": [
+        "logit[4]"
+      ],
+      "top_k": 1,
+      "lambda": 1.0
+    }
+  }
+}
