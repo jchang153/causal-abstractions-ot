@@ -77,3 +77,9 @@ Together they support the paper narrative:
 1. structured banks repair a benchmark-design problem
 2. anchored fitting gives OT another real gain
 3. the remaining gap to DAS is then easier to interpret as primitive-related rather than fit-bank-related
+
+## Hybrid Follow-on
+
+For the transport-guided DAS follow-on built on top of the shared OT discoverer, see:
+- `shared_ot_guided_das/README.md`
+- `shared_ot_guided_das/RUN_LOG.md`

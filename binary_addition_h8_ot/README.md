@@ -2,9 +2,10 @@
 
 This bundle packages the **new recurrent 4-bit binary addition benchmark** in the narrow `h=8` setting that produced the strongest OT scores.
 
-It contains four method tracks on the same `h=8` recurrent addition benchmark:
+It contains five method tracks on the same `h=8` recurrent addition benchmark:
 - `regular_shared_ot/`: the best **pre-anchoring shared-bank OT** pipeline
 - `anchored_ot/`: the best **anchored-bank OT** pipeline
+- `shared_ot_guided_das/`: the **3-seed shared-OT-guided DAS** hybrid run
 - `das/`: the matched **anchor-prefix DAS** comparator
 - `mib_baselines/`: `Full Vector`, `DBM`, `DBM+PCA`, and `DBM+SAE`
 
@@ -12,6 +13,8 @@ Why `h=8` only:
 - this is the strongest OT regime we found for the repaired arithmetic benchmark
 - best shared-bank OT carry mean: `0.8181`
 - best anchored OT carry mean: `0.8643`
+- shared-OT-guided DAS internal-carry mean (3 seeds): `0.9775`
+- shared-OT-guided DAS mean speedup vs matched full DAS: `3.21x`
 
 ## Layout
 
@@ -23,6 +26,8 @@ Why `h=8` only:
   - exact wrapper for the best anchored OT sweep
 - `scripts/run_h8_anchorprefix_das.py`
   - exact wrapper for the matched anchor-prefix DAS run
+- `scripts/run_h8_shared_ot_guided_das_multiseed.py`
+  - exact wrapper for the 3-seed shared-OT-guided DAS run
 - `scripts/run_h8_mib_baselines.py`
   - exact wrapper for the MIB-style baseline suite
 - `regular_shared_ot/README.md`
@@ -31,6 +36,10 @@ Why `h=8` only:
   - full description of the anchored setup and best result
 - `das/README.md`
   - matched DAS setup and best result
+- `shared_ot_guided_das/README.md`
+  - shared-OT-guided DAS methodology and 3-seed result
+- `shared_ot_guided_das/RUN_LOG.md`
+  - seed-by-seed hybrid accuracy/runtime log
 - `mib_baselines/README.md`
   - MIB-style baseline setup and best result summary
 - `METHOD_COMPARISON.md`
@@ -68,6 +77,12 @@ Anchor-prefix DAS:
 
 ```bash
 python scripts/run_h8_anchorprefix_das.py
+```
+
+Shared-OT-guided DAS (3 seeds):
+
+```bash
+python scripts/run_h8_shared_ot_guided_das_multiseed.py
 ```
 
 MIB-style baselines:

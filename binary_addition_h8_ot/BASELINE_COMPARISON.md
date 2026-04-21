@@ -4,6 +4,8 @@ This note summarizes the non-OT comparison methods included in this package.
 
 ## Included comparators
 
+- `shared_ot_guided_das/`
+  - 3-seed shared-OT-guided DAS on the same `structured_26` benchmark family used for the frozen `h=8` OT package
 - `das/`
   - anchor-prefix DAS on the same `structured_26` benchmark family used for the frozen `h=8` OT package
 - `mib_baselines/`
@@ -19,6 +21,17 @@ Anchored OT (`h=8`):
 - carry subset combined: `0.8643`
 - internal-carry mean (`C1,C2,C3`): `0.8190`
 - measured runtime: `275.7s`
+
+Shared-OT-guided DAS (`h=8`, 3 seeds):
+- internal-carry mean: `0.9775`
+- `C3 = 0.9522`
+- mean runtime: `84.7s`
+- mean speedup vs matched full DAS: `3.21x`
+
+Matched full DAS on `C1,C2,C3` (`h=8`, 3 seeds):
+- internal-carry mean: `0.9746`
+- `C3 = 0.9508`
+- mean runtime: `271.8s`
 
 Anchor-prefix DAS (`h=8`):
 - carry subset combined: `0.9886`
@@ -50,13 +63,17 @@ MIB-style baselines (`h=8`, structured_26):
 
 ## Interpretation
 
-- anchored OT is the strongest OT variant in this package
-- DAS is still substantially stronger than OT on the same repaired benchmark
-- among the MIB-style baselines, `DBM+PCA` is the strongest comparator on `h=8`
+- anchored OT is the strongest standalone OT variant in this package
+- shared-OT-guided DAS is the strongest new hybrid result: it stays close to matched full DAS while running much faster
+- DAS is still substantially stronger than OT when OT is used as the final intervention method
+- among the MIB-style baselines, `DBM+PCA` is the strongest non-DAS comparator on `h=8`
 - `Full Vector` roughly matches the regular shared-bank OT result, while `DBM` and especially `DBM+PCA` outperform it
 
 ## Where to look
 
+- `shared_ot_guided_das/README.md`
+- `shared_ot_guided_das/RUN_LOG.md`
+- `shared_ot_guided_das/three_seed_summary_compact.json`
 - `das/README.md`
 - `mib_baselines/README.md`
 - `das/best_result_compact.json`

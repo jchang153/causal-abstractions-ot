@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
         ],
     )
     ap.add_argument("--fit-bank-mode", type=str, default="shared", choices=["shared", "anchored_prefix"])
+    ap.add_argument("--rows", type=str, default="")
     ap.add_argument("--selection-rule", type=str, default="combined", choices=["combined", "sensitivity_only", "sensitivity_then_invariance"])
     ap.add_argument("--invariance-floor", type=float, default=0.0)
     ap.add_argument("--lambda-grid", type=str, default="0.5,1,2,4")
@@ -89,6 +90,10 @@ def _parse_ints(text: str) -> tuple[int, ...]:
 
 def _parse_floats(text: str) -> tuple[float, ...]:
     return tuple(float(x.strip()) for x in text.split(",") if x.strip())
+
+
+def _parse_keys(text: str) -> tuple[str, ...]:
+    return tuple(x.strip() for x in str(text).split(",") if x.strip())
 
 
 def _load_or_train_model(
@@ -317,6 +322,10 @@ def main() -> None:
     run_cache = build_run_cache(model, examples, device=device)
 
     specs = _row_specs(args.abstract_mode, int(args.width))
+    requested_rows = _parse_keys(args.rows)
+    if requested_rows:
+        requested_set = set(requested_rows)
+        specs = [spec for spec in specs if spec.key in requested_set]
     row_keys = [spec.key for spec in specs]
     banks = _build_banks(
         split,
@@ -332,9 +341,9 @@ def main() -> None:
     lambda_grid = _parse_floats(args.lambda_grid)
     requested_dims = _parse_ints(args.das_subspace_dims)
     requested_lrs = _parse_floats(args.das_lrs)
-    carry_keys = [f"C{i}" for i in range(1, int(args.width) + 1)]
-    internal_carry_keys = [f"C{i}" for i in range(1, int(args.width)) if f"C{i}" in row_keys]
-    output_keys = [f"S{i}" for i in range(int(args.width)) if f"S{i}" in row_keys]
+    carry_keys = [row_key for row_key in row_keys if row_key.startswith("C")]
+    internal_carry_keys = [row_key for row_key in row_keys if row_key.startswith("C") and row_key != f"C{int(args.width)}"]
+    output_keys = [row_key for row_key in row_keys if row_key.startswith("S")]
 
     per_resolution = []
     global_best = None
