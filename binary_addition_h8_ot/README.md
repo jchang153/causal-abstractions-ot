@@ -2,11 +2,12 @@
 
 This bundle packages the **new recurrent 4-bit binary addition benchmark** in the narrow `h=8` setting that produced the strongest OT scores.
 
-It contains five method tracks on the same `h=8` recurrent addition benchmark:
-- `regular_shared_ot/`: the best **pre-anchoring shared-bank OT** pipeline
-- `anchored_ot/`: the best **anchored-bank OT** pipeline
-- `shared_ot_guided_das/`: the **3-seed shared-OT-guided DAS** hybrid run
-- `das/`: the matched **anchor-prefix DAS** comparator
+It contains six method tracks on the same recurrent addition benchmark family:
+- `regular_shared_ot/`: the best **pre-anchoring shared-bank OT** pipeline at `h=8`
+- `anchored_ot/`: the best **anchored-bank OT** pipeline at `h=8`
+- `shared_ot_guided_das/`: the **3-seed shared-OT-guided DAS** hybrid run at `h=8`
+- `shared_ot_guided_das_h16/`: the **3-seed shared-OT-guided DAS** scaling run at `h=16`
+- `das/`: the matched **anchor-prefix DAS** comparator at `h=8`
 - `mib_baselines/`: `Full Vector`, `DBM`, `DBM+PCA`, and `DBM+SAE`
 
 Why `h=8` only:
@@ -27,7 +28,9 @@ Why `h=8` only:
 - `scripts/run_h8_anchorprefix_das.py`
   - exact wrapper for the matched anchor-prefix DAS run
 - `scripts/run_h8_shared_ot_guided_das_multiseed.py`
-  - exact wrapper for the 3-seed shared-OT-guided DAS run
+  - exact wrapper for the 3-seed shared-OT-guided DAS run at `h=8`
+- `scripts/run_h16_shared_ot_guided_das_multiseed.py`
+  - exact wrapper for the 3-seed shared-OT-guided DAS scaling run at `h=16`
 - `scripts/run_h8_mib_baselines.py`
   - exact wrapper for the MIB-style baseline suite
 - `regular_shared_ot/README.md`
@@ -37,9 +40,13 @@ Why `h=8` only:
 - `das/README.md`
   - matched DAS setup and best result
 - `shared_ot_guided_das/README.md`
-  - shared-OT-guided DAS methodology and 3-seed result
+  - shared-OT-guided DAS methodology and 3-seed `h=8` result
 - `shared_ot_guided_das/RUN_LOG.md`
-  - seed-by-seed hybrid accuracy/runtime log
+  - seed-by-seed hybrid accuracy/runtime log for `h=8`
+- `shared_ot_guided_das_h16/README.md`
+  - shared-OT-guided DAS scaling result at `h=16`
+- `shared_ot_guided_das_h16/RUN_LOG.md`
+  - seed-by-seed hybrid accuracy/runtime log for `h=16`
 - `mib_baselines/README.md`
   - MIB-style baseline setup and best result summary
 - `METHOD_COMPARISON.md`
