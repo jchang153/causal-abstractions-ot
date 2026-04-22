@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import Union
 
 
 @dataclass(frozen=True)
@@ -115,13 +115,13 @@ class RotatedCompositeSite:
         return f"L{int(self.layer)}:{self.token_position_id}:{segment_labels}"
 
 
-SiteLike: TypeAlias = (
-    ResidualSite
-    | ResidualUnionSite
-    | ResidualCompositeSite
-    | RotatedBandSite
-    | RotatedCompositeSite
-)
+SiteLike = Union[
+    ResidualSite,
+    ResidualUnionSite,
+    ResidualCompositeSite,
+    RotatedBandSite,
+    RotatedCompositeSite,
+]
 
 
 def site_segments(site: SiteLike, *, model_hidden_size: int) -> tuple[ResidualSite, ...]:
