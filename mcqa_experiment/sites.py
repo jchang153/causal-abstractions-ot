@@ -251,3 +251,34 @@ def enumerate_rotated_band_sites(
     if start != int(rank):
         raise ValueError(f"Rotated band enumeration failed to cover the full rank={int(rank)}")
     return band_sites
+
+
+def enumerate_rotated_top_prefix_sites(
+    *,
+    rank: int,
+    prefix_sizes: tuple[int, ...],
+    layer: int,
+    token_position_id: str,
+    basis_id: str,
+) -> list[RotatedBandSite]:
+    """Enumerate cumulative top-prefix PCA sites clipped to the retained rank."""
+    if int(rank) <= 0:
+        raise ValueError(f"rank must be > 0, got {int(rank)}")
+    resolved_sizes: list[int] = []
+    seen_sizes: set[int] = set()
+    for prefix_size in prefix_sizes:
+        resolved_size = min(int(rank), max(1, int(prefix_size)))
+        if resolved_size in seen_sizes:
+            continue
+        seen_sizes.add(resolved_size)
+        resolved_sizes.append(resolved_size)
+    return [
+        RotatedBandSite(
+            layer=int(layer),
+            token_position_id=str(token_position_id),
+            basis_id=str(basis_id),
+            component_start=0,
+            component_end=int(prefix_size),
+        )
+        for prefix_size in resolved_sizes
+    ]

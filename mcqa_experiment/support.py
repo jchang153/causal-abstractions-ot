@@ -62,6 +62,56 @@ def _block_mask_from_prefix(
     return tuple(selected or ranked_site_indices[:1])
 
 
+def _merged_rotated_segments(segments: tuple[RotatedBandSite, ...]) -> tuple[RotatedBandSite, ...]:
+    if not segments:
+        return ()
+    first_segment = segments[0]
+    if not all(
+        int(segment.layer) == int(first_segment.layer)
+        and str(segment.token_position_id) == str(first_segment.token_position_id)
+        and str(segment.basis_id) == str(first_segment.basis_id)
+        for segment in segments
+    ):
+        raise ValueError("Rotated support masks must stay within one layer/token-position/basis")
+    ordered = sorted(
+        {
+            (int(segment.component_start), int(segment.component_end))
+            for segment in segments
+        }
+    )
+    merged: list[tuple[int, int]] = []
+    for component_start, component_end in ordered:
+        if not merged or int(component_start) > int(merged[-1][1]):
+            merged.append((int(component_start), int(component_end)))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (int(previous_start), max(int(previous_end), int(component_end)))
+    return tuple(
+        RotatedBandSite(
+            layer=int(first_segment.layer),
+            token_position_id=str(first_segment.token_position_id),
+            basis_id=str(first_segment.basis_id),
+            component_start=int(component_start),
+            component_end=int(component_end),
+        )
+        for component_start, component_end in merged
+    )
+
+
+def _site_mask_total_dim(*, sites: list[SiteLike], site_mask: tuple[int, ...]) -> int:
+    selected_sites = tuple(sites[site_index] for site_index in site_mask)
+    if selected_sites and all(isinstance(site, RotatedBandSite) for site in selected_sites):
+        merged_segments = _merged_rotated_segments(tuple(selected_sites))
+        return sum(
+            int(segment.component_end) - int(segment.component_start)
+            for segment in merged_segments
+        )
+    return sum(
+        int(site_total_width(sites[site_index], model_hidden_size=0))
+        for site_index in site_mask
+    )
+
+
 def _mask_candidates_from_ordered_support(
     *,
     ranked_site_indices: tuple[int, ...],
@@ -84,10 +134,7 @@ def _mask_candidates_from_ordered_support(
                 "name": f"Top{int(count)}",
                 "site_indices": list(site_mask),
                 "site_labels": [sites[site_index].label for site_index in site_mask],
-                "site_total_dim": sum(
-                    int(site_total_width(sites[site_index], model_hidden_size=0))
-                    for site_index in site_mask
-                ),
+                "site_total_dim": int(_site_mask_total_dim(sites=sites, site_mask=site_mask)),
             }
         )
     for name, coverage in coverage_specs:
@@ -104,10 +151,7 @@ def _mask_candidates_from_ordered_support(
                 "name": str(name),
                 "site_indices": list(site_mask),
                 "site_labels": [sites[site_index].label for site_index in site_mask],
-                "site_total_dim": sum(
-                    int(site_total_width(sites[site_index], model_hidden_size=0))
-                    for site_index in site_mask
-                ),
+                "site_total_dim": int(_site_mask_total_dim(sites=sites, site_mask=site_mask)),
             }
         )
     return mask_candidates
@@ -531,12 +575,13 @@ def build_ordered_composite_sites_from_support(
         if isinstance(first_segment, RotatedBandSite):
             if not all(isinstance(segment, RotatedBandSite) for segment in segments):
                 raise ValueError("Rotated composite support masks must contain only RotatedBandSite segments")
+            merged_segments = _merged_rotated_segments(tuple(segments))
             composite_sites.append(
                 RotatedCompositeSite(
                     layer=int(first_segment.layer),
                     token_position_id=str(first_segment.token_position_id),
                     basis_id=str(first_segment.basis_id),
-                    segments=tuple(segments),
+                    segments=tuple(merged_segments),
                 )
             )
             continue

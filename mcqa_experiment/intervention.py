@@ -230,8 +230,24 @@ def run_das_residual_intervention(
     intervention: DASSubspaceIntervention,
     base_position_by_id: dict[str, torch.Tensor],
     source_position_by_id: dict[str, torch.Tensor],
+    pca_bases_by_id: dict[str, LayerPCABasis] | None = None,
 ) -> torch.Tensor:
     """Apply one trainable DAS-style rotated-space swap at a residual-stream site."""
+    if isinstance(site, (RotatedBandSite, RotatedCompositeSite)):
+        if pca_bases_by_id is None:
+            raise ValueError("pca_bases_by_id is required for rotated DAS interventions")
+        return run_das_rotated_residual_intervention(
+            model=model,
+            base_input_ids=base_input_ids,
+            base_attention_mask=base_attention_mask,
+            source_input_ids=source_input_ids,
+            source_attention_mask=source_attention_mask,
+            site=site,
+            intervention=intervention,
+            base_position_by_id=base_position_by_id,
+            source_position_by_id=source_position_by_id,
+            pca_bases_by_id=pca_bases_by_id,
+        )
     layers = resolve_transformer_layers(model)
     source_hidden_by_layer = _collect_source_hidden_states(
         model=model,
@@ -321,6 +337,87 @@ def _rotated_site_segments(site: RotatedBandSite | RotatedCompositeSite) -> tupl
     if isinstance(site, RotatedCompositeSite):
         return tuple(site.segments)
     return (site,)
+
+
+def _merged_rotated_site_segments(site: RotatedBandSite | RotatedCompositeSite) -> tuple[RotatedBandSite, ...]:
+    segments = _rotated_site_segments(site)
+    if not segments:
+        return ()
+    first_segment = segments[0]
+    ordered = sorted(
+        {
+            (int(segment.component_start), int(segment.component_end))
+            for segment in segments
+        }
+    )
+    merged: list[tuple[int, int]] = []
+    for component_start, component_end in ordered:
+        if not merged or int(component_start) > int(merged[-1][1]):
+            merged.append((int(component_start), int(component_end)))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (int(previous_start), max(int(previous_end), int(component_end)))
+    return tuple(
+        RotatedBandSite(
+            layer=int(first_segment.layer),
+            token_position_id=str(first_segment.token_position_id),
+            basis_id=str(first_segment.basis_id),
+            component_start=int(component_start),
+            component_end=int(component_end),
+        )
+        for component_start, component_end in merged
+    )
+
+
+def apply_rotated_das_site_update(
+    *,
+    base_vectors: torch.Tensor,
+    source_vectors: torch.Tensor,
+    basis: LayerPCABasis,
+    site: RotatedBandSite | RotatedCompositeSite,
+    intervention: nn.Module,
+) -> torch.Tensor:
+    """Apply a DAS intervention inside a selected PCA span while preserving the orthogonal complement."""
+    if base_vectors.shape != source_vectors.shape:
+        raise ValueError(
+            f"Base/source shape mismatch: {tuple(base_vectors.shape)} vs {tuple(source_vectors.shape)}"
+        )
+    if base_vectors.shape[-1] != int(basis.hidden_size):
+        raise ValueError(
+            f"Expected vectors with hidden_size={int(basis.hidden_size)}, got shape {tuple(base_vectors.shape)}"
+        )
+    compute_dtype = torch.float32
+    mean = basis.mean.to(device=base_vectors.device, dtype=compute_dtype)
+    components = basis.components.to(device=base_vectors.device, dtype=compute_dtype)
+    base_centered = base_vectors.to(compute_dtype) - mean
+    source_centered = source_vectors.to(compute_dtype) - mean
+    z_base = base_centered @ components
+    z_source = source_centered @ components
+    segments = _merged_rotated_site_segments(site)
+    selected_base = torch.cat(
+        [
+            z_base[:, int(segment.component_start) : int(segment.component_end)]
+            for segment in segments
+        ],
+        dim=1,
+    )
+    selected_source = torch.cat(
+        [
+            z_source[:, int(segment.component_start) : int(segment.component_end)]
+            for segment in segments
+        ],
+        dim=1,
+    )
+    updated_selected = intervention(selected_base, selected_source).to(compute_dtype)
+    z_updated = z_base.clone()
+    offset = 0
+    for segment in segments:
+        segment_width = int(segment.component_end) - int(segment.component_start)
+        next_offset = offset + segment_width
+        z_updated[:, int(segment.component_start) : int(segment.component_end)] = updated_selected[:, offset:next_offset]
+        offset = next_offset
+    delta_h = (z_updated - z_base) @ components.transpose(0, 1)
+    return base_vectors + delta_h.to(dtype=base_vectors.dtype)
 
 
 def run_soft_rotated_residual_intervention(
@@ -433,6 +530,86 @@ def run_soft_rotated_residual_intervention(
     finally:
         for handle in handles:
             handle.remove()
+    return gather_last_token_logits(outputs.logits, base_attention_mask)
+
+
+def run_das_rotated_residual_intervention(
+    *,
+    model,
+    base_input_ids: torch.Tensor,
+    base_attention_mask: torch.Tensor,
+    source_input_ids: torch.Tensor,
+    source_attention_mask: torch.Tensor,
+    site: RotatedBandSite | RotatedCompositeSite,
+    intervention: DASSubspaceIntervention,
+    base_position_by_id: dict[str, torch.Tensor],
+    source_position_by_id: dict[str, torch.Tensor],
+    pca_bases_by_id: dict[str, LayerPCABasis],
+) -> torch.Tensor:
+    """Apply a trainable DAS swap inside a rotated PCA span."""
+    basis = pca_bases_by_id.get(str(site.basis_id))
+    if basis is None:
+        raise KeyError(f"Missing PCA basis for basis_id={site.basis_id!r}")
+    if int(basis.layer) != int(site.layer):
+        raise ValueError(
+            f"PCA basis layer mismatch for basis_id={site.basis_id!r}: basis layer={int(basis.layer)} "
+            f"but site layer={int(site.layer)}"
+        )
+    if str(basis.token_position_id) != str(site.token_position_id):
+        raise ValueError(
+            f"PCA basis token-position mismatch for basis_id={site.basis_id!r}: "
+            f"basis token_position_id={basis.token_position_id!r} vs site token_position_id={site.token_position_id!r}"
+        )
+
+    layers = resolve_transformer_layers(model)
+    source_hidden_by_layer = _collect_source_hidden_states(
+        model=model,
+        source_input_ids=source_input_ids,
+        source_attention_mask=source_attention_mask,
+        target_layers=(site.layer,),
+    )
+
+    def hook(_module, _inputs, output):
+        hidden = output[0] if isinstance(output, tuple) else output
+        hidden = hidden.clone()
+        batch_size = hidden.shape[0]
+        batch_indices = torch.arange(batch_size, device=hidden.device)
+        source_hidden = source_hidden_by_layer[int(site.layer)].to(hidden.device)
+        base_attention_mask_device = base_attention_mask.to(hidden.device)
+        source_attention_mask_device = source_attention_mask.to(hidden.device)
+        base_positions = _resolve_padded_positions(
+            base_attention_mask_device,
+            base_position_by_id[str(site.token_position_id)].to(hidden.device),
+        )
+        source_positions = _resolve_padded_positions(
+            source_attention_mask_device,
+            source_position_by_id[str(site.token_position_id)].to(hidden.device),
+        )
+        base_vectors = hidden[batch_indices, base_positions]
+        source_vectors = source_hidden[batch_indices, source_positions]
+        updated_vectors = apply_rotated_das_site_update(
+            base_vectors=base_vectors,
+            source_vectors=source_vectors,
+            basis=basis,
+            site=site,
+            intervention=intervention,
+        )
+        hidden[batch_indices, base_positions] = updated_vectors
+        if isinstance(output, tuple):
+            return (hidden, *output[1:])
+        return hidden
+
+    handle = layers[int(site.layer)].register_forward_hook(hook)
+    try:
+        base_position_ids = build_position_ids_from_left_padded_attention_mask(base_attention_mask)
+        outputs = model(
+            input_ids=base_input_ids,
+            attention_mask=base_attention_mask,
+            position_ids=base_position_ids,
+            use_cache=False,
+        )
+    finally:
+        handle.remove()
     return gather_last_token_logits(outputs.logits, base_attention_mask)
 
 

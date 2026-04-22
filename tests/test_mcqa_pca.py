@@ -2,13 +2,15 @@ from pathlib import Path
 import sys
 
 import torch
+import torch.nn as nn
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from mcqa_experiment.intervention import apply_rotated_das_site_update
 from mcqa_experiment.pca import LayerPCABasis, apply_rotated_component_update, fit_pca_basis_from_states
-from mcqa_experiment.sites import enumerate_rotated_band_sites, site_total_width
+from mcqa_experiment.sites import enumerate_rotated_band_sites, enumerate_rotated_top_prefix_sites, site_total_width
 from mcqa_experiment.support import build_rotated_span_sites_from_support, extract_ordered_site_support
 
 
@@ -70,6 +72,19 @@ def test_enumerate_rotated_head_bands_split_head_more_finely():
     assert sum(widths) == 20
     assert widths[0] < widths[-1]
     assert widths == sorted(widths)
+
+
+def test_enumerate_rotated_top_prefix_sites_clips_and_dedupes():
+    sites = enumerate_rotated_top_prefix_sites(
+        rank=20,
+        prefix_sizes=(8, 16, 16, 32),
+        layer=25,
+        token_position_id="last_token",
+        basis_id="basis",
+    )
+
+    assert [site.component_start for site in sites] == [0, 0, 0]
+    assert [site.component_end for site in sites] == [8, 16, 20]
 
 
 def test_apply_rotated_component_update_identity_basis_matches_coordinate_swap():
@@ -180,3 +195,78 @@ def test_extract_ordered_site_support_and_build_rotated_spans():
     assert site_total_width(span_sites[1], model_hidden_size=0) == (
         site_total_width(sites[0], model_hidden_size=0) + site_total_width(sites[1], model_hidden_size=0)
     )
+
+
+def test_build_rotated_span_sites_merge_overlapping_prefix_and_partition_masks():
+    partition_sites = enumerate_rotated_band_sites(
+        rank=64,
+        num_bands=4,
+        layer=20,
+        token_position_id="last_token",
+        basis_id="basis",
+    )
+    prefix_sites = enumerate_rotated_top_prefix_sites(
+        rank=64,
+        prefix_sizes=(32,),
+        layer=20,
+        token_position_id="last_token",
+        basis_id="basis",
+    )
+    sites = [*partition_sites, *prefix_sites]
+    support_summary = {
+        "mask_candidates": [
+            {
+                "name": "Top2",
+                "site_indices": [0, 4],
+            }
+        ]
+    }
+
+    span_sites = build_rotated_span_sites_from_support(
+        support_summary=support_summary,
+        sites=sites,
+    )
+
+    assert len(span_sites) == 1
+    assert span_sites[0].label == "L20:last_token:pc[0:32]"
+    assert site_total_width(span_sites[0], model_hidden_size=0) == 32
+
+
+class _CopySourceIntervention(nn.Module):
+    def forward(self, base_vectors: torch.Tensor, source_vectors: torch.Tensor) -> torch.Tensor:
+        return source_vectors
+
+
+def test_apply_rotated_das_site_update_replaces_only_selected_components():
+    basis = LayerPCABasis(
+        basis_id="identity",
+        layer=20,
+        token_position_id="last_token",
+        hidden_size=4,
+        rank=4,
+        mean=torch.zeros(4, dtype=torch.float32),
+        components=torch.eye(4, dtype=torch.float32),
+        singular_values=torch.ones(4, dtype=torch.float32),
+        explained_variance=torch.ones(4, dtype=torch.float32),
+        num_fit_states=8,
+    )
+    site = enumerate_rotated_top_prefix_sites(
+        rank=4,
+        prefix_sizes=(2,),
+        layer=20,
+        token_position_id="last_token",
+        basis_id="identity",
+    )[0]
+    base = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32)
+    source = torch.tensor([[10.0, 20.0, 30.0, 40.0]], dtype=torch.float32)
+
+    updated = apply_rotated_das_site_update(
+        base_vectors=base,
+        source_vectors=source,
+        basis=basis,
+        site=site,
+        intervention=_CopySourceIntervention(),
+    )
+
+    expected = torch.tensor([[10.0, 20.0, 3.0, 4.0]], dtype=torch.float32)
+    assert torch.allclose(updated, expected)
