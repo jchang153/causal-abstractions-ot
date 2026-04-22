@@ -16,6 +16,7 @@ try:
 except Exception:  # pragma: no cover
     tqdm = None
 
+from .checking import causalab_substring_checker
 from .runtime import resolve_device
 
 
@@ -26,6 +27,21 @@ _DATASET_CONFIG_UNSET = object()
 CANONICAL_ANSWER_STRINGS = (" A", " B", " C", " D")
 CANONICAL_ANSWER_LABELS = ("A", "B", "C", "D")
 ALPHABET_LABELS = tuple(chr(codepoint) for codepoint in range(ord("A"), ord("Z") + 1))
+COUNTERFACTUAL_FAMILIES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
+TARGET_VAR_ALIASES = {
+    "answer_pointer": "answer_pointer",
+    "ans_index": "answer_pointer",
+    "answer": "answer_token",
+    "answer_token": "answer_token",
+    "ans_value": "answer_token",
+}
+
+
+def canonicalize_target_var(target_var: str) -> str:
+    canonical = TARGET_VAR_ALIASES.get(str(target_var))
+    if canonical is None:
+        raise ValueError(f"Unsupported MCQA target variable {target_var}")
+    return canonical
 
 
 class MCQACausalModel:
@@ -65,6 +81,30 @@ class MCQACausalModel:
         output["answer"] = answer
         output["raw_output"] = answer
         return output
+
+    def run_interchange(
+        self,
+        base_input: dict[str, object],
+        source_input: dict[str, object],
+        target_variables: tuple[str, ...] | list[str],
+    ) -> dict[str, object]:
+        base_setting = self.run_forward(base_input)
+        source_setting = self.run_forward(source_input)
+        canonical_targets = {canonicalize_target_var(str(variable)) for variable in target_variables}
+
+        setting = dict(base_setting)
+        if "answer_pointer" in canonical_targets:
+            setting["answer_pointer"] = int(source_setting["answer_pointer"])
+        if "answer_token" in canonical_targets:
+            setting["answer"] = str(source_setting["answer"])
+
+        # Recompute descendants in topological order for the supported MCQA DAG.
+        if "answer_pointer" in canonical_targets and "answer_token" not in canonical_targets:
+            pointer = int(setting["answer_pointer"])
+            setting["answer"] = " " + str(setting[f"symbol{pointer}"])
+        if canonical_targets:
+            setting["raw_output"] = str(setting["answer"])
+        return setting
 
 
 @dataclass(frozen=True)
@@ -109,6 +149,7 @@ class MCQAPairBank:
     answer_token_ids: torch.Tensor
     base_answer_token_ids: torch.Tensor
     changed_mask: torch.Tensor
+    counterfactual_family_names: list[str]
     expected_answer_texts: list[str]
 
     @property
@@ -116,6 +157,9 @@ class MCQAPairBank:
         return int(self.labels.shape[0])
 
     def metadata(self) -> dict[str, object]:
+        family_counts: dict[str, int] = {}
+        for family_name in self.counterfactual_family_names:
+            family_counts[str(family_name)] = family_counts.get(str(family_name), 0) + 1
         return {
             "split": self.split,
             "target_var": self.target_var,
@@ -123,6 +167,7 @@ class MCQAPairBank:
             "dataset_names": list(self.dataset_names),
             "changed_count": int(self.changed_mask.sum().item()),
             "changed_rate": float(self.changed_mask.float().mean().item()) if self.size else 0.0,
+            "family_counts": family_counts,
         }
 
 
@@ -150,6 +195,7 @@ class MCQAPairDataset(torch.utils.data.Dataset):
             "alphabet_variant_token_ids": self.bank.alphabet_variant_token_ids[index],
             "answer_token_id": self.bank.answer_token_ids[index],
             "base_answer_token_id": self.bank.base_answer_token_ids[index],
+            "counterfactual_family_name": self.bank.counterfactual_family_names[index],
             "base_positions": {key: value[index] for key, value in self.bank.base_position_by_id.items()},
             "source_positions": {key: value[index] for key, value in self.bank.source_position_by_id.items()},
             "expected_answer_text": self.bank.expected_answer_texts[index],
@@ -252,6 +298,7 @@ def _load_counterfactual_rows(
     datasets: dict[str, list[dict[str, object]]] = {}
     for counterfactual_name in counterfactual_names:
         dataset_name = counterfactual_name.replace("_counterfactual", f"_{split}")
+        counterfactual_family = counterfactual_name.replace("_counterfactual", "")
         rows: list[dict[str, object]] = []
         for row in dataset:
             base_input = parse_mcqa_example(row)
@@ -261,6 +308,7 @@ def _load_counterfactual_rows(
                 {
                     "input": base_input,
                     "counterfactual_inputs": [source_input],
+                    "counterfactual_family": counterfactual_family,
                 }
             )
         datasets[dataset_name] = rows
@@ -305,22 +353,24 @@ def load_public_mcqa_datasets(
     return datasets
 
 
+def _build_position_ids_from_left_padded_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    position_ids = attention_mask.to(torch.long).cumsum(dim=-1) - 1
+    return position_ids.masked_fill(attention_mask == 0, 0)
+
+
 def _infer_next_token_ids(model, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    position_ids = _build_position_ids_from_left_padded_attention_mask(attention_mask)
     with torch.no_grad():
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             use_cache=False,
         )
     logits = outputs.logits
-    # Prompts are left-padded in this pipeline, so the final real prompt token
-    # always sits at the last sequence column for every batch element.
-    last_indices = torch.full(
-        (logits.shape[0],),
-        logits.shape[1] - 1,
-        dtype=torch.long,
-        device=logits.device,
-    )
+    reversed_mask = torch.flip(attention_mask.to(torch.long), dims=(1,))
+    trailing_pad = torch.argmax(reversed_mask, dim=1)
+    last_indices = logits.shape[1] - 1 - trailing_pad
     batch_indices = torch.arange(logits.shape[0], device=logits.device)
     return logits[batch_indices, last_indices].argmax(dim=-1)
 
@@ -338,28 +388,23 @@ def filter_correct_examples(
     batch_size: int,
     device: torch.device,
 ) -> dict[str, list[dict[str, object]]]:
-    """Keep only examples where Gemma predicts the factual answer token."""
-    filtered: dict[str, list[dict[str, object]]] = {}
-    for dataset_name, rows in datasets_by_name.items():
-        print(f"[filter] dataset={dataset_name} total_rows={len(rows)}")
-        prompts = [str(row["input"]["raw_input"]) for row in rows]
-        expected_answers = [normalize_answer_text(str(causal_model.run_forward(row["input"])["answer"])) for row in rows]
-        expected_answer_variant_ids = [_encode_symbol_token_variants(expected, tokenizer) for expected in expected_answers]
-        keep_mask: list[bool] = []
-        batch_starts = range(0, len(rows), batch_size)
+    """Keep only examples where Gemma predicts both the base and source answer tokens."""
+
+    def predict_next_token_ids(prompts: list[str]) -> list[int]:
+        predicted_ids_all: list[int] = []
+        batch_starts = range(0, len(prompts), batch_size)
         batch_iterator = batch_starts
         if tqdm is not None:
             batch_iterator = tqdm(
                 batch_starts,
-                desc=f"Filtering {dataset_name}",
+                desc="Filtering batch",
                 leave=False,
-                total=(len(rows) + batch_size - 1) // batch_size,
+                total=(len(prompts) + batch_size - 1) // batch_size,
             )
         for start in batch_iterator:
-            end = min(start + batch_size, len(rows))
-            batch_prompts = prompts[start:end]
+            end = min(start + batch_size, len(prompts))
             encoded = tokenizer(
-                batch_prompts,
+                prompts[start:end],
                 padding=True,
                 return_tensors="pt",
                 add_special_tokens=True,
@@ -367,13 +412,54 @@ def filter_correct_examples(
             input_ids = encoded["input_ids"].to(device)
             attention_mask = encoded["attention_mask"].to(device)
             predicted_ids = _infer_next_token_ids(model, input_ids, attention_mask)
-            for predicted_id, expected, expected_variants in zip(
-                predicted_ids.detach().cpu().tolist(),
-                expected_answers[start:end],
-                expected_answer_variant_ids[start:end],
-            ):
-                decoded = normalize_answer_text(tokenizer.decode([int(predicted_id)]))
-                keep_mask.append(int(predicted_id) in expected_variants or expected == decoded)
+            predicted_ids_all.extend(int(item) for item in predicted_ids.detach().cpu().tolist())
+        return predicted_ids_all
+
+    filtered: dict[str, list[dict[str, object]]] = {}
+    for dataset_name, rows in datasets_by_name.items():
+        print(f"[filter] dataset={dataset_name} total_rows={len(rows)}")
+        base_prompts = [str(row["input"]["raw_input"]) for row in rows]
+        source_prompts = [str(row["counterfactual_inputs"][0]["raw_input"]) for row in rows]
+        base_expected_answers = [normalize_answer_text(str(causal_model.run_forward(row["input"])["answer"])) for row in rows]
+        source_expected_answers = [
+            normalize_answer_text(str(causal_model.run_forward(row["counterfactual_inputs"][0])["answer"]))
+            for row in rows
+        ]
+        base_expected_answer_variant_ids = [
+            _encode_symbol_token_variants(expected, tokenizer) for expected in base_expected_answers
+        ]
+        source_expected_answer_variant_ids = [
+            _encode_symbol_token_variants(expected, tokenizer) for expected in source_expected_answers
+        ]
+        base_predicted_ids = predict_next_token_ids(base_prompts)
+        source_predicted_ids = predict_next_token_ids(source_prompts)
+        keep_mask: list[bool] = []
+        for (
+            base_predicted_id,
+            source_predicted_id,
+            base_expected,
+            source_expected,
+            base_expected_variants,
+            source_expected_variants,
+        ) in zip(
+            base_predicted_ids,
+            source_predicted_ids,
+            base_expected_answers,
+            source_expected_answers,
+            base_expected_answer_variant_ids,
+            source_expected_answer_variant_ids,
+        ):
+            base_decoded = normalize_answer_text(tokenizer.decode([int(base_predicted_id)]))
+            source_decoded = normalize_answer_text(tokenizer.decode([int(source_predicted_id)]))
+            base_correct = int(base_predicted_id) in base_expected_variants or causalab_substring_checker(
+                base_decoded,
+                base_expected,
+            )
+            source_correct = int(source_predicted_id) in source_expected_variants or causalab_substring_checker(
+                source_decoded,
+                source_expected,
+            )
+            keep_mask.append(bool(base_correct and source_correct))
         filtered[dataset_name] = [row for row, keep in zip(rows, keep_mask) if keep]
         print(f"[filter] dataset={dataset_name} kept={len(filtered[dataset_name])}/{len(rows)}")
     return filtered
@@ -430,15 +516,20 @@ def _compute_row_change_masks(
     source_inputs = [row["counterfactual_inputs"][0] for row in rows]
     base_outputs = [causal_model.run_forward(base_input) for base_input in base_inputs]
     source_outputs = [causal_model.run_forward(source_input) for source_input in source_inputs]
+    changed_pointer_masks = [
+        int(base_output["answer_pointer"]) != int(source_output["answer_pointer"])
+        for base_output, source_output in zip(base_outputs, source_outputs)
+    ]
+    changed_answer_masks = [
+        str(base_output["answer"]) != str(source_output["answer"])
+        for base_output, source_output in zip(base_outputs, source_outputs)
+    ]
     changed_masks = {
-        "answer_pointer": [
-            int(base_output["answer_pointer"]) != int(source_output["answer_pointer"])
-            for base_output, source_output in zip(base_outputs, source_outputs)
-        ],
-        "answer": [
-            str(base_output["answer"]) != str(source_output["answer"])
-            for base_output, source_output in zip(base_outputs, source_outputs)
-        ],
+        "answer_pointer": changed_pointer_masks,
+        "answer": changed_answer_masks,
+        "answer_token": changed_answer_masks,
+        "ans_index": changed_pointer_masks,
+        "ans_value": changed_answer_masks,
     }
     return base_outputs, source_outputs, changed_masks
 
@@ -458,10 +549,12 @@ def build_pair_banks(
     pooled_total_examples: int | None = None,
 ) -> tuple[dict[str, dict[str, MCQAPairBank]], dict[str, object]]:
     """Build pooled train/calibration/test banks with target-specific sensitive calibration/test sizes."""
+    canonical_target_vars = tuple(canonicalize_target_var(target_var) for target_var in target_vars)
     canonical_answer_token_ids = _validate_answer_tokenization(tokenizer)
     def make_bank(output_split: str, split_dataset_names: list[str], combined_rows: list[dict[str, object]]) -> dict[str, MCQAPairBank]:
         base_inputs = [row["input"] for row in combined_rows]
         source_inputs = [row["counterfactual_inputs"][0] for row in combined_rows]
+        counterfactual_family_names = [str(row["counterfactual_family"]) for row in combined_rows]
         base_outputs = [causal_model.run_forward(base_input) for base_input in base_inputs]
         source_outputs = [causal_model.run_forward(source_input) for source_input in source_inputs]
 
@@ -520,16 +613,16 @@ def build_pair_banks(
             dtype=torch.long,
         )
         alphabet_token_ids = alphabet_variant_token_ids[:, :, 0]
-        answer_token_ids = torch.tensor(
-            [_encode_symbol_token(str(source_output["answer"]).strip(), tokenizer) for source_output in source_outputs],
-            dtype=torch.long,
-        )
         base_answer_token_ids = torch.tensor(
-            [_encode_symbol_token(str(base_output["answer"]).strip(), tokenizer) for base_output in base_outputs],
+            [_encode_symbol_token(str(base_output["raw_output"]).strip(), tokenizer) for base_output in base_outputs],
             dtype=torch.long,
         )
         answer_label_indices = torch.tensor(
             [_alphabet_index(str(source_output["answer"])) for source_output in source_outputs],
+            dtype=torch.long,
+        )
+        pointer_label_indices = torch.tensor(
+            [int(source_output["answer_pointer"]) for source_output in source_outputs],
             dtype=torch.long,
         )
         changed_pointer = torch.tensor(
@@ -547,15 +640,23 @@ def build_pair_banks(
             dtype=torch.bool,
         )
         banks: dict[str, MCQAPairBank] = {}
-        for target_var in target_vars:
+        for target_var in canonical_target_vars:
             if target_var == "answer_pointer":
-                labels = answer_label_indices
+                labels = pointer_label_indices
                 changed_mask = changed_pointer
-            elif target_var == "answer":
+            elif target_var == "answer_token":
                 labels = answer_label_indices
                 changed_mask = changed_answer
             else:
                 raise ValueError(f"Unsupported MCQA target variable {target_var}")
+            interchange_outputs = [
+                causal_model.run_interchange(base_input, source_input, (target_var,))
+                for base_input, source_input in zip(base_inputs, source_inputs)
+            ]
+            answer_token_ids = torch.tensor(
+                [_encode_symbol_token(str(setting["raw_output"]).strip(), tokenizer) for setting in interchange_outputs],
+                dtype=torch.long,
+            )
             banks[target_var] = MCQAPairBank(
                 split=output_split,
                 target_var=target_var,
@@ -581,7 +682,11 @@ def build_pair_banks(
                 answer_token_ids=answer_token_ids,
                 base_answer_token_ids=base_answer_token_ids,
                 changed_mask=changed_mask,
-                expected_answer_texts=[normalize_answer_text(str(source_output["answer"])) for source_output in source_outputs],
+                counterfactual_family_names=counterfactual_family_names,
+                expected_answer_texts=[
+                    normalize_answer_text(str(setting["raw_output"]))
+                    for setting in interchange_outputs
+                ],
             )
         return banks
 
@@ -623,12 +728,12 @@ def build_pair_banks(
     train_rng.shuffle(shared_train_rows)
     banks_by_split["train"] = {}
     train_banks = make_bank("train", pooled_dataset_names, shared_train_rows)
-    for target_var in target_vars:
+    for target_var in canonical_target_vars:
         banks_by_split["train"][target_var] = train_banks[target_var]
 
     # Calibration/test are target-specific and sized by number of sensitive examples.
     _base_outputs, _source_outputs, holdout_changed_masks = _compute_row_change_masks(holdout_candidate_rows, causal_model)
-    for target_var in target_vars:
+    for target_var in canonical_target_vars:
         changed_mask = holdout_changed_masks[target_var]
         positive_rows = [row for row, changed in zip(holdout_candidate_rows, changed_mask) if changed]
         local_rng = random.Random(f"{int(split_seed)}:holdout:{target_var}")

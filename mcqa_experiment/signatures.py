@@ -9,9 +9,16 @@ except Exception:  # pragma: no cover
     tqdm = None
 
 from .data import MCQAPairBank
-from .intervention import forward_factual_logits, run_soft_residual_intervention
-from .metrics import gather_variable_logits
-from .sites import ResidualSite
+from .intervention import forward_factual_logits, run_soft_site_intervention
+from .metrics import (
+    _gather_label_logits,
+    build_family_label_signature,
+    build_family_signature,
+    gather_variable_logits,
+    structured_output_features,
+)
+from .pca import LayerPCABasis
+from .sites import SiteLike
 
 
 def _per_example_kl(counterfactual_logits: torch.Tensor, base_logits: torch.Tensor) -> torch.Tensor:
@@ -35,6 +42,22 @@ def signature_from_logits(
         counterfactual_target_logits = gather_variable_logits(counterfactual_logits, bank)
         base_target_logits = gather_variable_logits(base_logits, bank)
         return (counterfactual_target_logits - base_target_logits).reshape(-1)
+    if signature_mode in {"family_slot_label_delta", "family_slot_label_delta_norm"}:
+        counterfactual_features = structured_output_features(counterfactual_logits, bank)
+        base_features = structured_output_features(base_logits, bank)
+        return build_family_signature(
+            counterfactual_features - base_features,
+            bank,
+            normalize_blocks=(signature_mode == "family_slot_label_delta_norm"),
+        )
+    if signature_mode in {"family_label_delta", "family_label_delta_norm", "family_label_logit_delta", "family_label_logit_delta_norm"}:
+        counterfactual_features = _gather_label_logits(counterfactual_logits, bank)
+        base_features = _gather_label_logits(base_logits, bank)
+        return build_family_label_signature(
+            counterfactual_features - base_features,
+            bank,
+            normalize_blocks=signature_mode in {"family_label_delta_norm", "family_label_logit_delta_norm"},
+        )
     raise ValueError(f"Unsupported signature_mode={signature_mode}")
 
 
@@ -63,12 +86,13 @@ def collect_site_signatures(
     *,
     model,
     bank: MCQAPairBank,
-    sites: list[ResidualSite],
+    sites: list[SiteLike],
     base_logits: torch.Tensor,
     batch_size: int,
     device: torch.device,
     signature_mode: str,
     show_progress: bool = False,
+    pca_bases_by_id: dict[str, LayerPCABasis] | None = None,
 ) -> torch.Tensor:
     """Measure each residual site's intervention effect signature."""
     signatures = []
@@ -80,7 +104,7 @@ def collect_site_signatures(
             site_logits_chunks = []
             for start in range(0, bank.size, batch_size):
                 end = min(start + batch_size, bank.size)
-                logits = run_soft_residual_intervention(
+                logits = run_soft_site_intervention(
                     model=model,
                     base_input_ids=bank.base_input_ids[start:end].to(device),
                     base_attention_mask=bank.base_attention_mask[start:end].to(device),
@@ -94,6 +118,7 @@ def collect_site_signatures(
                     source_position_by_id={
                         key: value[start:end] for key, value in bank.source_position_by_id.items()
                     },
+                    pca_bases_by_id=pca_bases_by_id,
                 )
                 site_logits_chunks.append(logits.detach().cpu())
             site_logits = torch.cat(site_logits_chunks, dim=0)
@@ -106,3 +131,32 @@ def collect_site_signatures(
                 )
             )
     return torch.stack(signatures, dim=0)
+
+
+def collect_multi_variable_site_signatures(
+    *,
+    model,
+    banks_by_var: dict[str, MCQAPairBank],
+    sites: list[SiteLike],
+    base_logits_by_var: dict[str, torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+    signature_mode: str,
+    show_progress: bool = False,
+    pca_bases_by_id: dict[str, LayerPCABasis] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Collect site signatures separately for each abstract variable."""
+    return {
+        target_var: collect_site_signatures(
+            model=model,
+            bank=bank,
+            sites=sites,
+            base_logits=base_logits_by_var[target_var],
+            batch_size=batch_size,
+            device=device,
+            signature_mode=signature_mode,
+            show_progress=show_progress,
+            pca_bases_by_id=pca_bases_by_id,
+        )
+        for target_var, bank in banks_by_var.items()
+    }
