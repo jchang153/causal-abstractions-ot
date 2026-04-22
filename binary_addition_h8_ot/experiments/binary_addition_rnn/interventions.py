@@ -7,7 +7,7 @@ import torch
 
 from .model import GRUAdder, examples_to_tensors
 from .scm import BinaryAdditionExample
-from .sites import CoordinateGroupSite, FullStateSite, NeuronSite, OutputLogitSite, Site
+from .sites import CoordinateGroupSite, FullStateSite, NeuronSite, OutputLogitSite, RotatedSite, Site
 
 
 @dataclass(frozen=True)
@@ -121,6 +121,14 @@ def _apply_site_delta(
         return updated
     if isinstance(site, OutputLogitSite):
         return h
+    if isinstance(site, RotatedSite):
+        R = site.rotation.to(device=h.device, dtype=h.dtype)  # (hidden_size, hidden_size)
+        idx = list(site.coord_indices)
+        z_base = h @ R        # (batch, hidden_size) — coordinates in rotated basis
+        z_src = src_h @ R
+        delta_z = torch.zeros_like(z_base)
+        delta_z[:, idx] = float(lambda_scale) * float(weight) * (z_src[:, idx] - z_base[:, idx])
+        return h + delta_z @ R.T
     raise TypeError(f"Unsupported site type: {type(site)!r}")
 
 
