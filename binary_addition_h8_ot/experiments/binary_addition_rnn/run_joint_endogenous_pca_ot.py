@@ -7,7 +7,28 @@ resulting rotation is used to define RotatedSite objects that replace the usual
 CoordinateGroupSites.  Everything else (cost matrix, Sinkhorn, calibration,
 test) is identical to the shared OT pipeline.
 
-Timer: pca_fit_time + cost_matrix_time + trial_time for the best epsilon.
+Timer: wall-clock from PCA fit through the full resolution/epsilon grid search.
+
+Usage:
+    python experiments/binary_addition_rnn/run_joint_endogenous_pca_ot.py \\
+        --out-dir results/pca_ot \\
+        --hidden-size 8 \\
+        --resolutions 8,4,2,1 \\
+        --ot-epsilons 0.003,0.01,0.03,0.1,0.3 \\
+        --top-k-grid 1,2,4,8 \\
+        --lambda-grid 0.25,0.5,1,2,4,8 \\
+        --normalize-signatures \\
+        --fit-signature-mode all \\
+        --fit-stratify-mode row_counterfactual \\
+        --fit-family-profile all \\
+        --cost-metric sq_l2 \\
+        --source-policy structured_26_top3carry_c2x5_c3x7_no_random \\
+        --abstract-mode all_endogenous
+
+Key outputs in --out-dir:
+    joint_endogenous_pca_ot_summary.json
+        best_result.test.carry_subset  -- sensitivity/invariance/combined for carry rows
+        method_runtime_sec             -- total wall-clock time
 """
 from __future__ import annotations
 
