@@ -308,6 +308,7 @@ def run_das_pipeline(
         batch_size=config.batch_size,
         device=device,
         tokenizer=tokenizer,
+        pca_bases_by_id=pca_bases_by_id,
         return_details=True,
     )
     result = {
