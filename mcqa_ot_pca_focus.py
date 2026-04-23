@@ -43,6 +43,9 @@ DEFAULT_BASIS_SOURCE_MODE = "all_variants"
 DEFAULT_SCREEN_MAX_EPOCHS = 25
 DEFAULT_SCREEN_MIN_EPOCHS = 2
 DEFAULT_SCREEN_MASK_NAMES = ("Top1", "Top2")
+DEFAULT_GUIDED_DAS_MAX_EPOCHS = 100
+DEFAULT_GUIDED_DAS_MIN_EPOCHS = 5
+DEFAULT_GUIDED_DAS_MASK_NAMES = ("Top1", "Top2", "Top4", "S80")
 
 
 def _parse_csv_strings(value: str | None) -> list[str] | None:
@@ -97,6 +100,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--screen-max-epochs", type=int, default=DEFAULT_SCREEN_MAX_EPOCHS)
     parser.add_argument("--screen-min-epochs", type=int, default=DEFAULT_SCREEN_MIN_EPOCHS)
+    parser.add_argument("--guided-das", action="store_true")
+    parser.add_argument(
+        "--guided-mask-names",
+        help="Comma-separated PCA support masks for the guided DAS sweep. Default: Top1,Top2,Top4,S80",
+    )
+    parser.add_argument(
+        "--guided-subspace-dims",
+        help="Comma-separated subspace dims for the guided DAS sweep. If omitted, a width-aware grid is used.",
+    )
+    parser.add_argument("--guided-max-epochs", type=int, default=DEFAULT_GUIDED_DAS_MAX_EPOCHS)
+    parser.add_argument("--guided-min-epochs", type=int, default=DEFAULT_GUIDED_DAS_MIN_EPOCHS)
     parser.add_argument("--results-root", default="results/anvil")
     parser.add_argument("--results-timestamp")
     parser.add_argument("--signatures-dir", default="signatures")
@@ -360,6 +374,15 @@ def _screen_subspace_dims(max_width: int) -> tuple[int, ...]:
     return tuple(dict.fromkeys(int(dim) for dim in dims))
 
 
+def _guided_subspace_dims(max_width: int) -> tuple[int, ...]:
+    resolved_width = max(1, int(max_width))
+    if resolved_width <= 8:
+        return tuple(range(1, resolved_width + 1))
+    dims = [dim for dim in (4, 8, 16, 32, 64, 128) if int(dim) < resolved_width]
+    dims.append(int(resolved_width))
+    return tuple(dict.fromkeys(int(dim) for dim in dims))
+
+
 def _write_das_text_report(path: Path, *, title: str, payload: dict[str, object], extra_lines: list[str] | None = None) -> None:
     result = payload.get("results", [{}])[0]
     lines = [
@@ -372,6 +395,119 @@ def _write_das_text_report(path: Path, *, title: str, payload: dict[str, object]
     if extra_lines:
         lines.extend(extra_lines)
     write_text_report(path, "\n".join(lines))
+
+
+def _run_pca_das_from_support(
+    *,
+    model,
+    tokenizer,
+    banks_by_split,
+    device,
+    layer_dir: Path,
+    layer: int,
+    token_position_id: str,
+    site_catalog_tag: str,
+    basis_source_mode: str,
+    signature_mode: str,
+    target_vars: tuple[str, ...],
+    support_by_var: dict[str, dict[str, object]],
+    pca_sites: list[RotatedBandSite],
+    pca_bases_by_id: dict[str, LayerPCABasis],
+    model_hidden_size: int,
+    batch_size: int,
+    enabled: bool,
+    method_suffix: str,
+    method_name: str,
+    title: str,
+    mask_names: tuple[str, ...],
+    max_epochs: int,
+    min_epochs: int,
+    plateau_patience: int,
+    plateau_rel_delta: float,
+    learning_rate: float,
+    explicit_subspace_dims: tuple[int, ...] | None,
+    subspace_dim_resolver,
+) -> dict[str, dict[str, object]]:
+    payloads: dict[str, dict[str, object]] = {}
+    if not enabled:
+        return payloads
+    for target_var in target_vars:
+        support_summary = support_by_var.get(str(target_var))
+        if support_summary is None:
+            continue
+        filtered_summary = _filter_support_summary_by_mask_names(
+            support_summary=support_summary,
+            mask_names=mask_names,
+        )
+        span_sites = build_rotated_span_sites_from_support(
+            support_summary=filtered_summary,
+            sites=pca_sites,
+        )
+        if not span_sites:
+            continue
+        if explicit_subspace_dims is None:
+            subspace_dims = subspace_dim_resolver(
+                max(
+                    int(site_total_width(site, model_hidden_size=int(model_hidden_size)))
+                    for site in span_sites
+                )
+            )
+        else:
+            max_width = max(
+                int(site_total_width(site, model_hidden_size=int(model_hidden_size)))
+                for site in span_sites
+            )
+            filtered_dims = tuple(
+                int(dim) for dim in explicit_subspace_dims if 0 < int(dim) <= int(max_width)
+            )
+            subspace_dims = filtered_dims or (int(max_width),)
+        output_path = layer_dir / (
+            f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
+            f"_basis-{str(basis_source_mode)}_sig-{str(signature_mode)}_{str(target_var)}_{method_suffix}.json"
+        )
+        summary_path = layer_dir / (
+            f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
+            f"_basis-{str(basis_source_mode)}_sig-{str(signature_mode)}_{str(target_var)}_{method_suffix}.txt"
+        )
+        payload = _load_existing_payload(output_path)
+        if payload is None:
+            payload = run_das_pipeline(
+                model=model,
+                train_bank=banks_by_split["train"][target_var],
+                calibration_bank=banks_by_split["calibration"][target_var],
+                holdout_bank=banks_by_split["test"][target_var],
+                sites=span_sites,
+                device=device,
+                tokenizer=tokenizer,
+                config=DASConfig(
+                    method_name=str(method_name),
+                    batch_size=int(batch_size),
+                    max_epochs=int(max_epochs),
+                    min_epochs=int(min_epochs),
+                    plateau_patience=int(plateau_patience),
+                    plateau_rel_delta=float(plateau_rel_delta),
+                    learning_rate=float(learning_rate),
+                    subspace_dims=subspace_dims,
+                    store_candidate_holdout_metrics=True,
+                    verbose=True,
+                ),
+                pca_bases_by_id=pca_bases_by_id,
+            )
+            payload["support_summary"] = filtered_summary
+            payload["mask_names"] = list(str(mask_name) for mask_name in mask_names)
+            write_json(output_path, payload)
+            _write_das_text_report(
+                summary_path,
+                title=str(title),
+                payload=payload,
+                extra_lines=[
+                    f"target_var: {target_var}",
+                    f"mask_names: {list(str(mask_name) for mask_name in mask_names)}",
+                    f"subspace_dims: {list(int(dim) for dim in subspace_dims)}",
+                ],
+            )
+        payloads[str(target_var)] = payload
+    return payloads
 
 
 def _format_layer_summary(
@@ -389,6 +525,7 @@ def _format_layer_summary(
     ot_compare_payloads: list[dict[str, object]],
     support_by_var: dict[str, dict[str, object]],
     screen_payloads: dict[str, dict[str, object]],
+    guided_payloads: dict[str, dict[str, object]],
 ) -> str:
     lines = [
         "MCQA PCA OT Summary",
@@ -443,6 +580,19 @@ def _format_layer_summary(
                 f"cal={float(result.get('selection_exact_acc', result.get('calibration_exact_acc', 0.0))):.4f} "
                 f"site={result.get('site_label')} dim={result.get('subspace_dim')}"
             )
+    if guided_payloads:
+        lines.append("")
+        lines.append("guided PCA-span DAS sweep:")
+        for target_var in DEFAULT_TARGET_VARS:
+            payload = guided_payloads.get(str(target_var))
+            if payload is None:
+                continue
+            result = payload.get("results", [{}])[0]
+            lines.append(
+                f"DAS_GUIDED[{target_var}] exact={float(result.get('exact_acc', 0.0)):.4f} "
+                f"cal={float(result.get('selection_exact_acc', result.get('calibration_exact_acc', 0.0))):.4f} "
+                f"site={result.get('site_label')} dim={result.get('subspace_dim')}"
+            )
     return "\n".join(lines)
 
 
@@ -482,6 +632,8 @@ def main() -> None:
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
     top_prefix_sizes = tuple(_parse_csv_ints(args.top_prefix_sizes) or list(DEFAULT_TOP_PREFIX_SIZES))
     screen_mask_names = tuple(_parse_csv_strings(args.screen_mask_names) or list(DEFAULT_SCREEN_MASK_NAMES))
+    guided_mask_names = tuple(_parse_csv_strings(args.guided_mask_names) or list(DEFAULT_GUIDED_DAS_MASK_NAMES))
+    guided_subspace_dims = None if args.guided_subspace_dims is None else tuple(_parse_csv_ints(args.guided_subspace_dims) or [])
 
     results_root = Path(args.results_root)
     results_timestamp = args.results_timestamp or os.environ.get("RESULTS_TIMESTAMP") or base_run.RUN_TIMESTAMP
@@ -656,73 +808,66 @@ def main() -> None:
         )
         write_json(support_path, support_by_var)
 
-        screen_payloads: dict[str, dict[str, object]] = {}
-        if args.screen_das:
-            for target_var in target_vars:
-                support_summary = support_by_var.get(str(target_var))
-                if support_summary is None:
-                    continue
-                filtered_summary = _filter_support_summary_by_mask_names(
-                    support_summary=support_summary,
-                    mask_names=screen_mask_names,
-                )
-                span_sites = build_rotated_span_sites_from_support(
-                    support_summary=filtered_summary,
-                    sites=pca_sites,
-                )
-                if not span_sites:
-                    continue
-                screen_dims = _screen_subspace_dims(
-                    max(
-                        int(site_total_width(site, model_hidden_size=int(model.config.hidden_size)))
-                        for site in span_sites
-                    )
-                )
-                screen_output_path = layer_dir / (
-                    f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-                    f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_{str(target_var)}_das_screen.json"
-                )
-                screen_summary_path = layer_dir / (
-                    f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-                    f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_{str(target_var)}_das_screen.txt"
-                )
-                screen_payload = _load_existing_payload(screen_output_path)
-                if screen_payload is None:
-                    screen_payload = run_das_pipeline(
-                        model=model,
-                        train_bank=banks_by_split["train"][target_var],
-                        calibration_bank=banks_by_split["calibration"][target_var],
-                        holdout_bank=banks_by_split["test"][target_var],
-                        sites=span_sites,
-                        device=device,
-                        tokenizer=tokenizer,
-                        config=DASConfig(
-                            method_name="das_pca_screen",
-                            batch_size=int(args.batch_size),
-                            max_epochs=int(args.screen_max_epochs),
-                            min_epochs=int(args.screen_min_epochs),
-                            plateau_patience=1,
-                            plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
-                            learning_rate=base_run.DAS_LEARNING_RATE,
-                            subspace_dims=screen_dims,
-                            store_candidate_holdout_metrics=True,
-                            verbose=True,
-                        ),
-                        pca_bases_by_id=pca_bases_by_id,
-                    )
-                    screen_payload["support_summary"] = filtered_summary
-                    screen_payload["screen_mask_names"] = list(str(mask_name) for mask_name in screen_mask_names)
-                    write_json(screen_output_path, screen_payload)
-                    _write_das_text_report(
-                        screen_summary_path,
-                        title="MCQA PCA DAS Screen Summary",
-                        payload=screen_payload,
-                        extra_lines=[
-                            f"target_var: {target_var}",
-                            f"screen_mask_names: {list(str(mask_name) for mask_name in screen_mask_names)}",
-                        ],
-                    )
-                screen_payloads[str(target_var)] = screen_payload
+        screen_payloads = _run_pca_das_from_support(
+            model=model,
+            tokenizer=tokenizer,
+            banks_by_split=banks_by_split,
+            device=device,
+            layer_dir=layer_dir,
+            layer=int(layer),
+            token_position_id=str(args.token_position_id),
+            site_catalog_tag=site_catalog_tag,
+            basis_source_mode=str(args.basis_source_mode),
+            signature_mode=str(args.signature_mode),
+            target_vars=target_vars,
+            support_by_var=support_by_var,
+            pca_sites=pca_sites,
+            pca_bases_by_id=pca_bases_by_id,
+            model_hidden_size=int(model.config.hidden_size),
+            batch_size=int(args.batch_size),
+            enabled=bool(args.screen_das),
+            method_suffix="das_screen",
+            method_name="das_pca_screen",
+            title="MCQA PCA DAS Screen Summary",
+            mask_names=screen_mask_names,
+            max_epochs=int(args.screen_max_epochs),
+            min_epochs=int(args.screen_min_epochs),
+            plateau_patience=1,
+            plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
+            learning_rate=base_run.DAS_LEARNING_RATE,
+            explicit_subspace_dims=None,
+            subspace_dim_resolver=_screen_subspace_dims,
+        )
+        guided_payloads = _run_pca_das_from_support(
+            model=model,
+            tokenizer=tokenizer,
+            banks_by_split=banks_by_split,
+            device=device,
+            layer_dir=layer_dir,
+            layer=int(layer),
+            token_position_id=str(args.token_position_id),
+            site_catalog_tag=site_catalog_tag,
+            basis_source_mode=str(args.basis_source_mode),
+            signature_mode=str(args.signature_mode),
+            target_vars=target_vars,
+            support_by_var=support_by_var,
+            pca_sites=pca_sites,
+            pca_bases_by_id=pca_bases_by_id,
+            model_hidden_size=int(model.config.hidden_size),
+            batch_size=int(args.batch_size),
+            enabled=bool(args.guided_das),
+            method_suffix="das_guided",
+            method_name="das_pca_guided",
+            title="MCQA PCA Guided DAS Summary",
+            mask_names=guided_mask_names,
+            max_epochs=int(args.guided_max_epochs),
+            min_epochs=int(args.guided_min_epochs),
+            plateau_patience=int(base_run.DAS_PLATEAU_PATIENCE),
+            plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
+            learning_rate=base_run.DAS_LEARNING_RATE,
+            explicit_subspace_dims=guided_subspace_dims,
+            subspace_dim_resolver=_guided_subspace_dims,
+        )
 
         layer_summary_path = layer_dir / (
             f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
@@ -744,6 +889,7 @@ def main() -> None:
                 ot_compare_payloads=ot_compare_payloads,
                 support_by_var=support_by_var,
                 screen_payloads=screen_payloads,
+                guided_payloads=guided_payloads,
             ),
         )
 
@@ -767,6 +913,9 @@ def main() -> None:
             "support_by_var": support_by_var,
             "screen_mask_names": [str(mask_name) for mask_name in screen_mask_names],
             "screen_das_enabled": bool(args.screen_das),
+            "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
+            "guided_subspace_dims": None if guided_subspace_dims is None else [int(dim) for dim in guided_subspace_dims],
+            "guided_das_enabled": bool(args.guided_das),
             "screen_output_paths": {
                 str(target_var): str(
                     layer_dir / (
@@ -775,6 +924,15 @@ def main() -> None:
                     )
                 )
                 for target_var in screen_payloads
+            },
+            "guided_output_paths": {
+                str(target_var): str(
+                    layer_dir / (
+                        f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+                        f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_{str(target_var)}_das_guided.json"
+                    )
+                )
+                for target_var in guided_payloads
             },
             "ot_output_paths": [
                 str(
@@ -804,6 +962,7 @@ def main() -> None:
                 "basis_source_mode": str(args.basis_source_mode),
                 "signature_mode": str(args.signature_mode),
                 "screen_das_enabled": bool(args.screen_das),
+                "guided_das_enabled": bool(args.guided_das),
                 "summary_path": str(layer_summary_path),
                 "payload_path": str(layer_payload_path),
             }
@@ -825,6 +984,10 @@ def main() -> None:
             "basis_source_mode": str(args.basis_source_mode),
             "signature_mode": str(args.signature_mode),
             "screen_das_enabled": bool(args.screen_das),
+            "screen_mask_names": [str(mask_name) for mask_name in screen_mask_names],
+            "guided_das_enabled": bool(args.guided_das),
+            "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
+            "guided_subspace_dims": None if guided_subspace_dims is None else [int(dim) for dim in guided_subspace_dims],
             "runs": [
                 *[run for run in existing_manifest_runs if str(run.get("payload_path", "")) not in current_payload_paths],
                 *manifest_runs,
