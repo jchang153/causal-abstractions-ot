@@ -360,7 +360,6 @@ def build_broad_sweep_plan(*, repo_root: Path, args: argparse.Namespace, normali
                 ),
                 expected_outputs=(
                     str(run_dir / "mcqa_run_results.json"),
-                    str(run_dir / "mcqa_run_summary.txt"),
                 ),
             )
         )
@@ -470,7 +469,6 @@ def build_broad_sweep_plan(*, repo_root: Path, args: argparse.Namespace, normali
                 ),
                 expected_outputs=(
                     str(run_dir / "mcqa_run_results.json"),
-                    str(run_dir / "mcqa_run_summary.txt"),
                 ),
             )
         )
