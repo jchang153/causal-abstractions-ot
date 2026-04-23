@@ -8,7 +8,8 @@ from pathlib import Path
 from time import perf_counter
 
 from .das import DASConfig, run_das_pipeline
-from .ot import OTConfig, prepare_alignment_artifacts, run_alignment_pipeline
+from .data import canonicalize_target_var
+from .ot import OTConfig, prepare_alignment_artifacts, run_alignment_pipeline, run_bruteforce_site_pipeline
 from .reporting import format_summary, print_results_table, summarize_method_records, write_text_report
 from .runtime import write_json
 from .sites import enumerate_residual_sites
@@ -21,15 +22,18 @@ class CompareExperimentConfig:
     model_name: str
     output_path: Path
     summary_path: Path
-    methods: tuple[str, ...] = ("ot", "uot", "das")
-    target_vars: tuple[str, ...] = ("answer_pointer", "answer")
+    methods: tuple[str, ...] = ("ot",)
+    target_vars: tuple[str, ...] = ("answer_pointer", "answer_token")
     batch_size: int = 16
     ot_epsilon: float = 1.0
-    uot_beta_abstract: float = 1.0
     uot_beta_neural: float = 1.0
-    signature_mode: str = "answer_logit_delta"
+    signature_mode: str = "family_slot_label_delta"
     ot_top_k_values: tuple[int, ...] | None = None
     ot_lambdas: tuple[float, ...] = (1.0,)
+    calibration_metric: str = "exact_acc"
+    calibration_family_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
+    ot_top_k_values_by_var: dict[str, tuple[int, ...]] | None = None
+    ot_lambdas_by_var: dict[str, tuple[float, ...]] | None = None
     das_max_epochs: int = 5
     das_min_epochs: int = 1
     das_plateau_patience: int = 2
@@ -37,9 +41,9 @@ class CompareExperimentConfig:
     das_learning_rate: float = 1e-3
     das_subspace_dims: tuple[int, ...] | None = None
     das_store_candidate_holdout_metrics: bool = True
-    resolution: int | None = 1
+    resolution: int | None = None
     layers: tuple[int, ...] | None = None
-    token_position_ids: tuple[str, ...] | None = None
+    token_position_ids: tuple[str, ...] | None = ("correct_symbol", "correct_symbol_period", "last_token")
 
 
 def run_comparison(
@@ -53,6 +57,7 @@ def run_comparison(
     config: CompareExperimentConfig,
     prepared_ot_artifacts: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    target_vars = tuple(canonicalize_target_var(target_var) for target_var in config.target_vars)
     token_position_ids = tuple(token_position.id for token_position in token_positions)
     ot_sites = enumerate_residual_sites(
         num_layers=int(model.config.num_hidden_layers),
@@ -73,32 +78,36 @@ def run_comparison(
     method_payloads: dict[str, list[dict[str, object]]] = {method: [] for method in config.methods}
     all_records: list[dict[str, object]] = []
     for method in config.methods:
-        print(f"[method] start method={method} targets={list(config.target_vars)}")
+        print(f"[method] start method={method} targets={list(target_vars)}")
         prepared_artifacts = None
         ot_config = None
-        if method in {"ot", "uot"} and config.target_vars:
+        if method in {"ot", "uot"} and target_vars:
+            source_target_vars = target_vars
             ot_config = OTConfig(
                 method=method,
                 batch_size=config.batch_size,
                 epsilon=config.ot_epsilon,
-                uot_beta_abstract=config.uot_beta_abstract,
                 uot_beta_neural=config.uot_beta_neural,
                 signature_mode=config.signature_mode,
                 top_k_values=config.ot_top_k_values,
                 lambda_values=config.ot_lambdas,
+                source_target_vars=source_target_vars,
+                calibration_metric=config.calibration_metric,
+                calibration_family_weights=config.calibration_family_weights,
+                top_k_values_by_var=config.ot_top_k_values_by_var,
+                lambda_values_by_var=config.ot_lambdas_by_var,
             )
             prepared_artifacts = prepared_ot_artifacts
             if prepared_artifacts is None:
-                first_target = config.target_vars[0]
-                fit_bank = banks_by_split["train"][first_target]
+                fit_banks_by_var = {target_var: banks_by_split["train"][target_var] for target_var in source_target_vars}
                 prepared_artifacts = prepare_alignment_artifacts(
                     model=model,
-                    fit_bank=fit_bank,
+                    fit_banks_by_var=fit_banks_by_var,
                     sites=ot_sites,
                     device=device,
                     config=ot_config,
                 )
-        for target_var in config.target_vars:
+        for target_var in target_vars:
             start = perf_counter()
             print(f"[method] method={method} target={target_var}")
             train_bank = banks_by_split["train"][target_var]
@@ -109,15 +118,18 @@ def run_comparison(
                     method=method,
                     batch_size=config.batch_size,
                     epsilon=config.ot_epsilon,
-                    uot_beta_abstract=config.uot_beta_abstract,
                     uot_beta_neural=config.uot_beta_neural,
                     signature_mode=config.signature_mode,
                     top_k_values=config.ot_top_k_values,
                     lambda_values=config.ot_lambdas,
+                    calibration_metric=config.calibration_metric,
+                    calibration_family_weights=config.calibration_family_weights,
+                    top_k_values_by_var=config.ot_top_k_values_by_var,
+                    lambda_values_by_var=config.ot_lambdas_by_var,
                 )
                 payload = run_alignment_pipeline(
                     model=model,
-                    fit_bank=train_bank,
+                    fit_banks_by_var={source_var: banks_by_split["train"][source_var] for source_var in current_ot_config.source_target_vars},
                     calibration_bank=calibration_bank,
                     holdout_bank=test_bank,
                     sites=ot_sites,
@@ -125,6 +137,30 @@ def run_comparison(
                     tokenizer=tokenizer,
                     config=current_ot_config,
                     prepared_artifacts=prepared_artifacts,
+                )
+            elif method == "bruteforce":
+                current_ot_config = OTConfig(
+                    method=method,
+                    batch_size=config.batch_size,
+                    epsilon=config.ot_epsilon,
+                    uot_beta_neural=config.uot_beta_neural,
+                    signature_mode=config.signature_mode,
+                    top_k_values=config.ot_top_k_values,
+                    lambda_values=config.ot_lambdas,
+                    source_target_vars=target_vars,
+                    calibration_metric=config.calibration_metric,
+                    calibration_family_weights=config.calibration_family_weights,
+                    top_k_values_by_var=config.ot_top_k_values_by_var,
+                    lambda_values_by_var=config.ot_lambdas_by_var,
+                )
+                payload = run_bruteforce_site_pipeline(
+                    model=model,
+                    calibration_bank=calibration_bank,
+                    holdout_bank=test_bank,
+                    sites=ot_sites,
+                    device=device,
+                    tokenizer=tokenizer,
+                    config=current_ot_config,
                 )
             elif method == "das":
                 payload = run_das_pipeline(
@@ -170,18 +206,19 @@ def run_comparison(
         method_payloads=method_payloads,
         summary_records=summary_records,
     )
+    config_payload = {
+        **asdict(config),
+        "output_path": str(config.output_path),
+        "summary_path": str(config.summary_path),
+        "target_vars": list(target_vars),
+    }
     payload = {
-        "config": {
-            **asdict(config),
-            "output_path": str(config.output_path),
-            "summary_path": str(config.summary_path),
-        },
+        "config": config_payload,
         "model_name": config.model_name,
         "methods": list(config.methods),
-        "target_vars": list(config.target_vars),
+        "target_vars": list(target_vars),
         "signature_mode": config.signature_mode,
         "ot_epsilon": float(config.ot_epsilon),
-        "uot_beta_abstract": float(config.uot_beta_abstract),
         "uot_beta_neural": float(config.uot_beta_neural),
         "resolution": None if config.resolution is None else int(config.resolution),
         "num_candidate_sites": len(ot_sites),
