@@ -89,6 +89,34 @@ def _selection_score(record: dict[str, object]) -> float:
     return -1.0
 
 
+def _best_result_record(payloads: Iterable[dict[str, object]]) -> dict[str, object] | None:
+    best: dict[str, object] | None = None
+    for payload in payloads:
+        results = payload.get("results", [])
+        if not isinstance(results, list) or not results:
+            continue
+        result = results[0]
+        if not isinstance(result, dict):
+            continue
+        candidate = {
+            "epsilon": float(payload.get("_ot_epsilon", payload.get("ot_epsilon", -1.0))),
+            "selection_score": _selection_score(result),
+            "exact_acc": float(result.get("exact_acc", -1.0)),
+            "site_label": result.get("site_label"),
+            "result": result,
+            "payload": payload,
+        }
+        if best is None or (
+            float(candidate["selection_score"]),
+            float(candidate["exact_acc"]),
+        ) > (
+            float(best["selection_score"]),
+            float(best["exact_acc"]),
+        ):
+            best = candidate
+    return best
+
+
 def _site_catalog_tag(*, site_menu: str, num_bands: int, band_scheme: str, top_prefix_sizes: tuple[int, ...]) -> str:
     tag = f"menu-{str(site_menu)}-bands-{int(num_bands)}-scheme-{str(band_scheme)}"
     if str(site_menu) == "mixed":
@@ -284,7 +312,8 @@ def _build_stage_a_command(
         "ot",
         "--target-vars",
         ",".join(str(target_var) for target_var in normalized["target_vars"]),
-        "--layers",
+        "--layer-sweep",
+        "--layer-indices",
         ",".join(str(layer) for layer in layer_indices),
         "--token-position-ids",
         str(token_position_id),
@@ -453,42 +482,96 @@ def _run_stage_command(*, stage: SweepStage, repo_root: Path) -> None:
     subprocess.run(stage.command, cwd=repo_root, check=True)
 
 
-def _extract_stage_a_rankings(*, aggregate_path: Path) -> dict[str, list[dict[str, object]]]:
-    aggregate_payload = _load_json(aggregate_path)
-    if not isinstance(aggregate_payload, dict):
-        raise ValueError(f"Unexpected Stage A aggregate payload at {aggregate_path}")
-    compare_runs = aggregate_payload.get("runs", [])
+def _iter_ot_payloads_from_run_payload(run_payload: dict[str, object]) -> Iterable[dict[str, object]]:
+    compare_runs = run_payload.get("runs", [])
     if not isinstance(compare_runs, list):
-        raise ValueError(f"Malformed Stage A aggregate payload at {aggregate_path}")
-
-    grouped_payloads: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+        return
     for compare_payload in compare_runs:
         if not isinstance(compare_payload, dict):
             continue
         method_payloads = compare_payload.get("method_payloads", {})
+        if not isinstance(method_payloads, dict):
+            continue
         for payload in method_payloads.get("ot", []):
             if not isinstance(payload, dict):
                 continue
+            enriched = dict(payload)
+            enriched["_candidate_sites"] = compare_payload.get("candidate_sites", [])
+            enriched["_ot_epsilon"] = float(compare_payload.get("ot_epsilon", -1.0))
+            yield enriched
+
+
+def _stage_a_rankings_from_layer_sweep(*, manifest_path: Path, manifest_payload: dict[str, object]) -> dict[str, list[dict[str, object]]]:
+    manifest_runs = manifest_payload.get("runs", [])
+    if not isinstance(manifest_runs, list):
+        raise ValueError(f"Malformed Stage A layer-sweep manifest at {manifest_path}")
+
+    rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+    for manifest_record in manifest_runs:
+        if not isinstance(manifest_record, dict):
+            continue
+        layer = int(manifest_record.get("layer", -1))
+        output_path = manifest_record.get("output_path")
+        if layer < 0 or not output_path:
+            continue
+        raw_run_path = Path(str(output_path))
+        candidate_paths = [raw_run_path]
+        if not raw_run_path.is_absolute():
+            candidate_paths.extend(
+                [
+                    manifest_path.parent / raw_run_path.name,
+                    manifest_path.parent.parent / raw_run_path,
+                ]
+            )
+        run_path = next((path for path in candidate_paths if _stage_output_is_valid(path)), raw_run_path)
+        if not _stage_output_is_valid(run_path):
+            continue
+        run_payload = _load_json(run_path)
+        if not isinstance(run_payload, dict):
+            continue
+        grouped_payloads: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+        for payload in _iter_ot_payloads_from_run_payload(run_payload):
             target_var = str(payload.get("target_var"))
-            payload = dict(payload)
-            payload["_candidate_sites"] = compare_payload.get("candidate_sites", [])
-            payload["_ot_epsilon"] = float(compare_payload.get("ot_epsilon", -1.0))
             grouped_payloads.setdefault(target_var, []).append(payload)
+        for target_var, payloads in grouped_payloads.items():
+            best = _best_result_record(payloads)
+            if best is None:
+                continue
+            rankings.setdefault(str(target_var), []).append(
+                {
+                    "variable": str(target_var),
+                    "layer": int(layer),
+                    "selection_score": float(best["selection_score"]),
+                    "exact_acc": float(best["exact_acc"]),
+                    "epsilon": float(best["epsilon"]),
+                    "site_label": best.get("site_label"),
+                    "selection_basis": "calibration",
+                    "source_path": str(run_path),
+                }
+            )
+    for target_var in list(rankings):
+        rankings[target_var] = _sort_best_first(rankings[target_var])
+    return rankings
+
+
+def _stage_a_rankings_from_joint_run(*, aggregate_path: Path, aggregate_payload: dict[str, object]) -> dict[str, list[dict[str, object]]]:
+    # Fallback for older/non-sweep outputs. This records transport mass as diagnostic evidence,
+    # but Stage B selection should use the layer-sweep path above whenever possible.
+    grouped_payloads: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+    for payload in _iter_ot_payloads_from_run_payload(aggregate_payload):
+        target_var = str(payload.get("target_var"))
+        grouped_payloads.setdefault(target_var, []).append(payload)
 
     rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     for target_var, payloads in grouped_payloads.items():
         if not payloads:
             continue
-        best_selection = max(_selection_score(payload.get("results", [{}])[0]) for payload in payloads)
-        score_floor = float(best_selection) - 0.05
-        kept_payloads = [
-            payload for payload in payloads
-            if _selection_score(payload.get("results", [{}])[0]) >= score_floor
-        ] or payloads
+        best = _best_result_record(payloads)
+        if best is None:
+            continue
         evidence_by_layer: dict[int, float] = {}
         target_mass_by_layer: dict[int, float] = {}
-        kept_meta: list[dict[str, object]] = []
-        for payload in kept_payloads:
+        for payload in payloads:
             candidate_sites = list(payload.get("_candidate_sites", []))
             transport = payload.get("normalized_transport", payload.get("transport", []))
             if not isinstance(transport, list) or not transport:
@@ -499,13 +582,12 @@ def _extract_stage_a_rankings(*, aggregate_path: Path) -> dict[str, list[dict[st
             except ValueError:
                 target_row_index = 0
             row_count = len(transport)
-            row_mass = transport
             for site_index, label in enumerate(candidate_sites):
                 layer = _layer_from_site_label(label)
                 if layer is None:
                     continue
                 try:
-                    target_mass = float(row_mass[target_row_index][site_index])
+                    target_mass = float(transport[target_row_index][site_index])
                 except (IndexError, TypeError, ValueError):
                     continue
                 competitor_mass = 0.0
@@ -513,47 +595,57 @@ def _extract_stage_a_rankings(*, aggregate_path: Path) -> dict[str, list[dict[st
                     if int(other_row_index) == int(target_row_index):
                         continue
                     try:
-                        competitor_mass = max(competitor_mass, float(row_mass[other_row_index][site_index]))
+                        competitor_mass = max(competitor_mass, float(transport[other_row_index][site_index]))
                     except (IndexError, TypeError, ValueError):
                         continue
                 evidence_by_layer[layer] = evidence_by_layer.get(layer, 0.0) + max(target_mass - competitor_mass, 0.0)
                 target_mass_by_layer[layer] = target_mass_by_layer.get(layer, 0.0) + target_mass
-            result = payload.get("results", [{}])[0]
-            kept_meta.append(
-                {
-                    "epsilon": float(payload.get("_ot_epsilon", -1.0)),
-                    "selection_score": _selection_score(result),
-                    "exact_acc": float(result.get("exact_acc", -1.0)),
-                    "site_label": result.get("site_label"),
-                }
-            )
-        normalizer = max(1, len(kept_payloads))
+        normalizer = max(1, len(payloads))
         mean_target_mass_by_layer = {
             int(layer): float(value) / float(normalizer)
             for layer, value in target_mass_by_layer.items()
         }
         total_positive_mass = sum(max(float(value), 0.0) for value in mean_target_mass_by_layer.values())
-        concentration_by_layer = {
-            int(layer): (max(float(value), 0.0) / total_positive_mass if total_positive_mass > 0.0 else 0.0)
-            for layer, value in mean_target_mass_by_layer.items()
-        }
         for layer in sorted(set(evidence_by_layer) | set(mean_target_mass_by_layer)):
             rankings.setdefault(str(target_var), []).append(
                 {
                     "variable": str(target_var),
                     "layer": int(layer),
-                    "selection_score": float(evidence_by_layer.get(int(layer), 0.0)),
+                    "selection_score": float(best["selection_score"]),
+                    "exact_acc": float(best["exact_acc"]),
+                    "epsilon": float(best["epsilon"]),
+                    "site_label": best.get("site_label"),
                     "row_dominant_mass": float(evidence_by_layer.get(int(layer), 0.0)),
                     "mean_target_mass": float(mean_target_mass_by_layer.get(int(layer), 0.0)),
-                    "mass_share": float(concentration_by_layer.get(int(layer), 0.0)),
-                    "exact_acc": float(max((meta.get("exact_acc", -1.0) for meta in kept_meta), default=-1.0)),
-                    "kept_trials": kept_meta,
+                    "mass_share": (
+                        max(float(mean_target_mass_by_layer.get(int(layer), 0.0)), 0.0) / total_positive_mass
+                        if total_positive_mass > 0.0 else 0.0
+                    ),
+                    "selection_basis": "joint_calibration_with_mass_diagnostic",
                     "source_path": str(aggregate_path),
                 }
             )
     for target_var in list(rankings):
-        rankings[target_var] = _sort_best_first(rankings[target_var])
+        rankings[target_var] = sorted(
+            rankings[target_var],
+            key=lambda entry: (
+                float(entry.get("selection_score", -1.0)),
+                float(entry.get("exact_acc", -1.0)),
+                float(entry.get("row_dominant_mass", 0.0)),
+                -int(entry.get("layer", 10**9)),
+            ),
+            reverse=True,
+        )
     return rankings
+
+
+def _extract_stage_a_rankings(*, aggregate_path: Path) -> dict[str, list[dict[str, object]]]:
+    aggregate_payload = _load_json(aggregate_path)
+    if not isinstance(aggregate_payload, dict):
+        raise ValueError(f"Unexpected Stage A payload at {aggregate_path}")
+    if str(aggregate_path.name) == "layer_sweep_manifest.json":
+        return _stage_a_rankings_from_layer_sweep(manifest_path=aggregate_path, manifest_payload=aggregate_payload)
+    return _stage_a_rankings_from_joint_run(aggregate_path=aggregate_path, aggregate_payload=aggregate_payload)
 
 
 def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[dict[str, object]]]) -> str:
@@ -565,14 +657,20 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
     for target_var in DEFAULT_TARGET_VARS:
         lines.append(f"[{target_var}]")
         for entry in rankings.get(target_var, []):
-            lines.append(
-                "  - "
-                f"layer={int(entry['layer'])} "
-                f"row_dom={float(entry.get('row_dominant_mass', entry['selection_score'])):.4f} "
-                f"target_mass={float(entry.get('mean_target_mass', 0.0)):.4f} "
-                f"mass_share={float(entry.get('mass_share', 0.0)):.4f} "
-                f"best_test={float(entry.get('exact_acc', -1.0)):.4f}"
-            )
+            parts = [
+                f"layer={int(entry['layer'])}",
+                f"exact={float(entry.get('exact_acc', -1.0)):.4f}",
+                f"cal={float(entry.get('selection_score', -1.0)):.4f}",
+            ]
+            if "epsilon" in entry:
+                parts.append(f"eps={float(entry.get('epsilon', -1.0)):g}")
+            if entry.get("site_label") is not None:
+                parts.append(f"site={entry.get('site_label')}")
+            if "row_dominant_mass" in entry:
+                parts.append(f"row_dom={float(entry.get('row_dominant_mass', 0.0)):.4f}")
+            if "mass_share" in entry:
+                parts.append(f"mass_share={float(entry.get('mass_share', 0.0)):.4f}")
+            lines.append("  - " + " ".join(parts))
         lines.append("")
     return "\n".join(lines)
 
@@ -991,8 +1089,8 @@ def main() -> None:
         for token_position_id in normalized["stage_a_token_position_ids"]:
             stage_name = f"stage_a_{str(token_position_id)}"
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageA_{str(token_position_id)}"
-            run_root = results_root / f"{stage_timestamp}_mcqa"
-            stage_output = run_root / "mcqa_run_results.json"
+            run_root = results_root / f"{stage_timestamp}_mcqa_layer_sweep"
+            stage_output = run_root / "layer_sweep_manifest.json"
             ranking_json_path = sweep_root / f"stage_a_{str(token_position_id)}_layer_rankings.json"
             ranking_txt_path = sweep_root / f"stage_a_{str(token_position_id)}_layer_rankings.txt"
             if _stage_output_is_valid(stage_output) and _stage_output_is_valid(ranking_json_path):
