@@ -17,7 +17,12 @@ def test_select_stage_b_layers_uses_union_of_top_layers_per_row() -> None:
         ],
     }
 
-    assert _select_stage_b_layers(rankings=rankings, top_layers_per_var=2) == (18, 20, 25)
+    assert _select_stage_b_layers(
+        rankings=rankings,
+        top_layers_per_var=2,
+        neighbor_radius=1,
+        max_layers_per_var=5,
+    ) == (18, 19, 20, 21, 25)
 
 
 def test_extract_stage_b_best_configs_collapses_epsilons_per_config(tmp_path: Path) -> None:

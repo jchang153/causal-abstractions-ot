@@ -45,7 +45,7 @@ DEFAULT_SCREEN_MIN_EPOCHS = 2
 DEFAULT_SCREEN_MASK_NAMES = ("Top1", "Top2")
 DEFAULT_GUIDED_DAS_MAX_EPOCHS = 100
 DEFAULT_GUIDED_DAS_MIN_EPOCHS = 5
-DEFAULT_GUIDED_DAS_MASK_NAMES = ("Top1", "Top2", "Top4", "S80")
+DEFAULT_GUIDED_DAS_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
 
 
 def _parse_csv_strings(value: str | None) -> list[str] | None:
@@ -103,7 +103,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guided-das", action="store_true")
     parser.add_argument(
         "--guided-mask-names",
-        help="Comma-separated PCA support masks for the guided DAS sweep. Default: Top1,Top2,Top4,S80",
+        help="Comma-separated PCA support masks for the guided DAS sweep. Default: Top1,Top2,Top4,S50,S80",
     )
     parser.add_argument(
         "--guided-subspace-dims",
@@ -378,9 +378,27 @@ def _guided_subspace_dims(max_width: int) -> tuple[int, ...]:
     resolved_width = max(1, int(max_width))
     if resolved_width <= 8:
         return tuple(range(1, resolved_width + 1))
-    dims = [dim for dim in (4, 8, 16, 32, 64, 128) if int(dim) < resolved_width]
-    dims.append(int(resolved_width))
-    return tuple(dict.fromkeys(int(dim) for dim in dims))
+    raw_dims = [
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        resolved_width // 4,
+        resolved_width // 2,
+        resolved_width,
+    ]
+    return tuple(
+        sorted(
+            {
+                int(dim)
+                for dim in raw_dims
+                if 1 <= int(dim) <= int(resolved_width)
+            }
+        )
+    )
 
 
 def _write_das_text_report(path: Path, *, title: str, payload: dict[str, object], extra_lines: list[str] | None = None) -> None:
