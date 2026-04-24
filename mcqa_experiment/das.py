@@ -27,7 +27,8 @@ class DASConfig:
     plateau_rel_delta: float = 5e-3
     learning_rate: float = 1e-3
     subspace_dims: tuple[int, ...] | None = None
-    store_candidate_holdout_metrics: bool = True
+    store_candidate_holdout_metrics: bool = False
+    restarts: int = 1
     verbose: bool = True
 
 
@@ -203,7 +204,8 @@ def run_das_pipeline(
     best = None
     best_intervention = None
     best_site = None
-    total_candidates = sum(len(site_dims) for site_dims in subspace_dims_by_site.values())
+    restart_count = max(1, int(config.restarts))
+    total_candidates = sum(len(site_dims) for site_dims in subspace_dims_by_site.values()) * restart_count
     candidate_index = 0
     if config.verbose:
         print(
@@ -212,55 +214,38 @@ def run_das_pipeline(
         )
     for site in sites:
         for subspace_dim in subspace_dims_by_site[site]:
-            candidate_index += 1
-            if config.verbose:
-                print(
-                    f"[{config.method_name.upper()}] candidate {candidate_index}/{total_candidates} "
-                    f"variable={train_bank.target_var} site={site.label} dim={int(subspace_dim)}"
-                )
-            _sync_if_cuda(device)
-            candidate_train_start = perf_counter()
-            intervention, loss_history = train_das_candidate(
-                model=model,
-                bank=train_bank,
-                site=site,
-                subspace_dim=int(subspace_dim),
-                batch_size=config.batch_size,
-                max_epochs=config.max_epochs,
-                min_epochs=config.min_epochs,
-                plateau_patience=config.plateau_patience,
-                plateau_rel_delta=config.plateau_rel_delta,
-                learning_rate=config.learning_rate,
-                device=device,
-                pca_bases_by_id=pca_bases_by_id,
-                verbose=config.verbose,
-            )
-            _sync_if_cuda(device)
-            train_seconds = perf_counter() - candidate_train_start
-            _sync_if_cuda(device)
-            candidate_calibration_start = perf_counter()
-            calibration_metrics = evaluate_das_candidate(
-                model=model,
-                bank=calibration_bank,
-                site=site,
-                intervention=intervention,
-                batch_size=config.batch_size,
-                device=device,
-                tokenizer=tokenizer,
-                pca_bases_by_id=pca_bases_by_id,
-                return_details=False,
-            )
-            _sync_if_cuda(device)
-            calibration_seconds = perf_counter() - candidate_calibration_start
-            train_calibrate_seconds += float(train_seconds) + float(calibration_seconds)
-            holdout_metrics_for_candidate = None
-            current_candidate_holdout_seconds = 0.0
-            if config.store_candidate_holdout_metrics:
+            for restart_index in range(restart_count):
+                candidate_index += 1
+                if config.verbose:
+                    print(
+                        f"[{config.method_name.upper()}] candidate {candidate_index}/{total_candidates} "
+                        f"variable={train_bank.target_var} site={site.label} dim={int(subspace_dim)} "
+                        f"restart={restart_index + 1}/{restart_count}"
+                    )
                 _sync_if_cuda(device)
-                candidate_holdout_start = perf_counter()
-                holdout_metrics_for_candidate = evaluate_das_candidate(
+                candidate_train_start = perf_counter()
+                intervention, loss_history = train_das_candidate(
                     model=model,
-                    bank=holdout_bank,
+                    bank=train_bank,
+                    site=site,
+                    subspace_dim=int(subspace_dim),
+                    batch_size=config.batch_size,
+                    max_epochs=config.max_epochs,
+                    min_epochs=config.min_epochs,
+                    plateau_patience=config.plateau_patience,
+                    plateau_rel_delta=config.plateau_rel_delta,
+                    learning_rate=config.learning_rate,
+                    device=device,
+                    pca_bases_by_id=pca_bases_by_id,
+                    verbose=config.verbose,
+                )
+                _sync_if_cuda(device)
+                train_seconds = perf_counter() - candidate_train_start
+                _sync_if_cuda(device)
+                candidate_calibration_start = perf_counter()
+                calibration_metrics = evaluate_das_candidate(
+                    model=model,
+                    bank=calibration_bank,
                     site=site,
                     intervention=intervention,
                     batch_size=config.batch_size,
@@ -270,52 +255,73 @@ def run_das_pipeline(
                     return_details=False,
                 )
                 _sync_if_cuda(device)
-                current_candidate_holdout_seconds = perf_counter() - candidate_holdout_start
-                candidate_holdout_seconds += current_candidate_holdout_seconds
-            record = {
-                "method": str(config.method_name),
-                "variable": train_bank.target_var,
-                "split": calibration_bank.split,
-                "site_label": site.label,
-                "layer": int(site.layer),
-                "token_position_ids": list(site_token_position_ids(site)),
-                "site_total_dim": int(site_total_width(site, model_hidden_size=hidden_size)),
-                "subspace_dim": int(subspace_dim),
-                "selection_exact_acc": float(calibration_metrics["exact_acc"]),
-                "calibration_exact_acc": float(calibration_metrics["exact_acc"]),
-                "train_epochs_ran": len(loss_history),
-                "train_loss_history": loss_history,
-                "train_seconds": float(train_seconds),
-                "calibration_seconds": float(calibration_seconds),
-            }
-            if holdout_metrics_for_candidate is not None:
-                record["candidate_holdout_seconds"] = float(current_candidate_holdout_seconds)
-            if len(record["token_position_ids"]) == 1:
-                record["token_position_id"] = str(record["token_position_ids"][0])
-            if holdout_metrics_for_candidate is not None:
-                record["holdout_exact_acc"] = float(holdout_metrics_for_candidate["exact_acc"])
-                if "decoded_answer_acc" in holdout_metrics_for_candidate:
-                    record["holdout_decoded_answer_acc"] = float(holdout_metrics_for_candidate["decoded_answer_acc"])
-            search_records.append(record)
-            if config.verbose:
-                message = (
-                    f"[{config.method_name.upper()}] calibration variable={train_bank.target_var} site={site.label} "
-                    f"dim={int(subspace_dim)} epochs={len(loss_history)} "
-                    f"exact_acc={float(calibration_metrics['exact_acc']):.4f}"
-                )
-                if holdout_metrics_for_candidate is not None:
-                    message += f" holdout_exact_acc={float(holdout_metrics_for_candidate['exact_acc']):.4f}"
-                print(message)
-            if best is None or float(record["selection_exact_acc"]) > float(best["selection_exact_acc"]):
-                best = record
-                best_intervention = intervention
-                best_site = site
-                if config.verbose:
-                    print(
-                        f"[{config.method_name.upper()}] new best variable={train_bank.target_var} "
-                        f"site={site.label} dim={int(subspace_dim)} "
-                        f"calibration_exact_acc={float(record['selection_exact_acc']):.4f}"
+                calibration_seconds = perf_counter() - candidate_calibration_start
+                train_calibrate_seconds += float(train_seconds) + float(calibration_seconds)
+                holdout_metrics_for_candidate = None
+                current_candidate_holdout_seconds = 0.0
+                if config.store_candidate_holdout_metrics:
+                    _sync_if_cuda(device)
+                    candidate_holdout_start = perf_counter()
+                    holdout_metrics_for_candidate = evaluate_das_candidate(
+                        model=model,
+                        bank=holdout_bank,
+                        site=site,
+                        intervention=intervention,
+                        batch_size=config.batch_size,
+                        device=device,
+                        tokenizer=tokenizer,
+                        pca_bases_by_id=pca_bases_by_id,
+                        return_details=False,
                     )
+                    _sync_if_cuda(device)
+                    current_candidate_holdout_seconds = perf_counter() - candidate_holdout_start
+                    candidate_holdout_seconds += current_candidate_holdout_seconds
+                record = {
+                    "method": str(config.method_name),
+                    "variable": train_bank.target_var,
+                    "split": calibration_bank.split,
+                    "site_label": site.label,
+                    "layer": int(site.layer),
+                    "token_position_ids": list(site_token_position_ids(site)),
+                    "site_total_dim": int(site_total_width(site, model_hidden_size=hidden_size)),
+                    "subspace_dim": int(subspace_dim),
+                    "restart_index": int(restart_index),
+                    "restart_count": int(restart_count),
+                    "selection_exact_acc": float(calibration_metrics["exact_acc"]),
+                    "calibration_exact_acc": float(calibration_metrics["exact_acc"]),
+                    "train_epochs_ran": len(loss_history),
+                    "train_loss_history": loss_history,
+                    "train_seconds": float(train_seconds),
+                    "calibration_seconds": float(calibration_seconds),
+                }
+                if holdout_metrics_for_candidate is not None:
+                    record["candidate_holdout_seconds"] = float(current_candidate_holdout_seconds)
+                if len(record["token_position_ids"]) == 1:
+                    record["token_position_id"] = str(record["token_position_ids"][0])
+                if holdout_metrics_for_candidate is not None:
+                    record["holdout_exact_acc"] = float(holdout_metrics_for_candidate["exact_acc"])
+                    if "decoded_answer_acc" in holdout_metrics_for_candidate:
+                        record["holdout_decoded_answer_acc"] = float(holdout_metrics_for_candidate["decoded_answer_acc"])
+                search_records.append(record)
+                if config.verbose:
+                    message = (
+                        f"[{config.method_name.upper()}] calibration variable={train_bank.target_var} site={site.label} "
+                        f"dim={int(subspace_dim)} restart={restart_index + 1}/{restart_count} "
+                        f"epochs={len(loss_history)} exact_acc={float(calibration_metrics['exact_acc']):.4f}"
+                    )
+                    if holdout_metrics_for_candidate is not None:
+                        message += f" holdout_exact_acc={float(holdout_metrics_for_candidate['exact_acc']):.4f}"
+                    print(message)
+                if best is None or float(record["selection_exact_acc"]) > float(best["selection_exact_acc"]):
+                    best = record
+                    best_intervention = intervention
+                    best_site = site
+                    if config.verbose:
+                        print(
+                            f"[{config.method_name.upper()}] new best variable={train_bank.target_var} "
+                            f"site={site.label} dim={int(subspace_dim)} restart={restart_index + 1}/{restart_count} "
+                            f"calibration_exact_acc={float(record['selection_exact_acc']):.4f}"
+                        )
     if best is None or best_intervention is None or best_site is None:
         raise RuntimeError(f"Failed to select a DAS candidate for {train_bank.target_var}")
     _sync_if_cuda(device)
@@ -379,6 +385,7 @@ def run_das_pipeline(
             "min_epochs": config.min_epochs,
             "plateau_patience": config.plateau_patience,
             "plateau_rel_delta": config.plateau_rel_delta,
+            "restarts": int(restart_count),
         },
         "selected_calibration_metrics": selected_calibration_metrics,
         "search_records": {train_bank.target_var: search_records},

@@ -40,7 +40,8 @@ class CompareExperimentConfig:
     das_plateau_rel_delta: float = 5e-3
     das_learning_rate: float = 1e-3
     das_subspace_dims: tuple[int, ...] | None = None
-    das_store_candidate_holdout_metrics: bool = True
+    das_store_candidate_holdout_metrics: bool = False
+    das_restarts: int = 1
     resolution: int | None = None
     layers: tuple[int, ...] | None = None
     token_position_ids: tuple[str, ...] | None = ("correct_symbol", "correct_symbol_period", "last_token")
@@ -180,6 +181,7 @@ def run_comparison(
                         learning_rate=config.das_learning_rate,
                         subspace_dims=config.das_subspace_dims,
                         store_candidate_holdout_metrics=config.das_store_candidate_holdout_metrics,
+                        restarts=config.das_restarts,
                     ),
                 )
             else:

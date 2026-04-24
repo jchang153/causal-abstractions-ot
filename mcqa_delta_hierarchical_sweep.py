@@ -196,6 +196,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guided-mask-names", default="Top1,Top2,Top4,S50,S80")
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
+    parser.add_argument("--screen-restarts", type=int, default=1)
+    parser.add_argument("--guided-restarts", type=int, default=2)
     parser.add_argument("--guided-subspace-dims", default=None)
     parser.add_argument("--prompt-hf-login", action="store_true")
     return parser
@@ -379,6 +381,8 @@ def _build_stage_b_or_c_command(
                 str(int(args.guided_max_epochs)),
                 "--guided-min-epochs",
                 str(int(args.guided_min_epochs)),
+                "--guided-restarts",
+                str(max(1, int(args.guided_restarts))),
             ]
         )
         if normalized["guided_subspace_dims"] is not None:
@@ -434,6 +438,10 @@ def _build_native_block_command(
         str(stage_timestamp),
         "--signatures-dir",
         str(args.signatures_dir),
+        "--screen-restarts",
+        str(max(1, int(args.screen_restarts))),
+        "--full-restarts",
+        str(max(1, int(args.guided_restarts))),
     ]
     _append_optional_arg(command, "--dataset-config", args.dataset_config)
     if bool(args.prompt_hf_login):

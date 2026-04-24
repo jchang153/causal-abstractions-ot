@@ -100,6 +100,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--screen-max-epochs", type=int, default=DEFAULT_SCREEN_MAX_EPOCHS)
     parser.add_argument("--screen-min-epochs", type=int, default=DEFAULT_SCREEN_MIN_EPOCHS)
+    parser.add_argument("--screen-restarts", type=int, default=1)
     parser.add_argument("--guided-das", action="store_true")
     parser.add_argument(
         "--guided-mask-names",
@@ -111,6 +112,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--guided-max-epochs", type=int, default=DEFAULT_GUIDED_DAS_MAX_EPOCHS)
     parser.add_argument("--guided-min-epochs", type=int, default=DEFAULT_GUIDED_DAS_MIN_EPOCHS)
+    parser.add_argument("--guided-restarts", type=int, default=2)
     parser.add_argument("--results-root", default="results/anvil")
     parser.add_argument("--results-timestamp")
     parser.add_argument("--signatures-dir", default="signatures")
@@ -445,6 +447,7 @@ def _run_pca_das_from_support(
     learning_rate: float,
     explicit_subspace_dims: tuple[int, ...] | None,
     subspace_dim_resolver,
+    restarts: int,
 ) -> dict[str, dict[str, object]]:
     payloads: dict[str, dict[str, object]] = {}
     if not enabled:
@@ -506,7 +509,8 @@ def _run_pca_das_from_support(
                     plateau_rel_delta=float(plateau_rel_delta),
                     learning_rate=float(learning_rate),
                     subspace_dims=subspace_dims,
-                    store_candidate_holdout_metrics=True,
+                    store_candidate_holdout_metrics=False,
+                    restarts=max(1, int(restarts)),
                     verbose=True,
                 ),
                 pca_bases_by_id=pca_bases_by_id,
@@ -522,6 +526,7 @@ def _run_pca_das_from_support(
                     f"target_var: {target_var}",
                     f"mask_names: {list(str(mask_name) for mask_name in mask_names)}",
                     f"subspace_dims: {list(int(dim) for dim in subspace_dims)}",
+                    f"restarts: {max(1, int(restarts))}",
                 ],
             )
         payloads[str(target_var)] = payload
@@ -855,6 +860,7 @@ def main() -> None:
             learning_rate=base_run.DAS_LEARNING_RATE,
             explicit_subspace_dims=None,
             subspace_dim_resolver=_screen_subspace_dims,
+            restarts=int(args.screen_restarts),
         )
         guided_payloads = _run_pca_das_from_support(
             model=model,
@@ -885,6 +891,7 @@ def main() -> None:
             learning_rate=base_run.DAS_LEARNING_RATE,
             explicit_subspace_dims=guided_subspace_dims,
             subspace_dim_resolver=_guided_subspace_dims,
+            restarts=int(args.guided_restarts),
         )
 
         layer_summary_path = layer_dir / (

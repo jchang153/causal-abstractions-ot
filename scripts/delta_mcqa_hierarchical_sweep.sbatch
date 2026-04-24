@@ -54,6 +54,8 @@ export STAGE_C_TOP_CONFIGS_PER_VAR="${STAGE_C_TOP_CONFIGS_PER_VAR:-2}"
 export GUIDED_MASK_NAMES="${GUIDED_MASK_NAMES:-Top1,Top2,Top4,S50,S80}"
 export GUIDED_MAX_EPOCHS="${GUIDED_MAX_EPOCHS:-100}"
 export GUIDED_MIN_EPOCHS="${GUIDED_MIN_EPOCHS:-5}"
+export SCREEN_RESTARTS="${SCREEN_RESTARTS:-1}"
+export GUIDED_RESTARTS="${GUIDED_RESTARTS:-2}"
 export GUIDED_SUBSPACE_DIMS="${GUIDED_SUBSPACE_DIMS:-}"
 
 mkdir -p "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}"
@@ -89,6 +91,8 @@ ARGS=(
   --guided-mask-names "${GUIDED_MASK_NAMES}"
   --guided-max-epochs "${GUIDED_MAX_EPOCHS}"
   --guided-min-epochs "${GUIDED_MIN_EPOCHS}"
+  --screen-restarts "${SCREEN_RESTARTS}"
+  --guided-restarts "${GUIDED_RESTARTS}"
 )
 
 if [[ -n "${STAGE_A_LAYER_INDICES}" ]]; then

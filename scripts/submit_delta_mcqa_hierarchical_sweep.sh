@@ -22,6 +22,8 @@ echo "[submit-delta-hier] pca_basis_source_modes=${PCA_BASIS_SOURCE_MODES:-pair_
 echo "[submit-delta-hier] pca_num_bands_values=${PCA_NUM_BANDS_VALUES:-8,16}"
 echo "[submit-delta-hier] stage_c_top_configs_per_var=${STAGE_C_TOP_CONFIGS_PER_VAR:-2}"
 echo "[submit-delta-hier] guided_mask_names=${GUIDED_MASK_NAMES:-Top1,Top2,Top4,S50,S80}"
+echo "[submit-delta-hier] screen_restarts=${SCREEN_RESTARTS:-1}"
+echo "[submit-delta-hier] guided_restarts=${GUIDED_RESTARTS:-2}"
 
 RESULTS_TIMESTAMP="${TIMESTAMP}" \
 RESULTS_ROOT="${RESULTS_ROOT}" \

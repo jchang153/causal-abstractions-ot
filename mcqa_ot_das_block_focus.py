@@ -109,6 +109,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--screen-max-epochs", type=int, default=DEFAULT_SCREEN_MAX_EPOCHS)
     parser.add_argument("--screen-min-epochs", type=int, default=DEFAULT_SCREEN_MIN_EPOCHS)
+    parser.add_argument("--screen-restarts", type=int, default=1)
+    parser.add_argument("--full-restarts", type=int, default=2)
     parser.add_argument("--full-mask-limit", type=int, default=DEFAULT_FULL_MASK_LIMIT)
     parser.add_argument("--results-root", default="results/anvil")
     parser.add_argument("--results-timestamp")
@@ -368,6 +370,8 @@ def main() -> None:
                     batch_size=int(args.batch_size),
                     signature_mode=str(args.signature_mode),
                     das_subspace_dims=DEFAULT_DAS_SUBSPACE_DIMS,
+                    das_store_candidate_holdout_metrics=False,
+                    das_restarts=max(1, int(args.full_restarts)),
                     resolution=hidden_size,
                     layers=(int(layer),),
                     token_position_ids=DEFAULT_TOKEN_POSITION_IDS,
@@ -524,7 +528,8 @@ def main() -> None:
                                 plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
                                 learning_rate=base_run.DAS_LEARNING_RATE,
                                 subspace_dims=mask_subspace_dims,
-                                store_candidate_holdout_metrics=True,
+                                store_candidate_holdout_metrics=False,
+                                restarts=max(1, int(args.screen_restarts)),
                                 verbose=True,
                             ),
                         )
@@ -538,6 +543,7 @@ def main() -> None:
                                 f"target_var: {target_var}",
                                 f"mask_candidates: {[candidate.get('name') for candidate in support_summary.get('mask_candidates', [])]}",
                                 f"subspace_dims: {list(int(dim) for dim in mask_subspace_dims)}",
+                                f"restarts: {max(1, int(args.screen_restarts))}",
                             ],
                         )
                     screen_payloads[str(target_var)] = screen_payload
@@ -581,7 +587,8 @@ def main() -> None:
                                 plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
                                 learning_rate=base_run.DAS_LEARNING_RATE,
                                 subspace_dims=selected_subspace_dims,
-                                store_candidate_holdout_metrics=True,
+                                store_candidate_holdout_metrics=False,
+                                restarts=max(1, int(args.full_restarts)),
                                 verbose=True,
                             ),
                         )
@@ -596,6 +603,7 @@ def main() -> None:
                                 f"target_var: {target_var}",
                                 f"selected_screen_site_labels: {selected_site_labels}",
                                 f"subspace_dims: {list(int(dim) for dim in selected_subspace_dims)}",
+                                f"restarts: {max(1, int(args.full_restarts))}",
                             ],
                         )
                     block_payloads[str(target_var)] = block_payload
