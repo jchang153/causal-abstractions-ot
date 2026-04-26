@@ -36,6 +36,12 @@ fi
 sbatch \
   --account="${DELTA_ACCOUNT}" \
   --partition="${DELTA_PARTITION}" \
+  --nodes=1 \
+  --ntasks=1 \
+  --cpus-per-task="${ORCHESTRATOR_CPUS_PER_TASK:-1}" \
+  --gpus-per-node="${ORCHESTRATOR_GPUS_PER_NODE:-1}" \
+  --mem="${ORCHESTRATOR_MEM:-8g}" \
+  --constraint="${DELTA_CONSTRAINT:-scratch}" \
   "${AGG_DEPENDENCY_ARGS[@]}" \
   --time="${ORCHESTRATOR_TIME:-00:30:00}" \
   --output="${ROOT}/mcqa-agg-%j.out" \
