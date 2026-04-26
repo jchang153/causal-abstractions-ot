@@ -8,6 +8,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Iterable
 
 
@@ -25,7 +26,20 @@ DEFAULT_PCA_NUM_BANDS_VALUES = (8, 16)
 DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_PCA_TOP_PREFIX_SIZES = (8, 16, 32, 64)
 DEFAULT_GUIDED_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
-DEFAULT_NATIVE_BLOCK_RESOLUTIONS = (576, 288)
+DEFAULT_NATIVE_BLOCK_RESOLUTIONS = (1, 8, 32, 72, 144, 288, 576)
+DEFAULT_DAS_SUBSPACE_DIMS = (
+    32,
+    64,
+    96,
+    128,
+    256,
+    512,
+    768,
+    1024,
+    1536,
+    2048,
+    2304,
+)
 DEFAULT_STAGES = ("stage_a_layer_ot", "stage_b_native_ot", "stage_b_pca_ot", "stage_c_guided_das")
 
 
@@ -103,6 +117,9 @@ def _best_result_record(payloads: Iterable[dict[str, object]]) -> dict[str, obje
             "selection_score": _selection_score(result),
             "exact_acc": float(result.get("exact_acc", -1.0)),
             "site_label": result.get("site_label"),
+            "runtime_seconds": payload.get("runtime_seconds"),
+            "wall_runtime_seconds": payload.get("wall_runtime_seconds"),
+            "signature_prepare_runtime_seconds": payload.get("signature_prepare_runtime_seconds"),
             "result": result,
             "payload": payload,
         }
@@ -214,7 +231,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-b-top-layers-per-var", type=int, default=3)
     parser.add_argument("--stage-b-neighbor-radius", type=int, default=1)
     parser.add_argument("--stage-b-max-layers-per-var", type=int, default=5)
-    parser.add_argument("--native-block-resolutions", default="576,288")
+    parser.add_argument("--native-block-resolutions", default="1,8,32,72,144,288,576")
     parser.add_argument("--pca-site-menus", default="partition,mixed")
     parser.add_argument("--pca-basis-source-modes", default="pair_bank,all_variants")
     parser.add_argument("--pca-num-bands-values", default="8,16")
@@ -227,6 +244,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--screen-restarts", type=int, default=1)
     parser.add_argument("--guided-restarts", type=int, default=2)
     parser.add_argument("--guided-subspace-dims", default=None)
+    parser.add_argument(
+        "--regular-das-subspace-dims",
+        default="32,64,96,128,256,512,768,1024,1536,2048,2304",
+        help="Comma-separated DAS dimensions for full-layer/A-only DAS baselines.",
+    )
     parser.add_argument("--prompt-hf-login", action="store_true")
     return parser
 
@@ -252,6 +274,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     guided_subspace_dims = None
     if args.guided_subspace_dims is not None:
         guided_subspace_dims = _parse_csv_ints(args.guided_subspace_dims)
+    regular_das_subspace_dims = _parse_csv_ints(args.regular_das_subspace_dims) or DEFAULT_DAS_SUBSPACE_DIMS
     results_timestamp = (
         args.results_timestamp
         or os.environ.get("RESULTS_TIMESTAMP")
@@ -273,6 +296,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "calibration_family_weights": tuple(float(weight) for weight in calibration_family_weights),
         "guided_mask_names": tuple(str(mask_name) for mask_name in guided_mask_names),
         "guided_subspace_dims": None if guided_subspace_dims is None else tuple(int(dim) for dim in guided_subspace_dims),
+        "regular_das_subspace_dims": tuple(int(dim) for dim in regular_das_subspace_dims),
         "results_timestamp": str(results_timestamp),
     }
 
@@ -471,15 +495,26 @@ def _build_native_block_command(
         str(max(1, int(args.screen_restarts))),
         "--full-restarts",
         str(max(1, int(args.guided_restarts))),
+        "--full-das-subspace-dims",
+        ",".join(str(dim) for dim in normalized["regular_das_subspace_dims"]),
     ]
+    if normalized["guided_subspace_dims"] is not None:
+        command.extend(
+            [
+                "--guided-subspace-dims",
+                ",".join(str(dim) for dim in normalized["guided_subspace_dims"]),
+            ]
+        )
     _append_optional_arg(command, "--dataset-config", args.dataset_config)
     if bool(args.prompt_hf_login):
         command.append("--prompt-hf-login")
     return tuple(command)
 
 
-def _run_stage_command(*, stage: SweepStage, repo_root: Path) -> None:
+def _run_stage_command(*, stage: SweepStage, repo_root: Path) -> float:
+    start = perf_counter()
     subprocess.run(stage.command, cwd=repo_root, check=True)
+    return float(perf_counter() - start)
 
 
 def _iter_ot_payloads_from_run_payload(run_payload: dict[str, object]) -> Iterable[dict[str, object]]:
@@ -545,6 +580,9 @@ def _stage_a_rankings_from_layer_sweep(*, manifest_path: Path, manifest_payload:
                     "exact_acc": float(best["exact_acc"]),
                     "epsilon": float(best["epsilon"]),
                     "site_label": best.get("site_label"),
+                    "runtime_seconds": best.get("runtime_seconds"),
+                    "wall_runtime_seconds": best.get("wall_runtime_seconds"),
+                    "signature_prepare_runtime_seconds": best.get("signature_prepare_runtime_seconds"),
                     "selection_basis": "calibration",
                     "source_path": str(run_path),
                 }
@@ -615,6 +653,9 @@ def _stage_a_rankings_from_joint_run(*, aggregate_path: Path, aggregate_payload:
                     "exact_acc": float(best["exact_acc"]),
                     "epsilon": float(best["epsilon"]),
                     "site_label": best.get("site_label"),
+                    "runtime_seconds": best.get("runtime_seconds"),
+                    "wall_runtime_seconds": best.get("wall_runtime_seconds"),
+                    "signature_prepare_runtime_seconds": best.get("signature_prepare_runtime_seconds"),
                     "row_dominant_mass": float(evidence_by_layer.get(int(layer), 0.0)),
                     "mean_target_mass": float(mean_target_mass_by_layer.get(int(layer), 0.0)),
                     "mass_share": (
@@ -666,6 +707,8 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
                 parts.append(f"eps={float(entry.get('epsilon', -1.0)):g}")
             if entry.get("site_label") is not None:
                 parts.append(f"site={entry.get('site_label')}")
+            if entry.get("runtime_seconds") is not None:
+                parts.append(f"runtime={float(entry['runtime_seconds']):.2f}s")
             if "row_dominant_mass" in entry:
                 parts.append(f"row_dom={float(entry.get('row_dominant_mass', 0.0)):.4f}")
             if "mass_share" in entry:
@@ -741,6 +784,9 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
                     "selection_score": _selection_score(result),
                     "epsilon": epsilon,
                     "site_label": result.get("site_label"),
+                    "runtime_seconds": method_payload.get("runtime_seconds"),
+                    "wall_runtime_seconds": method_payload.get("wall_runtime_seconds"),
+                    "signature_prepare_runtime_seconds": method_payload.get("signature_prepare_runtime_seconds"),
                     "layer_payload_path": str(payload_path),
                 }
                 current = grouped.get(key)
@@ -759,18 +805,20 @@ def _format_stage_b_summary(*, rankings: dict[str, list[dict[str, object]]]) -> 
     for target_var in DEFAULT_TARGET_VARS:
         lines.append(f"[{target_var}]")
         for entry in rankings.get(target_var, []):
-            lines.append(
-                "  - "
-                f"layer={int(entry['layer'])} "
-                f"pos={entry['token_position_id']} "
-                f"basis={entry['basis_source_mode']} "
-                f"menu={entry['site_menu']} "
-                f"bands={int(entry['num_bands'])} "
-                f"exact={float(entry['exact_acc']):.4f} "
-                f"cal={float(entry['selection_score']):.4f} "
-                f"eps={float(entry['epsilon']):g} "
-                f"site={entry.get('site_label')}"
-            )
+            parts = [
+                f"layer={int(entry['layer'])}",
+                f"pos={entry['token_position_id']}",
+                f"basis={entry['basis_source_mode']}",
+                f"menu={entry['site_menu']}",
+                f"bands={int(entry['num_bands'])}",
+                f"exact={float(entry['exact_acc']):.4f}",
+                f"cal={float(entry['selection_score']):.4f}",
+                f"eps={float(entry['epsilon']):g}",
+                f"site={entry.get('site_label')}",
+            ]
+            if entry.get("runtime_seconds") is not None:
+                parts.append(f"runtime={float(entry['runtime_seconds']):.2f}s")
+            lines.append("  - " + " ".join(parts))
         lines.append("")
     return "\n".join(lines)
 
@@ -808,6 +856,9 @@ def _extract_native_rankings(*, payload_paths: Iterable[Path]) -> tuple[dict[str
                     "selection_score": _selection_score(result),
                     "epsilon": epsilon,
                     "site_label": result.get("site_label"),
+                    "runtime_seconds": method_payload.get("runtime_seconds"),
+                    "wall_runtime_seconds": method_payload.get("wall_runtime_seconds"),
+                    "signature_prepare_runtime_seconds": method_payload.get("signature_prepare_runtime_seconds"),
                     "payload_path": str(payload_path),
                 }
                 key = (target_var, layer, resolution)
@@ -842,6 +893,12 @@ def _extract_native_rankings(*, payload_paths: Iterable[Path]) -> tuple[dict[str
             seen_full_das_paths.add(full_das_path)
             full_payload = _load_json(Path(full_das_path))
             if isinstance(full_payload, dict):
+                runtime_by_var: dict[str, object] = {}
+                method_payloads = full_payload.get("method_payloads", {})
+                if isinstance(method_payloads, dict):
+                    for method_payload in method_payloads.get("das", []):
+                        if isinstance(method_payload, dict):
+                            runtime_by_var[str(method_payload.get("target_var"))] = method_payload.get("runtime_seconds")
                 for result in full_payload.get("results", []):
                     if not isinstance(result, dict):
                         continue
@@ -856,6 +913,7 @@ def _extract_native_rankings(*, payload_paths: Iterable[Path]) -> tuple[dict[str
                             "site_label": result.get("site_label"),
                             "subspace_dim": result.get("subspace_dim"),
                             "site_total_dim": result.get("site_total_dim"),
+                            "runtime_seconds": runtime_by_var.get(target_var),
                         }
                     )
     for entry in grouped_ot.values():
@@ -1028,6 +1086,10 @@ def _write_status(
             "pca_basis_source_modes": list(normalized["pca_basis_source_modes"]),
             "pca_num_bands_values": list(normalized["pca_num_bands_values"]),
             "guided_mask_names": list(normalized["guided_mask_names"]),
+            "guided_subspace_dims": None
+            if normalized["guided_subspace_dims"] is None
+            else list(normalized["guided_subspace_dims"]),
+            "regular_das_subspace_dims": list(normalized["regular_das_subspace_dims"]),
         },
         "stage_statuses": stage_statuses,
         "updated_at": datetime.now().isoformat(),
@@ -1142,7 +1204,7 @@ def main() -> None:
                     "started_at": datetime.now().isoformat(),
                 },
             )
-            _run_stage_command(stage=stage, repo_root=repo_root)
+            stage_runtime_seconds = _run_stage_command(stage=stage, repo_root=repo_root)
             rankings = _extract_stage_a_rankings(aggregate_path=stage_output)
             _write_json(ranking_json_path, rankings)
             _write_text(
@@ -1162,6 +1224,8 @@ def main() -> None:
                     "state": "completed",
                     "stage_timestamp": stage_timestamp,
                     "expected_outputs": [str(stage_output), str(ranking_json_path), str(ranking_txt_path)],
+                    "runtime_seconds": float(stage_runtime_seconds),
+                    "wall_runtime_seconds": float(stage_runtime_seconds),
                     "completed_at": datetime.now().isoformat(),
                 },
             )
@@ -1247,7 +1311,7 @@ def main() -> None:
                     "started_at": datetime.now().isoformat(),
                 },
             )
-            _run_stage_command(stage=stage, repo_root=repo_root)
+            stage_runtime_seconds = _run_stage_command(stage=stage, repo_root=repo_root)
             missing_outputs = [path for path in expected_outputs if not _stage_output_is_valid(Path(path))]
             if missing_outputs:
                 raise RuntimeError(f"Stage {stage_name} missing outputs: {missing_outputs}")
@@ -1263,6 +1327,8 @@ def main() -> None:
                     "state": "completed",
                     "stage_timestamp": stage_timestamp,
                     "expected_outputs": expected_outputs,
+                    "runtime_seconds": float(stage_runtime_seconds),
+                    "wall_runtime_seconds": float(stage_runtime_seconds),
                     "completed_at": datetime.now().isoformat(),
                 },
             )
@@ -1378,7 +1444,7 @@ def main() -> None:
                                 "started_at": datetime.now().isoformat(),
                             },
                         )
-                        _run_stage_command(stage=stage, repo_root=repo_root)
+                        stage_runtime_seconds = _run_stage_command(stage=stage, repo_root=repo_root)
                         missing_outputs = [path for path in expected_outputs if not _stage_output_is_valid(Path(path))]
                         if missing_outputs:
                             raise RuntimeError(f"Stage {stage_name} missing outputs: {missing_outputs}")
@@ -1394,6 +1460,8 @@ def main() -> None:
                                 "state": "completed",
                                 "stage_timestamp": stage_timestamp,
                                 "expected_outputs": expected_outputs,
+                                "runtime_seconds": float(stage_runtime_seconds),
+                                "wall_runtime_seconds": float(stage_runtime_seconds),
                                 "completed_at": datetime.now().isoformat(),
                             },
                         )
@@ -1506,7 +1574,7 @@ def main() -> None:
                     "started_at": datetime.now().isoformat(),
                 },
             )
-            _run_stage_command(stage=stage, repo_root=repo_root)
+            stage_runtime_seconds = _run_stage_command(stage=stage, repo_root=repo_root)
             missing_outputs = [path for path in expected_outputs if not _stage_output_is_valid(Path(path))]
             if missing_outputs:
                 raise RuntimeError(f"Stage {stage_name} missing outputs: {missing_outputs}")
@@ -1522,6 +1590,8 @@ def main() -> None:
                     "state": "completed",
                     "stage_timestamp": stage_timestamp,
                     "expected_outputs": expected_outputs,
+                    "runtime_seconds": float(stage_runtime_seconds),
+                    "wall_runtime_seconds": float(stage_runtime_seconds),
                     "completed_at": datetime.now().isoformat(),
                 },
             )
@@ -1541,6 +1611,8 @@ def main() -> None:
     for stage_name in sorted(stage_statuses):
         status = stage_statuses[stage_name]
         lines.append(f"{stage_name}: {status.get('state', 'unknown')}")
+        if status.get("runtime_seconds") is not None:
+            lines.append(f"  runtime_seconds: {float(status['runtime_seconds']):.2f}")
         for path in status.get("expected_outputs", []):
             lines.append(f"  {path}")
         lines.append("")

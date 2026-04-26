@@ -29,7 +29,7 @@ COMMON_ARGS=(
   --stage-b-top-layers-per-var "${STAGE_B_TOP_LAYERS_PER_VAR:-3}"
   --stage-b-neighbor-radius "${STAGE_B_NEIGHBOR_RADIUS:-1}"
   --stage-b-max-layers-per-var "${STAGE_B_MAX_LAYERS_PER_VAR:-5}"
-  --native-block-resolutions "${NATIVE_BLOCK_RESOLUTIONS:-576,288}"
+  --native-block-resolutions "${NATIVE_BLOCK_RESOLUTIONS:-1,8,32,72,144,288,576}"
   --pca-site-menus "${PCA_SITE_MENUS:-partition,mixed}"
   --pca-basis-source-modes "${PCA_BASIS_SOURCE_MODES:-pair_bank,all_variants}"
   --pca-num-bands-values "${PCA_NUM_BANDS_VALUES:-8,16}"
@@ -41,6 +41,7 @@ COMMON_ARGS=(
   --guided-min-epochs "${GUIDED_MIN_EPOCHS:-5}"
   --screen-restarts "${SCREEN_RESTARTS:-1}"
   --guided-restarts "${GUIDED_RESTARTS:-2}"
+  --regular-das-subspace-dims "${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
 )
 
 if [[ -n "${STAGE_A_LAYER_INDICES:-}" ]]; then

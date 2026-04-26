@@ -20,7 +20,19 @@ DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.5, 2.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
-DEFAULT_REGULAR_DAS_SUBSPACE_DIMS = (576, 1152, 1728, 2304)
+DEFAULT_REGULAR_DAS_SUBSPACE_DIMS = (
+    32,
+    64,
+    96,
+    128,
+    256,
+    512,
+    768,
+    1024,
+    1536,
+    2048,
+    2304,
+)
 DEFAULT_PCA_SITE_MENUS = ("partition", "mixed")
 DEFAULT_PCA_BASIS_SOURCE_MODES = ("pair_bank", "all_variants")
 DEFAULT_PCA_NUM_BANDS = 8
@@ -96,7 +108,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ot-lambdas", default="0.5,1,2,4")
     parser.add_argument("--calibration-metric", default=DEFAULT_CALIBRATION_METRIC)
     parser.add_argument("--calibration-family-weights", default="1,1.5,2")
-    parser.add_argument("--regular-das-subspace-dims", default="576,1152,1728,2304")
+    parser.add_argument(
+        "--regular-das-subspace-dims",
+        default="32,64,96,128,256,512,768,1024,1536,2048,2304",
+    )
     parser.add_argument("--regular-das-max-epochs", type=int, default=100)
     parser.add_argument("--regular-das-min-epochs", type=int, default=5)
     parser.add_argument("--regular-das-plateau-patience", type=int, default=2)

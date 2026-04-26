@@ -5,10 +5,12 @@ import hashlib
 import json
 from pathlib import Path
 import os
+from time import perf_counter
 
 from huggingface_hub import login as hf_login
 
 from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparison
+import mcqa_experiment.data as mcqa_data
 from mcqa_experiment.data import build_pair_banks, canonicalize_target_var, load_filtered_mcqa_pipeline
 from mcqa_experiment.ot import (
     OTConfig,
@@ -67,7 +69,19 @@ DAS_MIN_EPOCHS = 5
 DAS_PLATEAU_PATIENCE = 1
 DAS_PLATEAU_REL_DELTA = 1e-3
 DAS_LEARNING_RATE = 1e-3
-DAS_SUBSPACE_DIMS = [576, 1152, 1728, 2304]
+DAS_SUBSPACE_DIMS = [
+    32,
+    64,
+    96,
+    128,
+    256,
+    512,
+    768,
+    1024,
+    1536,
+    2048,
+    2304,
+]
 
 
 def _resolution_tag(resolution: int | None) -> str:
@@ -146,9 +160,11 @@ def _load_existing_run_payload(output_path: Path) -> dict[str, object] | None:
 
 
 def build_run_context() -> dict[str, object]:
+    context_start = perf_counter()
     device = resolve_device(DEVICE)
     hf_token = ensure_hf_login(HF_TOKEN, PROMPT_HF_LOGIN)
     print(f"[run] starting MCQA run model={MODEL_NAME} device={device}")
+    load_start = perf_counter()
     model, tokenizer, causal_model, token_positions, filtered_datasets = load_filtered_mcqa_pipeline(
         model_name=MODEL_NAME,
         device=DEVICE,
@@ -158,7 +174,10 @@ def build_run_context() -> dict[str, object]:
         dataset_path=MCQA_DATASET_PATH,
         dataset_name=MCQA_DATASET_CONFIG,
     )
+    load_pipeline_seconds = float(perf_counter() - load_start)
+    pipeline_timing_seconds = dict(getattr(mcqa_data, "LAST_PIPELINE_TIMING_SECONDS", {}))
     print("[run] building pair banks")
+    bank_start = perf_counter()
     banks_by_split, data_metadata = build_pair_banks(
         tokenizer=tokenizer,
         causal_model=causal_model,
@@ -171,6 +190,8 @@ def build_run_context() -> dict[str, object]:
         calibration_pool_size=CALIBRATION_POOL_SIZE,
         test_pool_size=TEST_POOL_SIZE,
     )
+    bank_build_seconds = float(perf_counter() - bank_start)
+    total_context_seconds = float(perf_counter() - context_start)
     print(f"[run] built splits={list(banks_by_split.keys())}")
     for split in SPLIT_PRINT_ORDER:
         split_metadata = data_metadata.get(split)
@@ -195,6 +216,12 @@ def build_run_context() -> dict[str, object]:
         "filtered_datasets": filtered_datasets,
         "banks_by_split": banks_by_split,
         "data_metadata": data_metadata,
+        "timing_seconds": {
+            **pipeline_timing_seconds,
+            "t_model_data_filter_load": load_pipeline_seconds,
+            "t_bank_build": bank_build_seconds,
+            "t_context_total_wall": total_context_seconds,
+        },
     }
 
 

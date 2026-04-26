@@ -4,8 +4,10 @@ import argparse
 import json
 import os
 from pathlib import Path
+from time import perf_counter
 
 import mcqa_run as base_run
+import torch
 from mcqa_experiment.das import DASConfig, run_das_pipeline
 from mcqa_experiment.data import COUNTERFACTUAL_FAMILIES, canonicalize_target_var
 from mcqa_experiment.ot import OTConfig, prepare_alignment_artifacts, run_alignment_pipeline
@@ -46,6 +48,12 @@ DEFAULT_SCREEN_MASK_NAMES = ("Top1", "Top2")
 DEFAULT_GUIDED_DAS_MAX_EPOCHS = 100
 DEFAULT_GUIDED_DAS_MIN_EPOCHS = 5
 DEFAULT_GUIDED_DAS_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
+
+
+def _synchronize_if_cuda(device: torch.device | str) -> None:
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(resolved)
 
 
 def _parse_csv_strings(value: str | None) -> list[str] | None:
@@ -378,29 +386,21 @@ def _screen_subspace_dims(max_width: int) -> tuple[int, ...]:
 
 def _guided_subspace_dims(max_width: int) -> tuple[int, ...]:
     resolved_width = max(1, int(max_width))
-    if resolved_width <= 8:
-        return tuple(range(1, resolved_width + 1))
     raw_dims = [
-        4,
-        8,
-        16,
         32,
         64,
+        96,
         128,
         256,
-        resolved_width // 4,
-        resolved_width // 2,
-        resolved_width,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2304,
     ]
-    return tuple(
-        sorted(
-            {
-                int(dim)
-                for dim in raw_dims
-                if 1 <= int(dim) <= int(resolved_width)
-            }
-        )
-    )
+    dims = tuple(int(dim) for dim in raw_dims if 1 <= int(dim) <= int(resolved_width))
+    return dims or (resolved_width,)
 
 
 def _write_das_text_report(path: Path, *, title: str, payload: dict[str, object], extra_lines: list[str] | None = None) -> None:
@@ -644,6 +644,7 @@ def _write_epsilon_summary(path: Path, *, payload: dict[str, object]) -> None:
 
 
 def main() -> None:
+    stage_start = perf_counter()
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -665,6 +666,7 @@ def main() -> None:
 
     _configure_base_run(args, sweep_root=sweep_root, results_timestamp=results_timestamp)
     context = base_run.build_run_context()
+    context_timing_seconds = dict(context.get("timing_seconds", {}))
     model = context["model"]
     tokenizer = context["tokenizer"]
     token_positions = context["token_positions"]
@@ -692,6 +694,7 @@ def main() -> None:
     )
 
     for layer in layers:
+        layer_start = perf_counter()
         layer_dir = sweep_root / f"layer_{int(layer):02d}"
         layer_dir.mkdir(parents=True, exist_ok=True)
 
@@ -699,6 +702,7 @@ def main() -> None:
             f"mcqa_layer-{int(layer)}_{str(args.token_position_id)}_basis-{str(args.basis_source_mode)}_pca_basis.pt"
         )
         prompt_records = None
+        pca_fit_start = perf_counter()
         if str(args.basis_source_mode) == "all_variants":
             prompt_records = _unique_prompt_records_for_all_variants(
                 train_bank=fit_bank_for_basis,
@@ -728,6 +732,9 @@ def main() -> None:
                 device=device,
                 basis_id=f"L{int(layer)}:{str(args.token_position_id)}:pca-{str(args.basis_source_mode)}",
             )
+        _synchronize_if_cuda(device)
+        pca_fit_seconds = float(perf_counter() - pca_fit_start)
+        site_build_start = perf_counter()
         pca_sites = _enumerate_pca_sites(
             basis=basis,
             token_position_id=str(args.token_position_id),
@@ -739,9 +746,11 @@ def main() -> None:
         )
         site_metrics = _rotated_site_metrics(basis=basis, sites=pca_sites)
         pca_bases_by_id = {str(basis.basis_id): basis}
+        site_build_seconds = float(perf_counter() - site_build_start)
 
         prepared_artifacts = None
         ot_compare_payloads: list[dict[str, object]] = []
+        ot_fit_cal_start = perf_counter()
         for epsilon in ot_epsilons:
             output_stem = (
                 f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
@@ -817,7 +826,10 @@ def main() -> None:
                 write_json(output_path, compare_payload)
                 _write_epsilon_summary(summary_path, payload=compare_payload)
             ot_compare_payloads.append(compare_payload)
+        _synchronize_if_cuda(device)
+        ot_fit_cal_seconds = float(perf_counter() - ot_fit_cal_start)
 
+        support_start = perf_counter()
         support_by_var = extract_ordered_site_support(
             ot_run_payloads=ot_compare_payloads,
             sites=pca_sites,
@@ -830,7 +842,9 @@ def main() -> None:
             f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_support.json"
         )
         write_json(support_path, support_by_var)
+        support_extract_seconds = float(perf_counter() - support_start)
 
+        das_screen_start = perf_counter()
         screen_payloads = _run_pca_das_from_support(
             model=model,
             tokenizer=tokenizer,
@@ -862,6 +876,9 @@ def main() -> None:
             subspace_dim_resolver=_screen_subspace_dims,
             restarts=int(args.screen_restarts),
         )
+        _synchronize_if_cuda(device)
+        das_screen_seconds = float(perf_counter() - das_screen_start)
+        das_guided_start = perf_counter()
         guided_payloads = _run_pca_das_from_support(
             model=model,
             tokenizer=tokenizer,
@@ -893,6 +910,9 @@ def main() -> None:
             subspace_dim_resolver=_guided_subspace_dims,
             restarts=int(args.guided_restarts),
         )
+        _synchronize_if_cuda(device)
+        das_guided_seconds = float(perf_counter() - das_guided_start)
+        layer_total_seconds = float(perf_counter() - layer_start)
 
         layer_summary_path = layer_dir / (
             f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
@@ -941,6 +961,22 @@ def main() -> None:
             "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
             "guided_subspace_dims": None if guided_subspace_dims is None else [int(dim) for dim in guided_subspace_dims],
             "guided_das_enabled": bool(args.guided_das),
+            "context_timing_seconds": context_timing_seconds,
+            "timing_seconds": {
+                "t_model_load": float(context_timing_seconds.get("t_model_load", 0.0)),
+                "t_data_load": float(context_timing_seconds.get("t_data_load", 0.0)),
+                "t_bank_build": float(context_timing_seconds.get("t_bank_build", 0.0)),
+                "t_factual_filter": float(context_timing_seconds.get("t_factual_filter", 0.0)),
+                "t_context_total_wall": float(context_timing_seconds.get("t_context_total_wall", 0.0)),
+                "t_stageB_pca_fit": float(pca_fit_seconds),
+                "t_stageB_pca_site_build": float(site_build_seconds),
+                "t_stageB_pca_ot_fit_cal": float(ot_fit_cal_seconds),
+                "t_support_extract": float(support_extract_seconds),
+                "t_stageC_das_screen": float(das_screen_seconds),
+                "t_stageC_das_full": float(das_guided_seconds),
+                "t_layer_total_wall": float(layer_total_seconds),
+                "t_stage_total_wall_so_far": float(perf_counter() - stage_start),
+            },
             "screen_output_paths": {
                 str(target_var): str(
                     layer_dir / (
@@ -988,6 +1024,8 @@ def main() -> None:
                 "signature_mode": str(args.signature_mode),
                 "screen_das_enabled": bool(args.screen_das),
                 "guided_das_enabled": bool(args.guided_das),
+                "runtime_seconds": float(layer_total_seconds),
+                "timing_seconds": layer_payload["timing_seconds"],
                 "summary_path": str(layer_summary_path),
                 "payload_path": str(layer_payload_path),
             }
@@ -1013,6 +1051,8 @@ def main() -> None:
             "guided_das_enabled": bool(args.guided_das),
             "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
             "guided_subspace_dims": None if guided_subspace_dims is None else [int(dim) for dim in guided_subspace_dims],
+            "context_timing_seconds": context_timing_seconds,
+            "runtime_seconds": float(perf_counter() - stage_start),
             "runs": [
                 *[run for run in existing_manifest_runs if str(run.get("payload_path", "")) not in current_payload_paths],
                 *manifest_runs,

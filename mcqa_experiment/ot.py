@@ -23,6 +23,12 @@ from .signatures import collect_base_logits, collect_multi_variable_site_signatu
 from .sites import SiteLike
 
 
+def _synchronize_if_cuda(device: torch.device | str) -> None:
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(resolved)
+
+
 def _squared_euclidean_cost(u_points: torch.Tensor, v_points: torch.Tensor) -> torch.Tensor:
     """Compute squared Euclidean transport costs between two point clouds."""
     u = u_points.to(dtype=torch.float32)
@@ -893,13 +899,16 @@ def run_alignment_pipeline(
 ) -> dict[str, object]:
     """Run OT or UOT for one MCQA target variable using a two-source abstraction."""
     device = torch.device(device)
+    total_start = perf_counter()
     if config.selection_verbose:
         print(
             f"[{config.method.upper()}] start variable={holdout_bank.target_var} "
             f"signature_mode={config.signature_mode} candidate_sites={len(sites)} "
             f"epsilon={float(config.epsilon):g} sources={list(config.source_target_vars)}"
         )
+    signature_prepare_wall_seconds = 0.0
     if prepared_artifacts is None:
+        signature_start = perf_counter()
         prepared_artifacts = prepare_alignment_artifacts(
             model=model,
             fit_banks_by_var=fit_banks_by_var,
@@ -908,17 +917,30 @@ def run_alignment_pipeline(
             config=config,
             pca_bases_by_id=pca_bases_by_id,
         )
+        _synchronize_if_cuda(device)
+        signature_prepare_wall_seconds = float(perf_counter() - signature_start)
+    signature_prepare_runtime_seconds = float(
+        signature_prepare_wall_seconds
+        if signature_prepare_wall_seconds > 0.0
+        else prepared_artifacts.get("prepare_runtime_seconds", 0.0)
+    )
     site_signatures_by_var = prepared_artifacts["site_signatures_by_var"]
+    variable_signature_start = perf_counter()
     variable_signatures_by_var = {
         target_var: build_variable_signature(fit_banks_by_var[target_var], config.signature_mode)
         for target_var in config.source_target_vars
     }
+    _synchronize_if_cuda(device)
+    variable_signature_seconds = float(perf_counter() - variable_signature_start)
+    transport_start = perf_counter()
     if config.method == "ot":
         transport, transport_meta = solve_ot_transport(variable_signatures_by_var, site_signatures_by_var, config)
     elif config.method == "uot":
         transport, transport_meta = solve_uot_transport(variable_signatures_by_var, site_signatures_by_var, config)
     else:
         raise ValueError(f"Unsupported MCQA transport method {config.method}")
+    _synchronize_if_cuda(device)
+    transport_solve_seconds = float(perf_counter() - transport_start)
     normalized_transport = normalize_transport_rows(transport)
     target_transport, target_source_target_vars, target_row_index = _select_transport_row_for_target(
         transport,
@@ -931,6 +953,7 @@ def run_alignment_pipeline(
         target_transport=target_transport,
         target_normalized_transport=target_normalized_transport,
     )
+    calibration_select_start = perf_counter()
     selected, calibration_sweep = _select_hyperparameters(
         model=model,
         calibration_bank=calibration_bank,
@@ -943,6 +966,8 @@ def run_alignment_pipeline(
         source_target_vars=target_source_target_vars,
         pca_bases_by_id=pca_bases_by_id,
     )
+    _synchronize_if_cuda(device)
+    calibration_select_seconds = float(perf_counter() - calibration_select_start)
     top_k = int(selected["top_k"])
     strength = float(selected["lambda"])
     selected_transport = truncate_transport_rows(
@@ -955,6 +980,7 @@ def run_alignment_pipeline(
     selected_position_mass = _position_mass_from_transport(selected_transport, sites)
     selected_raw_position_mass = _position_mass_from_transport(selected_raw_transport, sites)
     selected_raw_captured_mass = float(selected_raw_transport.sum())
+    selected_calibration_start = perf_counter()
     selected_calibration_result, selected_calibration_ranking = _evaluate_soft_intervention(
         model=model,
         bank=calibration_bank,
@@ -969,6 +995,9 @@ def run_alignment_pipeline(
         include_details=True,
         pca_bases_by_id=pca_bases_by_id,
     )
+    _synchronize_if_cuda(device)
+    selected_calibration_eval_seconds = float(perf_counter() - selected_calibration_start)
+    holdout_start = perf_counter()
     holdout_result, holdout_ranking = _evaluate_soft_intervention(
         model=model,
         bank=holdout_bank,
@@ -983,6 +1012,10 @@ def run_alignment_pipeline(
         include_details=True,
         pca_bases_by_id=pca_bases_by_id,
     )
+    _synchronize_if_cuda(device)
+    holdout_eval_seconds = float(perf_counter() - holdout_start)
+    total_wall_seconds = float(perf_counter() - total_start)
+    reported_runtime_seconds = float(total_wall_seconds) + float(signature_prepare_runtime_seconds)
     holdout_result["method"] = config.method
     holdout_result["selection_exact_acc"] = float(selected["result"]["exact_acc"])
     holdout_result["calibration_exact_acc"] = float(selected["result"]["exact_acc"])
@@ -1014,6 +1047,19 @@ def run_alignment_pipeline(
         "selected_raw_position_mass": selected_raw_position_mass,
         "selected_raw_captured_mass": float(selected_raw_captured_mass),
         "transport_meta": transport_meta,
+        "signature_prepare_runtime_seconds": float(signature_prepare_runtime_seconds),
+        "wall_runtime_seconds": float(total_wall_seconds),
+        "runtime_seconds": float(reported_runtime_seconds),
+        "core_method_seconds": float(reported_runtime_seconds),
+        "timing_seconds": {
+            "t_signature_prepare": float(signature_prepare_runtime_seconds),
+            "t_variable_signature_build": float(variable_signature_seconds),
+            "t_transport_solve": float(transport_solve_seconds),
+            "t_calibration_select": float(calibration_select_seconds),
+            "t_selected_calibration_eval": float(selected_calibration_eval_seconds),
+            "t_final_holdout_eval": float(holdout_eval_seconds),
+            "t_total_wall": float(total_wall_seconds),
+        },
         "selected_hyperparameters": {
             "top_k": top_k,
             "lambda": strength,

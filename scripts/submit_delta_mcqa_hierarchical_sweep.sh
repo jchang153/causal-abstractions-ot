@@ -16,7 +16,7 @@ echo "[submit-delta-hier] stage_a_token_position_ids=${STAGE_A_TOKEN_POSITION_ID
 echo "[submit-delta-hier] stage_b_top_layers_per_var=${STAGE_B_TOP_LAYERS_PER_VAR:-3}"
 echo "[submit-delta-hier] stage_b_neighbor_radius=${STAGE_B_NEIGHBOR_RADIUS:-1}"
 echo "[submit-delta-hier] stage_b_max_layers_per_var=${STAGE_B_MAX_LAYERS_PER_VAR:-5}"
-echo "[submit-delta-hier] native_block_resolutions=${NATIVE_BLOCK_RESOLUTIONS:-576,288}"
+echo "[submit-delta-hier] native_block_resolutions=${NATIVE_BLOCK_RESOLUTIONS:-1,8,32,72,144,288,576}"
 echo "[submit-delta-hier] pca_site_menus=${PCA_SITE_MENUS:-partition,mixed}"
 echo "[submit-delta-hier] pca_basis_source_modes=${PCA_BASIS_SOURCE_MODES:-pair_bank,all_variants}"
 echo "[submit-delta-hier] pca_num_bands_values=${PCA_NUM_BANDS_VALUES:-8,16}"
@@ -24,6 +24,8 @@ echo "[submit-delta-hier] stage_c_top_configs_per_var=${STAGE_C_TOP_CONFIGS_PER_
 echo "[submit-delta-hier] guided_mask_names=${GUIDED_MASK_NAMES:-Top1,Top2,Top4,S50,S80}"
 echo "[submit-delta-hier] screen_restarts=${SCREEN_RESTARTS:-1}"
 echo "[submit-delta-hier] guided_restarts=${GUIDED_RESTARTS:-2}"
+echo "[submit-delta-hier] regular_das_subspace_dims=${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
+echo "[submit-delta-hier] guided_subspace_dims=${GUIDED_SUBSPACE_DIMS:-width-aware-wide-grid}"
 
 RESULTS_TIMESTAMP="${TIMESTAMP}" \
 RESULTS_ROOT="${RESULTS_ROOT}" \

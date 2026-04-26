@@ -7,6 +7,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Iterable
 
 from mcqa_delta_hierarchical_sweep import (
@@ -106,6 +107,21 @@ def _mark_task(*, sweep_root: Path, task: dict[str, object], state: str, extra: 
     _write_json(_task_status_path(sweep_root=sweep_root, task_id=task_id), payload)
 
 
+def _task_statuses(*, sweep_root: Path) -> list[dict[str, object]]:
+    status_dir = sweep_root / "task_status"
+    if not status_dir.exists():
+        return []
+    statuses: list[dict[str, object]] = []
+    for path in sorted(status_dir.glob("*.json")):
+        try:
+            payload = _load_json(path)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            statuses.append(payload)
+    return statuses
+
+
 def _expected_pca_payload_path(
     *,
     args: argparse.Namespace,
@@ -180,10 +196,11 @@ def _expected_native_payload_paths(
     normalized: dict[str, object],
     stage_timestamp: str,
     layer: int,
+    resolutions: tuple[int, ...] | None = None,
 ) -> list[str]:
     native_root = Path(args.results_root) / f"{stage_timestamp}_mcqa_ot_das_block_focus"
     outputs = [str(native_root / "layer_sweep_manifest.json")]
-    for resolution in normalized["native_block_resolutions"]:
+    for resolution in (resolutions or normalized["native_block_resolutions"]):
         outputs.append(
             str(
                 native_root
@@ -234,9 +251,12 @@ def run_stage_a(args: argparse.Namespace) -> None:
                 layer_indices=tuple(int(layer) for layer in layer_indices),
             )
             print(f"[parallel-stage-a] running token_position={token_position_id} timestamp={stage_timestamp}")
+            stage_start = perf_counter()
             subprocess.run(command, cwd=repo_root, check=True)
+            stage_runtime_seconds = float(perf_counter() - stage_start)
         else:
             print(f"[parallel-stage-a] using existing output {stage_output}")
+            stage_runtime_seconds = None
 
         rankings = _extract_stage_a_rankings(aggregate_path=stage_output)
         _write_json(ranking_json_path, rankings)
@@ -249,6 +269,7 @@ def run_stage_a(args: argparse.Namespace) -> None:
             "stage_timestamp": stage_timestamp,
             "expected_outputs": [str(stage_output), str(ranking_json_path), str(ranking_txt_path)],
             "completed_at": datetime.now().isoformat(),
+            "runtime_seconds": stage_runtime_seconds,
         }
 
     _write_json(
@@ -295,32 +316,40 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
 
         if str(token_position_id) == "last_token":
             for layer in selected_layers:
-                stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_native_{token_position_id}_L{int(layer):02d}"
-                expected_outputs = _expected_native_payload_paths(
-                    args=args,
-                    normalized=normalized,
-                    stage_timestamp=stage_timestamp,
-                    layer=int(layer),
-                )
-                native_tasks.append(
-                    {
-                        "task_id": f"native_{token_position_id}_L{int(layer):02d}",
-                        "category": "stage_b_native_ot",
-                        "token_position_id": str(token_position_id),
-                        "layer": int(layer),
-                        "stage_timestamp": stage_timestamp,
-                        "command": list(
-                            _build_native_block_command(
-                                args=args,
-                                normalized=normalized,
-                                stage_timestamp=stage_timestamp,
-                                layers=(int(layer),),
-                            )
-                        ),
-                        "expected_outputs": expected_outputs,
-                        "payload_paths": expected_outputs[1:],
-                    }
-                )
+                for resolution in normalized["native_block_resolutions"]:
+                    stage_timestamp = (
+                        f"{str(normalized['results_timestamp'])}_stageB_native_{token_position_id}"
+                        f"_L{int(layer):02d}_res{int(resolution)}"
+                    )
+                    expected_outputs = _expected_native_payload_paths(
+                        args=args,
+                        normalized=normalized,
+                        stage_timestamp=stage_timestamp,
+                        layer=int(layer),
+                        resolutions=(int(resolution),),
+                    )
+                    task_normalized = dict(normalized)
+                    task_normalized["native_block_resolutions"] = (int(resolution),)
+                    native_tasks.append(
+                        {
+                            "task_id": f"native_{token_position_id}_L{int(layer):02d}_res{int(resolution)}",
+                            "category": "stage_b_native_ot",
+                            "token_position_id": str(token_position_id),
+                            "layer": int(layer),
+                            "resolution": int(resolution),
+                            "stage_timestamp": stage_timestamp,
+                            "command": list(
+                                _build_native_block_command(
+                                    args=args,
+                                    normalized=task_normalized,
+                                    stage_timestamp=stage_timestamp,
+                                    layers=(int(layer),),
+                                )
+                            ),
+                            "expected_outputs": expected_outputs,
+                            "payload_paths": expected_outputs[1:],
+                        }
+                    )
 
         for basis_source_mode in normalized["pca_basis_source_modes"]:
             for site_menu in normalized["pca_site_menus"]:
@@ -553,10 +582,19 @@ def aggregate_final(args: argparse.Namespace, *, strict: bool = True) -> None:
     sweep_root = _sweep_root(args, normalized)
     aggregate_stage_b(args, strict=strict, require_native=True)
     aggregate_stage_c(args, strict=strict)
+    task_statuses = _task_statuses(sweep_root=sweep_root)
+    completed_runtimes = [
+        float(status["runtime_seconds"])
+        for status in task_statuses
+        if status.get("state") == "completed" and status.get("runtime_seconds") is not None
+    ]
     lines = [
         "MCQA Delta Hierarchical Parallel Sweep",
         f"results_timestamp: {normalized['results_timestamp']}",
         f"results_root: {Path(args.results_root)}",
+        f"task_statuses: {len(task_statuses)}",
+        f"completed_task_runtime_sum_seconds: {sum(completed_runtimes):.2f}",
+        f"completed_task_runtime_max_seconds: {(max(completed_runtimes) if completed_runtimes else 0.0):.2f}",
         "",
     ]
     for filename in (
@@ -569,6 +607,13 @@ def aggregate_final(args: argparse.Namespace, *, strict: bool = True) -> None:
     ):
         path = sweep_root / filename
         lines.append(f"{filename}: {'present' if path.exists() else 'missing'}")
+    if task_statuses:
+        lines.extend(["", "task runtimes:"])
+        for status in task_statuses:
+            runtime = status.get("runtime_seconds")
+            runtime_text = "n/a" if runtime is None else f"{float(runtime):.2f}s"
+            lines.append(f"{status.get('task_id')}: {status.get('state')} runtime={runtime_text}")
+    _write_json(sweep_root / "parallel_task_statuses.json", task_statuses)
     _write_text(sweep_root / "hierarchical_parallel_summary.txt", "\n".join(lines))
     print(f"[parallel-aggregate-final] wrote {sweep_root / 'hierarchical_parallel_summary.txt'}")
 
@@ -594,6 +639,7 @@ def run_task(task_file: Path, task_index: int) -> None:
 
     _mark_task(sweep_root=sweep_root, task=task, state="running", extra={"started_at": datetime.now().isoformat()})
     print(f"[parallel-task] running task_id={task.get('task_id')} command={' '.join(command)}")
+    task_start = perf_counter()
     try:
         subprocess.run(command, cwd=_repo_root(), check=True)
     except Exception as exc:
@@ -604,6 +650,7 @@ def run_task(task_file: Path, task_index: int) -> None:
             extra={"failed_at": datetime.now().isoformat(), "error": repr(exc)},
         )
         raise
+    task_runtime_seconds = float(perf_counter() - task_start)
     missing_outputs = [str(path) for path in expected_outputs if not _stage_output_is_valid(path)]
     if missing_outputs:
         _mark_task(
@@ -613,7 +660,16 @@ def run_task(task_file: Path, task_index: int) -> None:
             extra={"failed_at": datetime.now().isoformat(), "missing_outputs": missing_outputs},
         )
         raise RuntimeError(f"Task {task.get('task_id')} missing outputs: {missing_outputs}")
-    _mark_task(sweep_root=sweep_root, task=task, state="completed", extra={"completed_at": datetime.now().isoformat()})
+    _mark_task(
+        sweep_root=sweep_root,
+        task=task,
+        state="completed",
+        extra={
+            "completed_at": datetime.now().isoformat(),
+            "runtime_seconds": float(task_runtime_seconds),
+            "wall_runtime_seconds": float(task_runtime_seconds),
+        },
+    )
     print(f"[parallel-task] completed task_id={task.get('task_id')}")
 
 

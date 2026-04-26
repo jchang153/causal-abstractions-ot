@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import random
 import re
+from time import perf_counter
 from typing import Callable
 
 from datasets import get_dataset_split_names, load_dataset
@@ -23,6 +24,7 @@ from .runtime import resolve_device
 DATASET_PATH = os.environ.get("MCQA_DATASET_PATH", "mib-bench/copycolors_mcqa")
 DATASET_NAME = os.environ.get("MCQA_DATASET_CONFIG", "4_answer_choices")
 _DATASET_CONFIG_UNSET = object()
+LAST_PIPELINE_TIMING_SECONDS: dict[str, float] = {}
 
 CANONICAL_ANSWER_STRINGS = (" A", " B", " C", " D")
 CANONICAL_ANSWER_LABELS = ("A", "B", "C", "D")
@@ -784,8 +786,11 @@ def load_filtered_mcqa_pipeline(
     """Load Gemma-2-2B, copy the MCQA task setup, and filter to correct examples."""
     import transformers
 
+    global LAST_PIPELINE_TIMING_SECONDS
+    pipeline_start = perf_counter()
     torch_device = resolve_device(device)
     print(f"[load] device={torch_device} model={model_name}")
+    model_start = perf_counter()
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name, token=hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -799,6 +804,9 @@ def load_filtered_mcqa_pipeline(
     )
     model.to(torch_device)
     model.eval()
+    if torch_device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(torch_device)
+    model_load_seconds = float(perf_counter() - model_start)
     print(f"[load] model and tokenizer ready dtype={dtype}")
     causal_model = MCQACausalModel()
     token_positions = get_token_positions(tokenizer, causal_model)
@@ -809,14 +817,17 @@ def load_filtered_mcqa_pipeline(
         f"[load] loading MCQA datasets path={resolved_dataset_path} "
         f"config={resolved_dataset_name!r} size_cap={dataset_size}"
     )
+    data_start = perf_counter()
     public_datasets = load_public_mcqa_datasets(
         size=dataset_size,
         hf_token=hf_token,
         dataset_path=resolved_dataset_path,
         dataset_name=resolved_dataset_name,
     )
+    data_load_seconds = float(perf_counter() - data_start)
     print(f"[load] loaded datasets={sorted(public_datasets.keys())}")
     print("[load] starting factual filtering")
+    filter_start = perf_counter()
     filtered_datasets = filter_correct_examples(
         model=model,
         tokenizer=tokenizer,
@@ -825,5 +836,14 @@ def load_filtered_mcqa_pipeline(
         batch_size=batch_size,
         device=torch_device,
     )
+    if torch_device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(torch_device)
+    filter_seconds = float(perf_counter() - filter_start)
+    LAST_PIPELINE_TIMING_SECONDS = {
+        "t_model_load": float(model_load_seconds),
+        "t_data_load": float(data_load_seconds),
+        "t_factual_filter": float(filter_seconds),
+        "t_pipeline_total_wall": float(perf_counter() - pipeline_start),
+    }
     print("[load] factual filtering complete")
     return model, tokenizer, causal_model, token_positions, filtered_datasets

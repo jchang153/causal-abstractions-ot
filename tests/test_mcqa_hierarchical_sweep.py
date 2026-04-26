@@ -254,8 +254,11 @@ def test_parallel_stage_b_planner_writes_disjoint_task_roots(tmp_path: Path) -> 
     native_tasks = json.loads((sweep_root / "stage_b_native_tasks.json").read_text())["tasks"]
     pca_tasks = json.loads((sweep_root / "stage_b_pca_tasks.json").read_text())["tasks"]
 
-    assert len(native_tasks) == 2
+    assert len(native_tasks) == 14
     assert len(pca_tasks) == 12
+    native_stage_roots = [Path(task["expected_outputs"][0]).parent for task in native_tasks]
+    assert len(native_stage_roots) == len(set(native_stage_roots))
+    assert all("_res" in task["stage_timestamp"] for task in native_tasks)
     stage_roots = [Path(task["expected_outputs"][0]).parent for task in pca_tasks]
     assert len(stage_roots) == len(set(stage_roots))
     assert all("_L" in task["stage_timestamp"] for task in pca_tasks)
