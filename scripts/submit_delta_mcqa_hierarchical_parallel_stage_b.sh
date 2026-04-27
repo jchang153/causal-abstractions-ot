@@ -10,6 +10,7 @@ DELTA_PARTITION="${DELTA_PARTITION:-gpuA100x4}"
 ARRAY_THROTTLE="${ARRAY_THROTTLE:-8}"
 SUBMIT_NATIVE="${SUBMIT_NATIVE:-1}"
 SUBMIT_PCA="${SUBMIT_PCA:-1}"
+SPLIT_SEED="${SPLIT_SEED:-0}"
 
 VENV_PATH="${VENV_PATH:-${HOME}/venvs/causal-ot}"
 if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
@@ -30,6 +31,7 @@ echo "[submit-delta-hpar-b] pca_basis_source_modes=${PCA_BASIS_SOURCE_MODES:-pai
 echo "[submit-delta-hpar-b] pca_num_bands_values=${PCA_NUM_BANDS_VALUES:-8,16}"
 echo "[submit-delta-hpar-b] regular_das_subspace_dims=${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
 echo "[submit-delta-hpar-b] guided_subspace_dims=${GUIDED_SUBSPACE_DIMS:-width-aware-wide-grid}"
+echo "[submit-delta-hpar-b] split_seed=${SPLIT_SEED}"
 
 COMMON_ARGS=(
   --device cuda
@@ -45,6 +47,7 @@ COMMON_ARGS=(
   --ot-lambdas "${OT_LAMBDAS:-0.5,1,2,4}"
   --calibration-metric "${CALIBRATION_METRIC:-family_weighted_macro_exact_acc}"
   --calibration-family-weights "${CALIBRATION_FAMILY_WEIGHTS:-1,1.5,2}"
+  --split-seed "${SPLIT_SEED}"
   --stage-b-top-layers-per-var "${STAGE_B_TOP_LAYERS_PER_VAR:-3}"
   --stage-b-neighbor-radius "${STAGE_B_NEIGHBOR_RADIUS:-1}"
   --stage-b-max-layers-per-var "${STAGE_B_MAX_LAYERS_PER_VAR:-5}"

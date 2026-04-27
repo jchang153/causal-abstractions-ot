@@ -7,6 +7,7 @@ RESULTS_ROOT="${RESULTS_ROOT:-results/delta}"
 DELTA_ACCOUNT="${DELTA_ACCOUNT:-bgvo-delta-gpu}"
 DELTA_PARTITION="${DELTA_PARTITION:-gpuA100x4}"
 ARRAY_THROTTLE_STAGE_C="${ARRAY_THROTTLE_STAGE_C:-${ARRAY_THROTTLE:-4}}"
+SPLIT_SEED="${SPLIT_SEED:-0}"
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
@@ -15,9 +16,9 @@ export HF_TOKEN="${HF_TOKEN:-$(cat "$HOME/.secrets/hf_token")}"
 ROOT="${RESULTS_ROOT}/${TIMESTAMP}_mcqa_hierarchical_sweep"
 mkdir -p "${ROOT}"
 
-echo "[orchestrate-after-b] submitting Stage C arrays for timestamp=${TIMESTAMP}"
+echo "[orchestrate-after-b] submitting Stage C arrays for timestamp=${TIMESTAMP} split_seed=${SPLIT_SEED}"
 mapfile -t STAGE_C_JOBS < <(
-  ARRAY_THROTTLE="${ARRAY_THROTTLE_STAGE_C}" \
+  SPLIT_SEED="${SPLIT_SEED}" ARRAY_THROTTLE="${ARRAY_THROTTLE_STAGE_C}" \
     bash scripts/submit_delta_mcqa_hierarchical_parallel_stage_c.sh "${TIMESTAMP}" 2>&1 \
     | tee "${ROOT}/stage_c_submit.log" \
     | awk '/Submitted batch job/ {print $4}'

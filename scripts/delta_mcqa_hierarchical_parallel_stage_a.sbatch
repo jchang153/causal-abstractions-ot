@@ -41,10 +41,11 @@ export OT_TOP_K_VALUES="${OT_TOP_K_VALUES:-1,2,4}"
 export OT_LAMBDAS="${OT_LAMBDAS:-0.5,1,2,4}"
 export CALIBRATION_METRIC="${CALIBRATION_METRIC:-family_weighted_macro_exact_acc}"
 export CALIBRATION_FAMILY_WEIGHTS="${CALIBRATION_FAMILY_WEIGHTS:-1,1.5,2}"
+export SPLIT_SEED="${SPLIT_SEED:-0}"
 
 mkdir -p "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}"
 
-echo "[delta-mcqa-hpar-stage-a] host=$(hostname) token_positions=${STAGE_A_TOKEN_POSITION_IDS} timestamp=${RESULTS_TIMESTAMP}"
+echo "[delta-mcqa-hpar-stage-a] host=$(hostname) token_positions=${STAGE_A_TOKEN_POSITION_IDS} timestamp=${RESULTS_TIMESTAMP} split_seed=${SPLIT_SEED}"
 nvidia-smi
 
 ARGS=(
@@ -61,6 +62,7 @@ ARGS=(
   --ot-lambdas "${OT_LAMBDAS}"
   --calibration-metric "${CALIBRATION_METRIC}"
   --calibration-family-weights "${CALIBRATION_FAMILY_WEIGHTS}"
+  --split-seed "${SPLIT_SEED}"
 )
 
 if [[ -n "${STAGE_A_LAYER_INDICES}" ]]; then
