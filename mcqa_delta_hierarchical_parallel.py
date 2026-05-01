@@ -707,7 +707,6 @@ def main() -> None:
     parser = _build_parser()
     parser.add_argument("--allow-partial", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--skip-native-aggregation", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--full-das-output", type=Path, action="append", default=[], help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if command == "stage-a":
         run_stage_a(args)
