@@ -11,6 +11,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Iterable
 
+from mcqa_paper_runtime import write_paper_runtime_summary
+
 
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_STAGE_A_TOKEN_POSITION_IDS = ("last_token",)
@@ -26,7 +28,7 @@ DEFAULT_PCA_NUM_BANDS_VALUES = (8, 16)
 DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_PCA_TOP_PREFIX_SIZES = (8, 16, 32, 64)
 DEFAULT_GUIDED_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
-DEFAULT_NATIVE_BLOCK_RESOLUTIONS = (1, 8, 32, 72, 144, 288, 576)
+DEFAULT_NATIVE_BLOCK_RESOLUTIONS = (128, 144, 192, 256, 288, 384, 576, 768)
 DEFAULT_DAS_SUBSPACE_DIMS = (
     32,
     64,
@@ -228,10 +230,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ot-lambdas", default="0.5,1,2,4")
     parser.add_argument("--calibration-metric", default=DEFAULT_CALIBRATION_METRIC)
     parser.add_argument("--calibration-family-weights", default="1,1.5,2")
-    parser.add_argument("--stage-b-top-layers-per-var", type=int, default=3)
-    parser.add_argument("--stage-b-neighbor-radius", type=int, default=1)
-    parser.add_argument("--stage-b-max-layers-per-var", type=int, default=5)
-    parser.add_argument("--native-block-resolutions", default="1,8,32,72,144,288,576")
+    parser.add_argument("--stage-b-top-layers-per-var", type=int, default=1)
+    parser.add_argument("--stage-b-neighbor-radius", type=int, default=0)
+    parser.add_argument("--stage-b-max-layers-per-var", type=int, default=1)
+    parser.add_argument("--native-block-resolutions", default="128,144,192,256,288,384,576,768")
     parser.add_argument("--pca-site-menus", default="partition,mixed")
     parser.add_argument("--pca-basis-source-modes", default="pair_bank,all_variants")
     parser.add_argument("--pca-num-bands-values", default="8,16")
@@ -243,7 +245,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guided-min-epochs", type=int, default=5)
     parser.add_argument("--screen-restarts", type=int, default=1)
     parser.add_argument("--guided-restarts", type=int, default=2)
-    parser.add_argument("--guided-subspace-dims", default=None)
+    parser.add_argument("--guided-subspace-dims", default="32,64,96,128,256,512,768,1024,1536,2048,2304")
+    parser.add_argument("--full-das-output", type=Path, action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument(
         "--regular-das-subspace-dims",
         default="32,64,96,128,256,512,768,1024,1536,2048,2304",
@@ -1600,6 +1603,8 @@ def main() -> None:
         stage_c_txt_path = sweep_root / "stage_c_guided_rankings.txt"
         _write_json(stage_c_json_path, stage_c_rankings)
         _write_text(stage_c_txt_path, _format_stage_c_summary(rankings=stage_c_rankings))
+
+    write_paper_runtime_summary(sweep_root=sweep_root, full_das_outputs=list(args.full_das_output or []))
 
     summary_path = sweep_root / "hierarchical_sweep_summary.txt"
     lines = [

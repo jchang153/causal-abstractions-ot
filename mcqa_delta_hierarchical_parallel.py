@@ -36,6 +36,7 @@ from mcqa_delta_hierarchical_sweep import (
     _write_json,
     _write_text,
 )
+from mcqa_paper_runtime import write_paper_runtime_summary
 
 
 TASK_MANIFEST_VERSION = 1
@@ -615,6 +616,7 @@ def aggregate_final(args: argparse.Namespace, *, strict: bool = True) -> None:
             lines.append(f"{status.get('task_id')}: {status.get('state')} runtime={runtime_text}")
     _write_json(sweep_root / "parallel_task_statuses.json", task_statuses)
     _write_text(sweep_root / "hierarchical_parallel_summary.txt", "\n".join(lines))
+    write_paper_runtime_summary(sweep_root=sweep_root, full_das_outputs=list(getattr(args, "full_das_output", []) or []))
     print(f"[parallel-aggregate-final] wrote {sweep_root / 'hierarchical_parallel_summary.txt'}")
 
 
@@ -705,6 +707,7 @@ def main() -> None:
     parser = _build_parser()
     parser.add_argument("--allow-partial", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--skip-native-aggregation", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--full-das-output", type=Path, action="append", default=[], help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if command == "stage-a":
         run_stage_a(args)

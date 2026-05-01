@@ -26,10 +26,10 @@ COMMON_ARGS=(
   --ot-lambdas "${OT_LAMBDAS:-0.5,1,2,4}"
   --calibration-metric "${CALIBRATION_METRIC:-family_weighted_macro_exact_acc}"
   --calibration-family-weights "${CALIBRATION_FAMILY_WEIGHTS:-1,1.5,2}"
-  --stage-b-top-layers-per-var "${STAGE_B_TOP_LAYERS_PER_VAR:-3}"
-  --stage-b-neighbor-radius "${STAGE_B_NEIGHBOR_RADIUS:-1}"
-  --stage-b-max-layers-per-var "${STAGE_B_MAX_LAYERS_PER_VAR:-5}"
-  --native-block-resolutions "${NATIVE_BLOCK_RESOLUTIONS:-1,8,32,72,144,288,576}"
+  --stage-b-top-layers-per-var "${STAGE_B_TOP_LAYERS_PER_VAR:-1}"
+  --stage-b-neighbor-radius "${STAGE_B_NEIGHBOR_RADIUS:-0}"
+  --stage-b-max-layers-per-var "${STAGE_B_MAX_LAYERS_PER_VAR:-1}"
+  --native-block-resolutions "${NATIVE_BLOCK_RESOLUTIONS:-128,144,192,256,288,384,576,768}"
   --pca-site-menus "${PCA_SITE_MENUS:-partition,mixed}"
   --pca-basis-source-modes "${PCA_BASIS_SOURCE_MODES:-pair_bank,all_variants}"
   --pca-num-bands-values "${PCA_NUM_BANDS_VALUES:-8,16}"
@@ -49,6 +49,14 @@ if [[ -n "${STAGE_A_LAYER_INDICES:-}" ]]; then
 fi
 if [[ -n "${GUIDED_SUBSPACE_DIMS:-}" ]]; then
   COMMON_ARGS+=(--guided-subspace-dims "${GUIDED_SUBSPACE_DIMS}")
+fi
+if [[ -n "${FULL_DAS_OUTPUTS:-}" ]]; then
+  IFS=',' read -r -a FULL_DAS_OUTPUT_ARRAY <<< "${FULL_DAS_OUTPUTS}"
+  for full_das_output in "${FULL_DAS_OUTPUT_ARRAY[@]}"; do
+    if [[ -n "${full_das_output}" ]]; then
+      COMMON_ARGS+=(--full-das-output "${full_das_output}")
+    fi
+  done
 fi
 if [[ "${ALLOW_PARTIAL:-0}" == "1" ]]; then
   COMMON_ARGS+=(--allow-partial)

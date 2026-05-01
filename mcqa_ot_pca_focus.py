@@ -116,7 +116,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--guided-subspace-dims",
-        help="Comma-separated subspace dims for the guided DAS sweep. If omitted, a width-aware grid is used.",
+        default="32,64,96,128,256,512,768,1024,1536,2048,2304",
+        help="Comma-separated subspace dims for the guided DAS sweep. Defaults to the paper master grid.",
     )
     parser.add_argument("--guided-max-epochs", type=int, default=DEFAULT_GUIDED_DAS_MAX_EPOCHS)
     parser.add_argument("--guided-min-epochs", type=int, default=DEFAULT_GUIDED_DAS_MIN_EPOCHS)

@@ -27,7 +27,7 @@ DEFAULT_LAYERS = (20, 25)
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
 DEFAULT_TOKEN_POSITION_IDS = ("last_token",)
-DEFAULT_BLOCK_RESOLUTIONS = (1, 8, 32, 72, 144, 288, 576)
+DEFAULT_BLOCK_RESOLUTIONS = (128, 144, 192, 256, 288, 384, 576, 768)
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.5, 2.0)
@@ -110,7 +110,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-pool-size", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layers", help="Comma-separated focused layers. Default: 20,25")
-    parser.add_argument("--block-resolutions", help="Comma-separated last-token block widths. Default: 1,8,32,72,144,288,576")
+    parser.add_argument("--block-resolutions", help="Comma-separated last-token block widths. Default: 128,144,192,256,288,384,576,768")
     parser.add_argument("--include-144", action="store_true", help="Append 144-d blocks to the resolution grid.")
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--support-score-slack", type=float, default=0.05)
@@ -130,7 +130,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--guided-subspace-dims",
-        help="Comma-separated native-guided DAS dims. If omitted, a width-aware wide grid is used.",
+        default="32,64,96,128,256,512,768,1024,1536,2048,2304",
+        help="Comma-separated native-guided DAS dims. Defaults to the paper master grid.",
     )
     parser.add_argument("--results-root", default="results/anvil")
     parser.add_argument("--results-timestamp")
