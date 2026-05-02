@@ -22,6 +22,36 @@ def _parse_csv_ints(value: str | None) -> list[int] | None:
     return [int(item) for item in items]
 
 
+def _parse_layer_blocks(value: str | None) -> list[list[int]] | None:
+    if value is None:
+        return None
+    blocks: list[list[int]] = []
+    for raw_block in value.split(";"):
+        raw_block = raw_block.strip()
+        if not raw_block:
+            continue
+        layers: list[int] = []
+        for item in raw_block.replace("+", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "-" in item:
+                start_text, end_text = item.split("-", 1)
+                start = int(start_text)
+                end = int(end_text)
+                step = 1 if end >= start else -1
+                layers.extend(range(start, end + step, step))
+            else:
+                layers.append(int(item))
+        resolved = sorted(dict.fromkeys(layers))
+        if not resolved:
+            raise ValueError(f"Layer block {raw_block!r} did not contain any layers")
+        blocks.append(resolved)
+    if not blocks:
+        raise ValueError("--layer-blocks did not contain any non-empty blocks")
+    return blocks
+
+
 def _parse_csv_resolutions(value: str | None) -> list[int | None] | None:
     items = _parse_csv_strings(value)
     if items is None:
@@ -163,6 +193,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated, e.g. answerPosition,randomLetter,answerPosition_randomLetter",
     )
     parser.add_argument("--layers", help="'auto' or comma-separated layer indices")
+    parser.add_argument(
+        "--layer-blocks",
+        help="Semicolon-separated coarse layer blocks, e.g. '0-4;5-9;10-14;15-19;20-25'.",
+    )
     parser.add_argument("--token-position-ids", help="'all' or comma-separated token position ids")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--resolutions", help="Comma-separated integers or 'full'")
@@ -245,6 +279,8 @@ def _override_base_run(
 
     if args.layers is not None:
         base_run.LAYERS = "auto" if args.layers == "auto" else _parse_csv_ints(args.layers)
+    if args.layer_blocks is not None:
+        base_run.LAYER_BLOCKS = _parse_layer_blocks(args.layer_blocks)
     if args.token_position_ids is not None:
         base_run.TOKEN_POSITION_IDS = None if args.token_position_ids == "all" else _parse_csv_strings(args.token_position_ids)
     if args.batch_size is not None:
@@ -309,6 +345,7 @@ def _override_base_run(
         "target_vars": list(base_run.TARGET_VARS),
         "counterfactual_names": list(base_run.COUNTERFACTUAL_NAMES),
         "layers": base_run.LAYERS,
+        "layer_blocks": base_run.LAYER_BLOCKS,
         "token_position_ids": base_run.TOKEN_POSITION_IDS,
         "batch_size": base_run.BATCH_SIZE,
         "resolutions": list(base_run.RESOLUTIONS),
@@ -395,6 +432,8 @@ def main() -> None:
     _apply_preset(args)
     if args.layer_sweep and args.layers is not None:
         raise ValueError("Use --layer-indices with --layer-sweep; do not combine --layer-sweep with --layers.")
+    if args.layer_sweep and args.layer_blocks is not None:
+        raise ValueError("Do not combine --layer-sweep with --layer-blocks.")
 
     if not args.layer_sweep:
         effective_config = _override_base_run(args)

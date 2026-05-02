@@ -151,7 +151,7 @@ def run_soft_residual_intervention(
     base_attention_mask: torch.Tensor,
     source_input_ids: torch.Tensor,
     source_attention_mask: torch.Tensor,
-    site_weights: dict[ResidualSite, float],
+    site_weights: dict[SiteLike, float],
     strength: float,
     base_position_by_id: dict[str, torch.Tensor],
     source_position_by_id: dict[str, torch.Tensor],
@@ -161,7 +161,12 @@ def run_soft_residual_intervention(
         return forward_factual_logits(model=model, input_ids=base_input_ids, attention_mask=base_attention_mask)
 
     layers = resolve_transformer_layers(model)
-    target_layers = tuple(sorted({site.layer for site in site_weights}))
+    weighted_segments = [
+        (segment, float(weight))
+        for site, weight in site_weights.items()
+        for segment in site_segments(site, model_hidden_size=get_hidden_size(model))
+    ]
+    target_layers = tuple(sorted({int(segment.layer) for segment, _ in weighted_segments}))
     source_hidden_by_layer = _collect_source_hidden_states(
         model=model,
         source_input_ids=source_input_ids,
@@ -171,7 +176,11 @@ def run_soft_residual_intervention(
     handles = []
 
     def make_hook(layer_index: int):
-        layer_sites = [(site, float(weight)) for site, weight in site_weights.items() if int(site.layer) == int(layer_index)]
+        layer_sites = [
+            (segment, float(weight))
+            for segment, weight in weighted_segments
+            if int(segment.layer) == int(layer_index)
+        ]
 
         def hook(_module, _inputs, output):
             hidden = output[0] if isinstance(output, tuple) else output

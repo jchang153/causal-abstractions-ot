@@ -19,7 +19,7 @@ from mcqa_experiment.ot import (
     save_prepared_alignment_artifacts,
 )
 from mcqa_experiment.runtime import resolve_device
-from mcqa_experiment.sites import enumerate_residual_sites
+from mcqa_experiment.sites import enumerate_layer_block_sites, enumerate_residual_sites
 
 
 DEVICE = "cuda"
@@ -52,6 +52,7 @@ COUNTERFACTUAL_NAMES = ["answerPosition", "randomLetter", "answerPosition_random
 
 LAYERS = "auto"
 TOKEN_POSITION_IDS = ["correct_symbol", "correct_symbol_period", "last_token"]
+LAYER_BLOCKS: list[list[int]] | None = None
 
 BATCH_SIZE = 64 
 
@@ -92,6 +93,12 @@ def _resolve_resolution(*, resolution: int | None, hidden_size: int) -> int | No
     return None if resolution is None else max(1, min(int(resolution), int(hidden_size)))
 
 
+def _layer_blocks_payload(layer_blocks: list[list[int]] | tuple[tuple[int, ...], ...] | None) -> list[list[int]] | None:
+    if not layer_blocks:
+        return None
+    return [[int(layer) for layer in block] for block in layer_blocks]
+
+
 def _signature_cache_spec(
     *,
     train_bank,
@@ -100,6 +107,7 @@ def _signature_cache_spec(
     signature_mode: str,
     selected_layers: list[int],
     token_position_ids: tuple[str, ...],
+    layer_blocks: list[list[int]] | tuple[tuple[int, ...], ...] | None,
 ) -> dict[str, object]:
     train_rows_digest = hashlib.sha256(
         "\n".join(
@@ -122,6 +130,7 @@ def _signature_cache_spec(
         "source_target_vars": [canonicalize_target_var(target_var) for target_var in TARGET_VARS],
         "train_rows_digest": train_rows_digest,
         "selected_layers": [int(layer) for layer in selected_layers],
+        "layer_blocks": _layer_blocks_payload(layer_blocks),
         "token_position_ids": list(token_position_ids if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS)),
         "batch_size": int(BATCH_SIZE),
     }
@@ -235,9 +244,13 @@ def execute_run_context(*, context: dict[str, object]) -> None:
     selected_layers = list(range(int(model.config.num_hidden_layers))) if LAYERS == "auto" else list(LAYERS)
     target_vars = [canonicalize_target_var(target_var) for target_var in TARGET_VARS]
     print(f"[run] selected_layers={selected_layers}")
+    if LAYER_BLOCKS:
+        print(f"[run] layer_blocks={_layer_blocks_payload(LAYER_BLOCKS)}")
     layer_suffix = ""
     if len(selected_layers) == 1:
         layer_suffix = f"_layer-{int(selected_layers[0])}"
+    if LAYER_BLOCKS:
+        layer_suffix = f"{layer_suffix}_layer-blocks"
     token_position_ids = tuple(token_position.id for token_position in token_positions)
     all_payloads = []
 
@@ -268,14 +281,25 @@ def execute_run_context(*, context: dict[str, object]) -> None:
             resolution_tag = _resolution_tag(resolution)
             prepared_ot_artifacts = None
             if transport_methods and TARGET_VARS:
-                ot_sites = enumerate_residual_sites(
-                    num_layers=int(model.config.num_hidden_layers),
-                    hidden_size=int(model.config.hidden_size),
-                    token_position_ids=token_position_ids,
-                    resolution=resolved_resolution,
-                    layers=tuple(selected_layers),
-                    selected_token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
-                )
+                if LAYER_BLOCKS and resolution is not None:
+                    raise ValueError("Layer-block OT sites require --resolutions full")
+                if LAYER_BLOCKS:
+                    ot_sites = enumerate_layer_block_sites(
+                        hidden_size=int(model.config.hidden_size),
+                        token_position_ids=token_position_ids,
+                        layer_blocks=tuple(tuple(int(layer) for layer in block) for block in LAYER_BLOCKS),
+                        selected_token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
+                    )
+                else:
+                    ot_sites = enumerate_residual_sites(
+                        num_layers=int(model.config.num_hidden_layers),
+                        hidden_size=int(model.config.hidden_size),
+                        token_position_ids=token_position_ids,
+                        resolution=resolved_resolution,
+                        layers=tuple(selected_layers),
+                        selected_token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
+                    )
+                print(f"[run] candidate_ot_sites={len(ot_sites)}")
                 train_banks = {target_var: banks_by_split["train"][target_var] for target_var in target_vars}
                 cache_spec = _signature_cache_spec(
                     train_bank=train_banks[target_vars[0]],
@@ -284,6 +308,7 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                     signature_mode=signature_mode,
                     selected_layers=selected_layers,
                     token_position_ids=token_position_ids,
+                    layer_blocks=LAYER_BLOCKS,
                 )
                 cache_path = _signature_cache_path(
                     resolution=resolution,
@@ -355,6 +380,7 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                                 resolution=resolved_resolution,
                                 layers=tuple(selected_layers),
                                 token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
+                                layer_blocks=None if LAYER_BLOCKS is None else tuple(tuple(int(layer) for layer in block) for block in LAYER_BLOCKS),
                                 calibration_metric=CALIBRATION_METRIC,
                                 calibration_family_weights=tuple(CALIBRATION_FAMILY_WEIGHTS),
                             )
@@ -386,6 +412,7 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                             resolution=resolved_resolution,
                             layers=tuple(selected_layers),
                             token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
+                            layer_blocks=None if LAYER_BLOCKS is None else tuple(tuple(int(layer) for layer in block) for block in LAYER_BLOCKS),
                             calibration_metric=CALIBRATION_METRIC,
                             calibration_family_weights=tuple(CALIBRATION_FAMILY_WEIGHTS),
                         )
@@ -418,6 +445,7 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                     resolution=resolved_resolution,
                     layers=tuple(selected_layers),
                     token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
+                    layer_blocks=None if LAYER_BLOCKS is None else tuple(tuple(int(layer) for layer in block) for block in LAYER_BLOCKS),
                     calibration_metric=CALIBRATION_METRIC,
                     calibration_family_weights=tuple(CALIBRATION_FAMILY_WEIGHTS),
                 )

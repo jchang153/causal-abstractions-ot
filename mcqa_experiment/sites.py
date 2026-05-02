@@ -67,6 +67,42 @@ class ResidualUnionSite:
 
 
 @dataclass(frozen=True)
+class ResidualLayerBlockSite:
+    """One coarse site spanning a block of full residual layers for one token position."""
+
+    layers: tuple[int, ...]
+    token_position_id: str
+    hidden_size: int
+
+    def __post_init__(self) -> None:
+        if not self.layers:
+            raise ValueError("ResidualLayerBlockSite requires at least one layer")
+        object.__setattr__(self, "layers", tuple(int(layer) for layer in self.layers))
+
+    @property
+    def layer(self) -> int:
+        return int(self.layers[0])
+
+    @property
+    def dim_start(self) -> int:
+        return 0
+
+    @property
+    def dim_end(self) -> int:
+        return int(self.hidden_size) * len(self.layers)
+
+    @property
+    def label(self) -> str:
+        if len(self.layers) == 1:
+            layer_label = f"L{int(self.layers[0])}"
+        elif all(int(right) == int(left) + 1 for left, right in zip(self.layers, self.layers[1:])):
+            layer_label = f"L{int(self.layers[0])}-{int(self.layers[-1])}"
+        else:
+            layer_label = "L" + "+".join(str(int(layer)) for layer in self.layers)
+        return f"{layer_label}:{self.token_position_id}[{int(self.dim_start)}:{int(self.dim_end)}]"
+
+
+@dataclass(frozen=True)
 class RotatedBandSite:
     """One rotated-basis site identified by a contiguous PCA component band."""
 
@@ -119,6 +155,7 @@ SiteLike = Union[
     ResidualSite,
     ResidualUnionSite,
     ResidualCompositeSite,
+    ResidualLayerBlockSite,
     RotatedBandSite,
     RotatedCompositeSite,
 ]
@@ -137,6 +174,16 @@ def site_segments(site: SiteLike, *, model_hidden_size: int) -> tuple[ResidualSi
             )
             for token_position_id in site.token_position_ids
         )
+    if isinstance(site, ResidualLayerBlockSite):
+        return tuple(
+            ResidualSite(
+                layer=int(layer),
+                token_position_id=str(site.token_position_id),
+                dim_start=0,
+                dim_end=int(site.hidden_size),
+            )
+            for layer in site.layers
+        )
     return (site,)
 
 
@@ -145,6 +192,8 @@ def site_token_position_ids(site: SiteLike) -> tuple[str, ...]:
         return tuple(dict.fromkeys(str(segment.token_position_id) for segment in site.segments))
     if isinstance(site, ResidualUnionSite):
         return tuple(str(token_position_id) for token_position_id in site.token_position_ids)
+    if isinstance(site, ResidualLayerBlockSite):
+        return (str(site.token_position_id),)
     if isinstance(site, RotatedCompositeSite):
         return (str(site.token_position_id),)
     return (str(site.token_position_id),)
@@ -155,6 +204,8 @@ def site_total_width(site: SiteLike, *, model_hidden_size: int) -> int:
         return sum(int(segment.dim_end) - int(segment.dim_start) for segment in site.segments)
     if isinstance(site, ResidualUnionSite):
         return int(site.hidden_size) * len(site.token_position_ids)
+    if isinstance(site, ResidualLayerBlockSite):
+        return int(site.hidden_size) * len(site.layers)
     if isinstance(site, RotatedCompositeSite):
         return sum(int(segment.component_end) - int(segment.component_start) for segment in site.segments)
     return int(site.dim_end) - int(site.dim_start)
@@ -188,6 +239,32 @@ def enumerate_residual_sites(
         for position_id in position_ids
         for dim_start, dim_end in dim_blocks
     ]
+
+
+def enumerate_layer_block_sites(
+    *,
+    hidden_size: int,
+    token_position_ids: tuple[str, ...],
+    layer_blocks: tuple[tuple[int, ...], ...],
+    selected_token_position_ids: tuple[str, ...] | None = None,
+) -> list[ResidualLayerBlockSite]:
+    """Enumerate coarse layer-block sites for joint PLOT localization."""
+    position_ids = token_position_ids if selected_token_position_ids is None else selected_token_position_ids
+    sites: list[ResidualLayerBlockSite] = []
+    for block in layer_blocks:
+        resolved_block = tuple(int(layer) for layer in block)
+        if not resolved_block:
+            raise ValueError("Layer block cannot be empty")
+        ordered_block = tuple(sorted(dict.fromkeys(resolved_block)))
+        for position_id in position_ids:
+            sites.append(
+                ResidualLayerBlockSite(
+                    layers=ordered_block,
+                    token_position_id=str(position_id),
+                    hidden_size=int(hidden_size),
+                )
+            )
+    return sites
 
 
 def enumerate_rotated_band_sites(

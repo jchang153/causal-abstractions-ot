@@ -12,7 +12,7 @@ from .data import canonicalize_target_var
 from .ot import OTConfig, prepare_alignment_artifacts, run_alignment_pipeline, run_bruteforce_site_pipeline
 from .reporting import format_summary, print_results_table, summarize_method_records, write_text_report
 from .runtime import write_json
-from .sites import enumerate_residual_sites
+from .sites import enumerate_layer_block_sites, enumerate_residual_sites
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,7 @@ class CompareExperimentConfig:
     resolution: int | None = None
     layers: tuple[int, ...] | None = None
     token_position_ids: tuple[str, ...] | None = ("correct_symbol", "correct_symbol_period", "last_token")
+    layer_blocks: tuple[tuple[int, ...], ...] | None = None
 
 
 def run_comparison(
@@ -60,14 +61,22 @@ def run_comparison(
 ) -> dict[str, object]:
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in config.target_vars)
     token_position_ids = tuple(token_position.id for token_position in token_positions)
-    ot_sites = enumerate_residual_sites(
-        num_layers=int(model.config.num_hidden_layers),
-        hidden_size=int(model.config.hidden_size),
-        token_position_ids=token_position_ids,
-        resolution=config.resolution,
-        layers=config.layers,
-        selected_token_position_ids=config.token_position_ids,
-    )
+    if config.layer_blocks:
+        ot_sites = enumerate_layer_block_sites(
+            hidden_size=int(model.config.hidden_size),
+            token_position_ids=token_position_ids,
+            layer_blocks=tuple(tuple(int(layer) for layer in block) for block in config.layer_blocks),
+            selected_token_position_ids=config.token_position_ids,
+        )
+    else:
+        ot_sites = enumerate_residual_sites(
+            num_layers=int(model.config.num_hidden_layers),
+            hidden_size=int(model.config.hidden_size),
+            token_position_ids=token_position_ids,
+            resolution=config.resolution,
+            layers=config.layers,
+            selected_token_position_ids=config.token_position_ids,
+        )
     das_sites = enumerate_residual_sites(
         num_layers=int(model.config.num_hidden_layers),
         hidden_size=int(model.config.hidden_size),
