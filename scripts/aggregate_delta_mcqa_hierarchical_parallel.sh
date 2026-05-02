@@ -25,7 +25,7 @@ COMMON_ARGS=(
   --ot-top-k-values "${OT_TOP_K_VALUES:-1,2,4}"
   --ot-lambdas "${OT_LAMBDAS:-0.5,1,2,4}"
   --calibration-metric "${CALIBRATION_METRIC:-family_weighted_macro_exact_acc}"
-  --calibration-family-weights "${CALIBRATION_FAMILY_WEIGHTS:-1,1.5,2}"
+  --calibration-family-weights "${CALIBRATION_FAMILY_WEIGHTS:-1,1,1}"
   --stage-b-top-layers-per-var "${STAGE_B_TOP_LAYERS_PER_VAR:-1}"
   --stage-b-neighbor-radius "${STAGE_B_NEIGHBOR_RADIUS:-0}"
   --stage-b-max-layers-per-var "${STAGE_B_MAX_LAYERS_PER_VAR:-1}"

@@ -110,7 +110,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.calibration_metric is None:
             args.calibration_metric = "family_weighted_macro_exact_acc"
         if args.calibration_family_weights is None:
-            args.calibration_family_weights = "1,1.5,2"
+            args.calibration_family_weights = "1,1,1"
     elif args.preset == "next_bf":
         if args.dataset_size is None:
             args.dataset_size = 2000
@@ -139,7 +139,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.calibration_metric is None:
             args.calibration_metric = "family_weighted_macro_exact_acc"
         if args.calibration_family_weights is None:
-            args.calibration_family_weights = "1,1.5,2"
+            args.calibration_family_weights = "1,1,1"
     else:
         raise ValueError(f"Unsupported preset {args.preset}")
 

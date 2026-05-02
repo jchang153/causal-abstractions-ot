@@ -16,7 +16,7 @@ DEFAULT_FULL_TOKEN_POSITION_IDS = ("correct_symbol", "correct_symbol_period", "l
 DEFAULT_PCA_TOKEN_POSITION_ID = "last_token"
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
-DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.5, 2.0)
+DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
@@ -107,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ot-top-k-values", default="1,2,4")
     parser.add_argument("--ot-lambdas", default="0.5,1,2,4")
     parser.add_argument("--calibration-metric", default=DEFAULT_CALIBRATION_METRIC)
-    parser.add_argument("--calibration-family-weights", default="1,1.5,2")
+    parser.add_argument("--calibration-family-weights", default="1,1,1")
     parser.add_argument(
         "--regular-das-subspace-dims",
         default="32,64,96,128,256,512,768,1024,1536,2048,2304",

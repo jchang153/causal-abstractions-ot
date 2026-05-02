@@ -19,7 +19,7 @@ DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_STAGE_A_TOKEN_POSITION_IDS = ("last_token",)
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
-DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.5, 2.0)
+DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
@@ -240,7 +240,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ot-top-k-values", default="1,2,4")
     parser.add_argument("--ot-lambdas", default="0.5,1,2,4")
     parser.add_argument("--calibration-metric", default=DEFAULT_CALIBRATION_METRIC)
-    parser.add_argument("--calibration-family-weights", default="1,1.5,2")
+    parser.add_argument("--calibration-family-weights", default="1,1,1")
     parser.add_argument("--stage-b-top-layers-per-var", type=int, default=1)
     parser.add_argument("--stage-b-neighbor-radius", type=int, default=0)
     parser.add_argument("--stage-b-max-layers-per-var", type=int, default=1)
