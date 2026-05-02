@@ -31,6 +31,7 @@ from mcqa_delta_hierarchical_sweep import (
     _select_stage_b_layers,
     _select_stage_c_configs,
     _site_catalog_tag,
+    _stage_a_output_path,
     _stage_b_slug,
     _stage_output_is_valid,
     _write_json,
@@ -236,8 +237,7 @@ def run_stage_a(args: argparse.Namespace) -> None:
     stage_statuses: dict[str, dict[str, object]] = {}
     for token_position_id in normalized["stage_a_token_position_ids"]:
         stage_timestamp = f"{str(normalized['results_timestamp'])}_stageA_{str(token_position_id)}"
-        run_root = Path(args.results_root) / f"{stage_timestamp}_mcqa_layer_sweep"
-        stage_output = run_root / "layer_sweep_manifest.json"
+        stage_output = _stage_a_output_path(results_root=args.results_root, stage_timestamp=stage_timestamp)
         ranking_json_path, ranking_txt_path = _stage_a_rankings_paths(
             sweep_root=sweep_root,
             token_position_id=str(token_position_id),

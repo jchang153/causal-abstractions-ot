@@ -87,7 +87,7 @@ def _sort_best_first(entries: Iterable[dict[str, object]]) -> list[dict[str, obj
     return sorted(
         entries,
         key=lambda entry: (
-            float(entry.get("selection_score", entry.get("cal", -1.0))),
+            float(entry.get("layer_score", entry.get("selection_score", entry.get("cal", -1.0)))),
             float(entry.get("exact_acc", -1.0)),
             -int(entry.get("layer", 10**9)),
         ),
@@ -203,6 +203,10 @@ def _resolve_num_layers(model_name: str) -> int:
 def _all_layer_indices(model_name: str) -> tuple[int, ...]:
     num_layers = _resolve_num_layers(model_name)
     return tuple(range(int(num_layers)))
+
+
+def _stage_a_output_path(*, results_root: str | Path, stage_timestamp: str) -> Path:
+    return Path(results_root) / f"{stage_timestamp}_mcqa" / "mcqa_run_results.json"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -339,8 +343,7 @@ def _build_stage_a_command(
         "ot",
         "--target-vars",
         ",".join(str(target_var) for target_var in normalized["target_vars"]),
-        "--layer-sweep",
-        "--layer-indices",
+        "--layers",
         ",".join(str(layer) for layer in layer_indices),
         "--token-position-ids",
         str(token_position_id),
@@ -596,8 +599,8 @@ def _stage_a_rankings_from_layer_sweep(*, manifest_path: Path, manifest_payload:
 
 
 def _stage_a_rankings_from_joint_run(*, aggregate_path: Path, aggregate_payload: dict[str, object]) -> dict[str, list[dict[str, object]]]:
-    # Fallback for older/non-sweep outputs. This records transport mass as diagnostic evidence,
-    # but Stage B selection should use the layer-sweep path above whenever possible.
+    # True Stage A: one OT coupling whose neural sites are full residual-stream layers.
+    # Layers are ranked by the target variable's normalized transport mass.
     grouped_payloads: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     for payload in _iter_ot_payloads_from_run_payload(aggregate_payload):
         target_var = str(payload.get("target_var"))
@@ -610,76 +613,69 @@ def _stage_a_rankings_from_joint_run(*, aggregate_path: Path, aggregate_payload:
         best = _best_result_record(payloads)
         if best is None:
             continue
-        evidence_by_layer: dict[int, float] = {}
+
+        best_payload = best.get("payload")
+        if not isinstance(best_payload, dict):
+            continue
+        candidate_sites = list(best_payload.get("_candidate_sites", []))
+        target_transport = best_payload.get("target_normalized_transport")
+        if not isinstance(target_transport, list) or not target_transport:
+            target_transport = best_payload.get("normalized_transport", best_payload.get("transport", []))
+        selected_transport = best_payload.get("selected_transport")
+        try:
+            source_target_vars = tuple(str(var) for var in best_payload.get("source_target_vars", [])) or (str(target_var),)
+            target_row_index = int(best_payload.get("target_var_row_index", source_target_vars.index(str(target_var))))
+        except ValueError:
+            target_row_index = 0
+
         target_mass_by_layer: dict[int, float] = {}
-        for payload in payloads:
-            candidate_sites = list(payload.get("_candidate_sites", []))
-            transport = payload.get("normalized_transport", payload.get("transport", []))
-            if not isinstance(transport, list) or not transport:
+        selected_mass_by_layer: dict[int, float] = {}
+        for site_index, label in enumerate(candidate_sites):
+            layer = _layer_from_site_label(str(label))
+            if layer is None:
                 continue
-            source_target_vars = tuple(str(var) for var in payload.get("source_target_vars", [])) or (str(target_var),)
             try:
-                target_row_index = int(payload.get("target_var_row_index", source_target_vars.index(str(target_var))))
-            except ValueError:
-                target_row_index = 0
-            row_count = len(transport)
-            for site_index, label in enumerate(candidate_sites):
-                layer = _layer_from_site_label(label)
-                if layer is None:
-                    continue
-                try:
-                    target_mass = float(transport[target_row_index][site_index])
-                except (IndexError, TypeError, ValueError):
-                    continue
-                competitor_mass = 0.0
-                for other_row_index in range(row_count):
-                    if int(other_row_index) == int(target_row_index):
-                        continue
-                    try:
-                        competitor_mass = max(competitor_mass, float(transport[other_row_index][site_index]))
-                    except (IndexError, TypeError, ValueError):
-                        continue
-                evidence_by_layer[layer] = evidence_by_layer.get(layer, 0.0) + max(target_mass - competitor_mass, 0.0)
-                target_mass_by_layer[layer] = target_mass_by_layer.get(layer, 0.0) + target_mass
-        normalizer = max(1, len(payloads))
-        mean_target_mass_by_layer = {
-            int(layer): float(value) / float(normalizer)
-            for layer, value in target_mass_by_layer.items()
-        }
-        total_positive_mass = sum(max(float(value), 0.0) for value in mean_target_mass_by_layer.values())
-        for layer in sorted(set(evidence_by_layer) | set(mean_target_mass_by_layer)):
+                if len(target_transport) == 1:
+                    target_mass = float(target_transport[0][site_index])
+                else:
+                    target_mass = float(target_transport[target_row_index][site_index])
+            except (IndexError, TypeError, ValueError):
+                target_mass = 0.0
+            try:
+                if isinstance(selected_transport, list) and selected_transport:
+                    if len(selected_transport) == 1:
+                        selected_mass = float(selected_transport[0][site_index])
+                    else:
+                        selected_mass = float(selected_transport[target_row_index][site_index])
+                else:
+                    selected_mass = 0.0
+            except (IndexError, TypeError, ValueError):
+                selected_mass = 0.0
+            target_mass_by_layer[layer] = target_mass_by_layer.get(layer, 0.0) + target_mass
+            selected_mass_by_layer[layer] = selected_mass_by_layer.get(layer, 0.0) + selected_mass
+
+        for layer in sorted(target_mass_by_layer):
             rankings.setdefault(str(target_var), []).append(
                 {
                     "variable": str(target_var),
                     "layer": int(layer),
-                    "selection_score": float(best["selection_score"]),
+                    "layer_score": float(target_mass_by_layer.get(int(layer), 0.0)),
+                    "selection_score": float(target_mass_by_layer.get(int(layer), 0.0)),
+                    "handle_calibration_score": float(best["selection_score"]),
                     "exact_acc": float(best["exact_acc"]),
                     "epsilon": float(best["epsilon"]),
                     "site_label": best.get("site_label"),
                     "runtime_seconds": best.get("runtime_seconds"),
                     "wall_runtime_seconds": best.get("wall_runtime_seconds"),
                     "signature_prepare_runtime_seconds": best.get("signature_prepare_runtime_seconds"),
-                    "row_dominant_mass": float(evidence_by_layer.get(int(layer), 0.0)),
-                    "mean_target_mass": float(mean_target_mass_by_layer.get(int(layer), 0.0)),
-                    "mass_share": (
-                        max(float(mean_target_mass_by_layer.get(int(layer), 0.0)), 0.0) / total_positive_mass
-                        if total_positive_mass > 0.0 else 0.0
-                    ),
-                    "selection_basis": "joint_calibration_with_mass_diagnostic",
+                    "target_mass": float(target_mass_by_layer.get(int(layer), 0.0)),
+                    "selected_mass": float(selected_mass_by_layer.get(int(layer), 0.0)),
+                    "selection_basis": "joint_ot_target_mass",
                     "source_path": str(aggregate_path),
                 }
             )
     for target_var in list(rankings):
-        rankings[target_var] = sorted(
-            rankings[target_var],
-            key=lambda entry: (
-                float(entry.get("selection_score", -1.0)),
-                float(entry.get("exact_acc", -1.0)),
-                float(entry.get("row_dominant_mass", 0.0)),
-                -int(entry.get("layer", 10**9)),
-            ),
-            reverse=True,
-        )
+        rankings[target_var] = _sort_best_first(rankings[target_var])
     return rankings
 
 
@@ -704,18 +700,18 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
             parts = [
                 f"layer={int(entry['layer'])}",
                 f"exact={float(entry.get('exact_acc', -1.0)):.4f}",
-                f"cal={float(entry.get('selection_score', -1.0)):.4f}",
+                f"mass={float(entry.get('layer_score', entry.get('target_mass', entry.get('selection_score', -1.0)))):.4f}",
             ]
+            if "handle_calibration_score" in entry:
+                parts.append(f"cal={float(entry.get('handle_calibration_score', -1.0)):.4f}")
             if "epsilon" in entry:
                 parts.append(f"eps={float(entry.get('epsilon', -1.0)):g}")
             if entry.get("site_label") is not None:
                 parts.append(f"site={entry.get('site_label')}")
             if entry.get("runtime_seconds") is not None:
                 parts.append(f"runtime={float(entry['runtime_seconds']):.2f}s")
-            if "row_dominant_mass" in entry:
-                parts.append(f"row_dom={float(entry.get('row_dominant_mass', 0.0)):.4f}")
-            if "mass_share" in entry:
-                parts.append(f"mass_share={float(entry.get('mass_share', 0.0)):.4f}")
+            if "selected_mass" in entry:
+                parts.append(f"selected_mass={float(entry.get('selected_mass', 0.0)):.4f}")
             lines.append("  - " + " ".join(parts))
         lines.append("")
     return "\n".join(lines)
@@ -1154,8 +1150,7 @@ def main() -> None:
         for token_position_id in normalized["stage_a_token_position_ids"]:
             stage_name = f"stage_a_{str(token_position_id)}"
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageA_{str(token_position_id)}"
-            run_root = results_root / f"{stage_timestamp}_mcqa_layer_sweep"
-            stage_output = run_root / "layer_sweep_manifest.json"
+            stage_output = _stage_a_output_path(results_root=results_root, stage_timestamp=stage_timestamp)
             ranking_json_path = sweep_root / f"stage_a_{str(token_position_id)}_layer_rankings.json"
             ranking_txt_path = sweep_root / f"stage_a_{str(token_position_id)}_layer_rankings.txt"
             if _stage_output_is_valid(stage_output) and _stage_output_is_valid(ranking_json_path):
@@ -1182,7 +1177,7 @@ def main() -> None:
             stage = SweepStage(
                 name=stage_name,
                 category="stage_a_layer_ot",
-                description=f"All-layer full-vector OT discovery at token position {token_position_id}.",
+                description=f"Joint OT over full-layer residual sites at token position {token_position_id}.",
                 stage_timestamp=stage_timestamp,
                 command=_build_stage_a_command(
                     args=args,
