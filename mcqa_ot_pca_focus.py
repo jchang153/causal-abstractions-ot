@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,13 @@ import mcqa_run as base_run
 import torch
 from mcqa_experiment.das import DASConfig, run_das_pipeline
 from mcqa_experiment.data import COUNTERFACTUAL_FAMILIES, canonicalize_target_var
-from mcqa_experiment.ot import OTConfig, prepare_alignment_artifacts, run_alignment_pipeline
+from mcqa_experiment.ot import (
+    OTConfig,
+    load_prepared_alignment_artifacts,
+    prepare_alignment_artifacts,
+    run_alignment_pipeline,
+    save_prepared_alignment_artifacts,
+)
 from mcqa_experiment.pca import (
     LayerPCABasis,
     load_or_fit_pca_basis,
@@ -331,6 +338,58 @@ def _site_catalog_tag(
     if str(site_menu) == "mixed":
         tag += f"-top-{'-'.join(str(size) for size in top_prefix_sizes)}"
     return tag
+
+
+def _pca_signature_cache_spec(
+    *,
+    fit_bank,
+    basis: LayerPCABasis,
+    basis_source_mode: str,
+    token_position_id: str,
+    layer: int,
+    site_catalog_tag: str,
+    signature_mode: str,
+    prompt_records: list[dict[str, object]] | None,
+) -> dict[str, object]:
+    train_rows_digest = hashlib.sha256(
+        "\n".join(
+            f"{base.get('raw_input', '')}|||{source.get('raw_input', '')}"
+            for base, source in zip(fit_bank.base_inputs, fit_bank.source_inputs)
+        ).encode("utf-8")
+    ).hexdigest()
+    prompt_digest = hashlib.sha256(
+        json.dumps(prompt_records or [], sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "kind": "mcqa_pca_alignment_signatures",
+        "model_name": base_run.MODEL_NAME,
+        "dataset_path": base_run.MCQA_DATASET_PATH,
+        "dataset_config": base_run.MCQA_DATASET_CONFIG,
+        "split_seed": int(base_run.SPLIT_SEED),
+        "train_pool_size": int(base_run.TRAIN_POOL_SIZE),
+        "train_bank": fit_bank.metadata(),
+        "train_rows_digest": train_rows_digest,
+        "layer": int(layer),
+        "token_position_id": str(token_position_id),
+        "basis_id": str(basis.basis_id),
+        "basis_source_mode": str(basis_source_mode),
+        "site_catalog_tag": str(site_catalog_tag),
+        "signature_mode": str(signature_mode),
+        "batch_size": int(base_run.BATCH_SIZE),
+        "prompt_records_digest": str(prompt_digest),
+        "source_target_vars": [canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS],
+    }
+
+
+def _pca_signature_cache_path(*, cache_spec: dict[str, object]) -> Path:
+    spec_json = json.dumps(cache_spec, sort_keys=True, separators=(",", ":"))
+    spec_hash = hashlib.sha256(spec_json.encode("utf-8")).hexdigest()[:12]
+    stem = (
+        f"mcqa_pca_layer-{int(cache_spec['layer'])}_pos-{str(cache_spec['token_position_id'])}"
+        f"_basis-{str(cache_spec['basis_source_mode'])}_catalog-{str(cache_spec['site_catalog_tag'])}"
+        f"_sig-{str(cache_spec['signature_mode'])}_{spec_hash}.pt"
+    )
+    return base_run.SIGNATURES_DIR / stem
 
 
 def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, dict[str, object]]:
@@ -749,7 +808,24 @@ def main() -> None:
         pca_bases_by_id = {str(basis.basis_id): basis}
         site_build_seconds = float(perf_counter() - site_build_start)
 
-        prepared_artifacts = None
+        cache_spec = _pca_signature_cache_spec(
+            fit_bank=fit_bank_for_basis,
+            basis=basis,
+            basis_source_mode=str(args.basis_source_mode),
+            token_position_id=str(args.token_position_id),
+            layer=int(layer),
+            site_catalog_tag=site_catalog_tag,
+            signature_mode=str(args.signature_mode),
+            prompt_records=prompt_records,
+        )
+        cache_path = _pca_signature_cache_path(cache_spec=cache_spec)
+        artifact_prepare_load_start = perf_counter()
+        prepared_artifacts = load_prepared_alignment_artifacts(
+            cache_path,
+            expected_spec=cache_spec,
+        )
+        artifact_prepare_load_seconds = float(perf_counter() - artifact_prepare_load_start)
+        artifact_prepare_create_seconds = 0.0
         ot_compare_payloads: list[dict[str, object]] = []
         ot_fit_cal_start = perf_counter()
         for epsilon in ot_epsilons:
@@ -775,6 +851,7 @@ def main() -> None:
                     lambda_values_by_var={target_var: DEFAULT_OT_LAMBDAS for target_var in target_vars},
                 )
                 if prepared_artifacts is None:
+                    artifact_prepare_start = perf_counter()
                     prepared_artifacts = prepare_alignment_artifacts(
                         model=model,
                         fit_banks_by_var={target_var: banks_by_split["train"][target_var] for target_var in target_vars},
@@ -782,6 +859,12 @@ def main() -> None:
                         device=device,
                         config=ot_config,
                         pca_bases_by_id=pca_bases_by_id,
+                    )
+                    artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
+                    save_prepared_alignment_artifacts(
+                        cache_path,
+                        prepared_artifacts=prepared_artifacts,
+                        cache_spec=cache_spec,
                     )
                 method_payloads = []
                 for target_var in target_vars:
@@ -844,6 +927,7 @@ def main() -> None:
         )
         write_json(support_path, support_by_var)
         support_extract_seconds = float(perf_counter() - support_start)
+        best_ot_by_var = _best_ot_records(ot_compare_payloads)
 
         das_screen_start = perf_counter()
         screen_payloads = _run_pca_das_from_support(
@@ -914,6 +998,14 @@ def main() -> None:
         _synchronize_if_cuda(device)
         das_guided_seconds = float(perf_counter() - das_guided_start)
         layer_total_seconds = float(perf_counter() - layer_start)
+        localization_runtime_seconds = float(
+            pca_fit_seconds
+            + site_build_seconds
+            + artifact_prepare_load_seconds
+            + artifact_prepare_create_seconds
+            + ot_fit_cal_seconds
+            + support_extract_seconds
+        )
 
         layer_summary_path = layer_dir / (
             f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
@@ -939,8 +1031,8 @@ def main() -> None:
             ),
         )
 
-        layer_payload = {
-            "kind": "mcqa_ot_pca_focus_layer",
+        plot_support_payload = {
+            "kind": "mcqa_plot_pca_support_layer",
             "layer": int(layer),
             "token_position_id": str(args.token_position_id),
             "site_menu": str(args.site_menu),
@@ -957,11 +1049,15 @@ def main() -> None:
             "site_metrics": site_metrics,
             "support_score_slack": float(args.support_score_slack),
             "support_by_var": support_by_var,
+            "method_by_var": best_ot_by_var,
             "screen_mask_names": [str(mask_name) for mask_name in screen_mask_names],
             "screen_das_enabled": bool(args.screen_das),
             "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
             "guided_subspace_dims": None if guided_subspace_dims is None else [int(dim) for dim in guided_subspace_dims],
             "guided_das_enabled": bool(args.guided_das),
+            "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)) if prepared_artifacts else False,
+            "localization_runtime_seconds": float(localization_runtime_seconds),
+            "runtime_seconds": float(localization_runtime_seconds),
             "context_timing_seconds": context_timing_seconds,
             "timing_seconds": {
                 "t_model_load": float(context_timing_seconds.get("t_model_load", 0.0)),
@@ -971,11 +1067,12 @@ def main() -> None:
                 "t_context_total_wall": float(context_timing_seconds.get("t_context_total_wall", 0.0)),
                 "t_stageB_pca_fit": float(pca_fit_seconds),
                 "t_stageB_pca_site_build": float(site_build_seconds),
+                "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
+                "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
                 "t_stageB_pca_ot_fit_cal": float(ot_fit_cal_seconds),
                 "t_support_extract": float(support_extract_seconds),
-                "t_stageC_das_screen": float(das_screen_seconds),
-                "t_stageC_das_full": float(das_guided_seconds),
-                "t_layer_total_wall": float(layer_total_seconds),
+                "t_stageB_pca_localization": float(localization_runtime_seconds),
+                "t_layer_total_wall": float(localization_runtime_seconds),
                 "t_stage_total_wall_so_far": float(perf_counter() - stage_start),
             },
             "screen_output_paths": {
@@ -1007,12 +1104,50 @@ def main() -> None:
             ],
             "summary_path": str(layer_summary_path),
         }
-        layer_payload_path = layer_dir / (
+        plot_support_payload_path = layer_dir / (
             f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-            f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_ot_pca.json"
+            f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_plot_pca_support.json"
         )
-        write_json(layer_payload_path, layer_payload)
-        all_payloads.append(layer_payload)
+        write_json(plot_support_payload_path, plot_support_payload)
+        all_payloads.append(plot_support_payload)
+
+        payload_path_for_manifest = plot_support_payload_path
+        runtime_for_manifest = localization_runtime_seconds
+        timing_for_manifest = plot_support_payload["timing_seconds"]
+        if bool(args.guided_das) or bool(args.screen_das):
+            guided_summary_payload = {
+                "kind": "mcqa_plot_das_pca_support_layer",
+                "layer": int(layer),
+                "token_position_id": str(args.token_position_id),
+                "site_menu": str(args.site_menu),
+                "num_bands": int(args.num_bands),
+                "band_scheme": str(args.band_scheme),
+                "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
+                "basis_source_mode": str(args.basis_source_mode),
+                "signature_mode": str(args.signature_mode),
+                "support_path": str(support_path),
+                "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
+                "guided_output_paths": plot_support_payload["guided_output_paths"],
+                "screen_output_paths": plot_support_payload["screen_output_paths"],
+                "guided_das_enabled": bool(args.guided_das),
+                "screen_das_enabled": bool(args.screen_das),
+                "runtime_seconds": float(das_screen_seconds + das_guided_seconds),
+                "localization_runtime_seconds": float(localization_runtime_seconds),
+                "timing_seconds": {
+                    "t_stageC_das_screen": float(das_screen_seconds),
+                    "t_stageC_das_full": float(das_guided_seconds),
+                    "t_stageC_total_wall": float(das_screen_seconds + das_guided_seconds),
+                },
+            }
+            guided_summary_payload_path = layer_dir / (
+                f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+                f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_plot_das_pca_support.json"
+            )
+            write_json(guided_summary_payload_path, guided_summary_payload)
+            all_payloads.append(guided_summary_payload)
+            payload_path_for_manifest = guided_summary_payload_path
+            runtime_for_manifest = float(das_screen_seconds + das_guided_seconds)
+            timing_for_manifest = guided_summary_payload["timing_seconds"]
         manifest_runs.append(
             {
                 "layer": int(layer),
@@ -1025,10 +1160,10 @@ def main() -> None:
                 "signature_mode": str(args.signature_mode),
                 "screen_das_enabled": bool(args.screen_das),
                 "guided_das_enabled": bool(args.guided_das),
-                "runtime_seconds": float(layer_total_seconds),
-                "timing_seconds": layer_payload["timing_seconds"],
+                "runtime_seconds": float(runtime_for_manifest),
+                "timing_seconds": timing_for_manifest,
                 "summary_path": str(layer_summary_path),
-                "payload_path": str(layer_payload_path),
+                "payload_path": str(payload_path_for_manifest),
             }
         )
 

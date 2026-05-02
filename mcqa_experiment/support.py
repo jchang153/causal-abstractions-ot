@@ -596,6 +596,33 @@ def build_ordered_composite_sites_from_support(
     return composite_sites
 
 
+def build_atomic_candidate_sites_from_support(
+    *,
+    support_summary: dict[str, object],
+    sites: list[SiteLike],
+) -> list[SiteLike]:
+    """Return the unique atomic sites referenced by ordered support masks."""
+    mask_candidates = support_summary.get("mask_candidates", [])
+    selected_indices: list[int] = []
+    seen_indices: set[int] = set()
+    for candidate in mask_candidates:
+        for site_index in candidate.get("site_indices", []):
+            resolved_index = int(site_index)
+            if resolved_index in seen_indices:
+                continue
+            seen_indices.add(resolved_index)
+            selected_indices.append(resolved_index)
+    if not selected_indices:
+        ranked_site_indices = [int(site_index) for site_index in support_summary.get("ranked_site_indices", [])]
+        if ranked_site_indices:
+            selected_indices = [ranked_site_indices[0]]
+    return [
+        sites[site_index]
+        for site_index in selected_indices
+        if 0 <= int(site_index) < len(sites)
+    ]
+
+
 def build_rotated_span_sites_from_support(
     *,
     support_summary: dict[str, object],

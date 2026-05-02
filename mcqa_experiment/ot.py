@@ -260,6 +260,7 @@ def load_prepared_alignment_artifacts(
         "cache_spec": cached_spec,
         "cache_path": str(path),
         "loaded_from_disk": True,
+        "artifact_cache_hit": True,
     }
 
 
@@ -328,6 +329,7 @@ def prepare_alignment_artifacts(
         "site_signatures_by_var": site_signatures_by_var,
         "prepare_runtime_seconds": float(perf_counter() - start),
         "loaded_from_disk": False,
+        "artifact_cache_hit": False,
     }
 
 
@@ -907,6 +909,7 @@ def run_alignment_pipeline(
             f"epsilon={float(config.epsilon):g} sources={list(config.source_target_vars)}"
         )
     signature_prepare_wall_seconds = 0.0
+    artifact_prepare_load_seconds = 0.0
     if prepared_artifacts is None:
         signature_start = perf_counter()
         prepared_artifacts = prepare_alignment_artifacts(
@@ -919,11 +922,12 @@ def run_alignment_pipeline(
         )
         _synchronize_if_cuda(device)
         signature_prepare_wall_seconds = float(perf_counter() - signature_start)
-    signature_prepare_runtime_seconds = float(
-        signature_prepare_wall_seconds
-        if signature_prepare_wall_seconds > 0.0
-        else prepared_artifacts.get("prepare_runtime_seconds", 0.0)
-    )
+    else:
+        artifact_prepare_load_seconds = 0.0
+    artifact_cache_hit = bool(prepared_artifacts.get("loaded_from_disk", False))
+    artifact_prepare_recorded_seconds = float(prepared_artifacts.get("prepare_runtime_seconds", 0.0))
+    artifact_prepare_create_seconds = float(signature_prepare_wall_seconds)
+    signature_prepare_runtime_seconds = float(signature_prepare_wall_seconds)
     site_signatures_by_var = prepared_artifacts["site_signatures_by_var"]
     variable_signature_start = perf_counter()
     variable_signatures_by_var = {
@@ -1015,7 +1019,15 @@ def run_alignment_pipeline(
     _synchronize_if_cuda(device)
     holdout_eval_seconds = float(perf_counter() - holdout_start)
     total_wall_seconds = float(perf_counter() - total_start)
-    reported_runtime_seconds = float(total_wall_seconds) + float(signature_prepare_runtime_seconds)
+    localization_runtime_seconds = float(
+        artifact_prepare_create_seconds
+        + artifact_prepare_load_seconds
+        + variable_signature_seconds
+        + transport_solve_seconds
+        + calibration_select_seconds
+        + selected_calibration_eval_seconds
+        + holdout_eval_seconds
+    )
     holdout_result["method"] = config.method
     holdout_result["selection_exact_acc"] = float(selected["result"]["exact_acc"])
     holdout_result["calibration_exact_acc"] = float(selected["result"]["exact_acc"])
@@ -1047,17 +1059,26 @@ def run_alignment_pipeline(
         "selected_raw_position_mass": selected_raw_position_mass,
         "selected_raw_captured_mass": float(selected_raw_captured_mass),
         "transport_meta": transport_meta,
+        "artifact_cache_hit": bool(artifact_cache_hit),
+        "artifact_prepare_create_seconds": float(artifact_prepare_create_seconds),
+        "artifact_prepare_load_seconds": float(artifact_prepare_load_seconds),
+        "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
         "signature_prepare_runtime_seconds": float(signature_prepare_runtime_seconds),
         "wall_runtime_seconds": float(total_wall_seconds),
-        "runtime_seconds": float(reported_runtime_seconds),
-        "core_method_seconds": float(reported_runtime_seconds),
+        "runtime_seconds": float(total_wall_seconds),
+        "localization_runtime_seconds": float(localization_runtime_seconds),
+        "core_method_seconds": float(total_wall_seconds),
         "timing_seconds": {
+            "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
+            "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
             "t_signature_prepare": float(signature_prepare_runtime_seconds),
             "t_variable_signature_build": float(variable_signature_seconds),
             "t_transport_solve": float(transport_solve_seconds),
+            "t_handle_calibration": float(calibration_select_seconds),
             "t_calibration_select": float(calibration_select_seconds),
             "t_selected_calibration_eval": float(selected_calibration_eval_seconds),
             "t_final_holdout_eval": float(holdout_eval_seconds),
+            "t_localization_runtime": float(localization_runtime_seconds),
             "t_total_wall": float(total_wall_seconds),
         },
         "selected_hyperparameters": {

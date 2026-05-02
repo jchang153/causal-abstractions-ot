@@ -13,17 +13,6 @@ from typing import Iterable
 
 
 TARGET_VARS = ("answer_pointer", "answer_token")
-NATIVE_STAGE_B_KEYS = (
-    "t_stageB_native_signature_build",
-    "t_stageB_native_ot_fit_cal",
-)
-PCA_STAGE_B_KEYS = (
-    "t_stageB_pca_fit",
-    "t_stageB_pca_site_build",
-    "t_stageB_pca_ot_fit_cal",
-)
-
-
 def _load_json(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -77,63 +66,29 @@ def _stage_a_runtime(sweep_root: Path) -> float:
             if str(key).startswith("stage_a") and isinstance(status, dict):
                 if status.get("runtime_seconds") is not None:
                     return _as_float(status.get("runtime_seconds"))
+    fallback = _read_rankings(sweep_root, "stage_a_last_token_layer_rankings.json")
+    for target_var in TARGET_VARS:
+        entry = _first_entry(fallback, target_var)
+        if entry and entry.get("runtime_seconds") is not None:
+            return _as_float(entry.get("runtime_seconds"))
     return 0.0
 
 
-def _task_payload_paths(sweep_root: Path, manifest_name: str) -> list[Path]:
-    path = sweep_root / manifest_name
-    if not path.exists():
-        return []
-    payload = _load_json(path)
-    if not isinstance(payload, dict):
-        return []
-    tasks = payload.get("tasks")
-    if not isinstance(tasks, list):
-        return []
-    paths: list[Path] = []
-    for task in tasks:
-        if not isinstance(task, dict):
+def _runtime_by_layer_from_rankings(rankings: dict[str, object]) -> dict[int, float]:
+    runtime_by_layer: dict[int, float] = {}
+    for target_var in TARGET_VARS:
+        entries = rankings.get(target_var)
+        if not isinstance(entries, list):
             continue
-        for payload_path in task.get("payload_paths", []):
-            resolved = Path(str(payload_path))
-            if resolved.exists():
-                paths.append(resolved)
-    return paths
-
-
-def _payload_timing(payload: dict[str, object], keys: Iterable[str]) -> float:
-    timing = payload.get("timing_seconds")
-    if not isinstance(timing, dict):
-        return 0.0
-    return sum(_as_float(timing.get(key)) for key in keys)
-
-
-def _payloads_by_layer(paths: Iterable[Path]) -> dict[int, list[dict[str, object]]]:
-    grouped: dict[int, list[dict[str, object]]] = {}
-    for path in paths:
-        payload = _load_json(path)
-        if not isinstance(payload, dict):
-            continue
-        if payload.get("layer") is None:
-            continue
-        grouped.setdefault(int(payload["layer"]), []).append(payload)
-    return grouped
-
-
-def _native_stage_b_runtime_by_layer(sweep_root: Path) -> dict[int, float]:
-    payloads = _payloads_by_layer(_task_payload_paths(sweep_root, "stage_b_native_tasks.json"))
-    return {
-        layer: sum(_payload_timing(payload, NATIVE_STAGE_B_KEYS) for payload in layer_payloads)
-        for layer, layer_payloads in payloads.items()
-    }
-
-
-def _pca_stage_b_runtime_by_layer(sweep_root: Path) -> dict[int, float]:
-    payloads = _payloads_by_layer(_task_payload_paths(sweep_root, "stage_b_pca_tasks.json"))
-    return {
-        layer: sum(_payload_timing(payload, PCA_STAGE_B_KEYS) for payload in layer_payloads)
-        for layer, layer_payloads in payloads.items()
-    }
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("layer") is None:
+                continue
+            layer = int(entry["layer"])
+            runtime_by_layer[layer] = max(
+                float(runtime_by_layer.get(layer, 0.0)),
+                _as_float(entry.get("runtime_seconds")),
+            )
+    return runtime_by_layer
 
 
 def _method_record(
@@ -251,22 +206,23 @@ def build_paper_runtime_summary(
 ) -> dict[str, object]:
     stage_a_seconds = _stage_a_runtime(sweep_root)
     stage_a_rankings = _read_rankings(sweep_root, "stage_a_last_token_layer_rankings.json")
-    native_rankings = _read_rankings(sweep_root, "stage_b_native_rankings.json")
-    pca_rankings = _read_rankings(sweep_root, "stage_b_pca_rankings.json")
-    a_only_rankings = _read_rankings(sweep_root, "stage_c_a_only_rankings.json")
-    native_guided_rankings = _read_rankings(sweep_root, "stage_c_native_guided_rankings.json")
+    native_rankings = _read_rankings(sweep_root, "stage_b_native_support_rankings.json")
+    pca_rankings = _read_rankings(sweep_root, "stage_b_pca_support_rankings.json")
+    layer_das_rankings = _read_rankings(sweep_root, "stage_c_layer_das_rankings.json")
+    native_guided_rankings = _read_rankings(sweep_root, "stage_c_native_support_das_rankings.json")
+    pca_guided_rankings = _read_rankings(sweep_root, "stage_c_pca_support_das_rankings.json")
 
-    native_stage_b_by_layer = _native_stage_b_runtime_by_layer(sweep_root)
-    pca_stage_b_by_layer = _pca_stage_b_runtime_by_layer(sweep_root)
+    native_stage_b_by_layer = _runtime_by_layer_from_rankings(native_rankings)
+    pca_stage_b_by_layer = _runtime_by_layer_from_rankings(pca_rankings)
 
     records: list[dict[str, object]] = []
     records.append(
         _method_record(
-            method="PLOT (layer OT)",
+            method="PLOT (layer)",
             stage_a_seconds=stage_a_seconds,
             downstream_by_var={var: 0.0 for var in TARGET_VARS},
             entries_by_var={var: _first_entry(stage_a_rankings, var) for var in TARGET_VARS},
-            notes="Full Stage A all-layer final-token OT discovery.",
+            notes="Joint Stage A layer localization over full-layer sites.",
         )
     )
 
@@ -281,14 +237,14 @@ def build_paper_runtime_summary(
     )
     records.append(
         _method_record(
-            method="PLOT (native OT)",
+            method="PLOT (native support)",
             stage_a_seconds=stage_a_seconds,
             downstream_by_var=native_downstream,
             entries_by_var=native_entries,
             serial_downstream_seconds=native_serial,
             parallel_downstream_seconds=native_parallel,
             shared_runtime_seconds_by_layer=native_shared_by_layer,
-            notes="Stage A plus local Stage B native search over all configured native resolutions in each unique selected layer.",
+            notes="Stage A plus native-support localization over one canonical atomic partition per selected layer.",
         )
     )
 
@@ -303,29 +259,29 @@ def build_paper_runtime_summary(
     )
     records.append(
         _method_record(
-            method="PLOT-PCA",
+            method="PLOT (PCA support)",
             stage_a_seconds=stage_a_seconds,
             downstream_by_var=pca_downstream,
             entries_by_var=pca_entries,
             serial_downstream_seconds=pca_serial,
             parallel_downstream_seconds=pca_parallel,
             shared_runtime_seconds_by_layer=pca_shared_by_layer,
-            notes="Stage A plus local Stage B PCA search over configured PCA menus/bases in the selected layer.",
+            notes="Stage A plus PCA-support localization over the selected layer.",
         )
     )
 
-    a_only_entries = {var: _first_entry(a_only_rankings, var) for var in TARGET_VARS}
-    a_only_downstream = {
+    layer_das_entries = {var: _first_entry(layer_das_rankings, var) for var in TARGET_VARS}
+    layer_das_downstream = {
         var: _as_float(entry.get("runtime_seconds")) if entry else 0.0
-        for var, entry in a_only_entries.items()
+        for var, entry in layer_das_entries.items()
     }
     records.append(
         _method_record(
-            method="PLOT-DAS (layer only)",
+            method="PLOT-DAS (layer)",
             stage_a_seconds=stage_a_seconds,
-            downstream_by_var=a_only_downstream,
-            entries_by_var=a_only_entries,
-            notes="Stage A plus focused full-layer DAS for AP and AT at their selected layers.",
+            downstream_by_var=layer_das_downstream,
+            entries_by_var=layer_das_entries,
+            notes="Stage A plus standalone layer-restricted DAS over the selected layers.",
         )
     )
 
@@ -356,7 +312,38 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=native_guided_serial,
             parallel_downstream_seconds=native_guided_parallel,
             shared_runtime_seconds_by_layer=native_guided_stage_b_by_layer,
-            notes="Stage A plus local Stage B native search plus guided DAS in the selected native support.",
+            notes="Stage A plus native-support localization plus DAS over the selected native supports.",
+        )
+    )
+
+    pca_guided_entries = {var: _first_entry(pca_guided_rankings, var) for var in TARGET_VARS}
+    pca_guided_stage_b_by_layer, pca_guided_stage_b_serial, _ = _unique_layer_runtime(
+        pca_guided_entries,
+        pca_stage_b_by_layer,
+    )
+    pca_guided_downstream = {}
+    pca_guided_das = {}
+    for var, entry in pca_guided_entries.items():
+        if entry:
+            stage_b_seconds = pca_stage_b_by_layer.get(int(entry["layer"]), 0.0)
+            das_seconds = _as_float(entry.get("runtime_seconds"))
+            pca_guided_das[var] = das_seconds
+            pca_guided_downstream[var] = stage_b_seconds + das_seconds
+        else:
+            pca_guided_das[var] = 0.0
+            pca_guided_downstream[var] = 0.0
+    pca_guided_serial = pca_guided_stage_b_serial + sum(_as_float(pca_guided_das.get(var)) for var in TARGET_VARS)
+    pca_guided_parallel = max(_as_float(pca_guided_downstream.get(var)) for var in TARGET_VARS)
+    records.append(
+        _method_record(
+            method="PLOT-DAS (PCA support)",
+            stage_a_seconds=stage_a_seconds,
+            downstream_by_var=pca_guided_downstream,
+            entries_by_var=pca_guided_entries,
+            serial_downstream_seconds=pca_guided_serial,
+            parallel_downstream_seconds=pca_guided_parallel,
+            shared_runtime_seconds_by_layer=pca_guided_stage_b_by_layer,
+            notes="Stage A plus PCA-support localization plus DAS over the selected PCA supports.",
         )
     )
 

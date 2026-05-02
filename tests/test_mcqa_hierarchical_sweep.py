@@ -254,11 +254,11 @@ def test_parallel_stage_b_planner_writes_disjoint_task_roots(tmp_path: Path) -> 
     native_tasks = json.loads((sweep_root / "stage_b_native_tasks.json").read_text())["tasks"]
     pca_tasks = json.loads((sweep_root / "stage_b_pca_tasks.json").read_text())["tasks"]
 
-    assert len(native_tasks) == 14
+    assert len(native_tasks) == 2
     assert len(pca_tasks) == 12
     native_stage_roots = [Path(task["expected_outputs"][0]).parent for task in native_tasks]
     assert len(native_stage_roots) == len(set(native_stage_roots))
-    assert all("_res" in task["stage_timestamp"] for task in native_tasks)
+    assert all("_L" in task["stage_timestamp"] for task in native_tasks)
     stage_roots = [Path(task["expected_outputs"][0]).parent for task in pca_tasks]
     assert len(stage_roots) == len(set(stage_roots))
     assert all("_L" in task["stage_timestamp"] for task in pca_tasks)
@@ -269,7 +269,7 @@ def test_parallel_stage_c_planner_reuses_stage_b_task_root(tmp_path: Path) -> No
     sweep_root = tmp_path / f"{timestamp}_mcqa_hierarchical_sweep"
     sweep_root.mkdir(parents=True)
     stage_b_timestamp = f"{timestamp}_stageB_last_token_pair_bank_partition_8b_L23"
-    (sweep_root / "stage_b_pca_rankings.json").write_text(
+    (sweep_root / "stage_b_pca_support_rankings.json").write_text(
         json.dumps(
             {
                 "answer_pointer": [],
@@ -292,7 +292,7 @@ def test_parallel_stage_c_planner_reuses_stage_b_task_root(tmp_path: Path) -> No
         tmp_path
         / f"{stage_b_timestamp}_mcqa_ot_pca_focus"
         / "layer_23"
-        / "mcqa_layer-23_pos-last_token_pca-menu-partition-bands-8-scheme-equal_basis-pair_bank_sig-family_label_delta_norm_ot_pca.json"
+        / "mcqa_layer-23_pos-last_token_pca-menu-partition-bands-8-scheme-equal_basis-pair_bank_sig-family_label_delta_norm_plot_pca_support.json"
     )
     (sweep_root / "stage_b_pca_tasks.json").write_text(
         json.dumps(
@@ -329,7 +329,12 @@ def test_parallel_stage_c_planner_reuses_stage_b_task_root(tmp_path: Path) -> No
 
     plan_stage_c_tasks(args)
 
+    layer_tasks = json.loads((sweep_root / "stage_c_layer_tasks.json").read_text())["tasks"]
+    native_tasks = json.loads((sweep_root / "stage_c_native_tasks.json").read_text())["tasks"]
     stage_c_tasks = json.loads((sweep_root / "stage_c_pca_tasks.json").read_text())["tasks"]
+    assert layer_tasks == []
+    assert native_tasks == []
     assert len(stage_c_tasks) == 1
     assert stage_c_tasks[0]["stage_timestamp"] == stage_b_timestamp
     assert any(path.endswith("_answer_token_das_guided.json") for path in stage_c_tasks[0]["expected_outputs"])
+    assert any(path.endswith("_plot_das_pca_support.json") for path in stage_c_tasks[0]["expected_outputs"])

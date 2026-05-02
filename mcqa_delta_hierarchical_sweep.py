@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -42,7 +43,14 @@ DEFAULT_DAS_SUBSPACE_DIMS = (
     2048,
     2304,
 )
-DEFAULT_STAGES = ("stage_a_layer_ot", "stage_b_native_ot", "stage_b_pca_ot", "stage_c_guided_das")
+DEFAULT_STAGES = (
+    "stage_a_plot_layer",
+    "stage_b_plot_native_support",
+    "stage_b_plot_pca_support",
+    "stage_c_plot_das_layer",
+    "stage_c_plot_das_native_support",
+    "stage_c_plot_das_pca_support",
+)
 
 
 @dataclass(frozen=True)
@@ -206,7 +214,7 @@ def _all_layer_indices(model_name: str) -> tuple[int, ...]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Hierarchical Delta sweep for MCQA layer discovery -> PCA OT -> guided DAS.")
+    parser = argparse.ArgumentParser(description="Hierarchical MCQA sweep for PLOT/PLOT-DAS method families.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--model-name", default="google/gemma-2-2b")
     parser.add_argument("--dataset-path", default="jchang153/copycolors_mcqa")
@@ -221,7 +229,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--results-timestamp")
     parser.add_argument("--signatures-dir", default="signatures")
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
-    parser.add_argument("--stages", default="stage_a_layer_ot,stage_b_native_ot,stage_b_pca_ot,stage_c_guided_das")
+    parser.add_argument(
+        "--stages",
+        default="stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_layer,stage_c_plot_das_native_support,stage_c_plot_das_pca_support",
+    )
     parser.add_argument("--stage-a-token-position-ids", default="last_token")
     parser.add_argument("--stage-a-layer-indices", default=None, help="Comma-separated layer indices. Default: all layers.")
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
@@ -314,9 +325,7 @@ def _build_stage_a_command(
 ) -> tuple[str, ...]:
     command = [
         sys.executable,
-        "mcqa_run_cloud.py",
-        "--preset",
-        "full",
+        "mcqa_plot_layer.py",
         "--device",
         str(args.device),
         "--model-name",
@@ -335,29 +344,14 @@ def _build_stage_a_command(
         str(int(args.test_pool_size)),
         "--batch-size",
         str(int(args.batch_size)),
-        "--methods",
-        "ot",
-        "--target-vars",
-        ",".join(str(target_var) for target_var in normalized["target_vars"]),
-        "--layer-sweep",
-        "--layer-indices",
+        "--layers",
         ",".join(str(layer) for layer in layer_indices),
-        "--token-position-ids",
+        "--token-position-id",
         str(token_position_id),
-        "--resolutions",
-        "full",
         "--ot-epsilons",
         ",".join(str(epsilon).rstrip("0").rstrip(".") if "." in str(epsilon) else str(epsilon) for epsilon in normalized["ot_epsilons"]),
-        "--ot-top-k-values",
-        ",".join(str(value) for value in normalized["ot_top_k_values"]),
-        "--ot-lambdas",
-        ",".join(str(value).rstrip("0").rstrip(".") if "." in str(value) else str(value) for value in normalized["ot_lambdas"]),
-        "--signature-modes",
+        "--signature-mode",
         str(args.signature_mode),
-        "--calibration-metric",
-        str(args.calibration_metric),
-        "--calibration-family-weights",
-        ",".join(str(weight).rstrip("0").rstrip(".") if "." in str(weight) else str(weight) for weight in normalized["calibration_family_weights"]),
         "--results-root",
         str(args.results_root),
         "--results-timestamp",
@@ -463,9 +457,11 @@ def _build_native_block_command(
 ) -> tuple[str, ...]:
     command = [
         sys.executable,
-        "mcqa_ot_das_block_focus.py",
+        "mcqa_plot_native_support.py",
         "--device",
         str(args.device),
+        "--model-name",
+        str(args.model_name),
         "--dataset-path",
         str(args.dataset_path),
         "--dataset-size",
@@ -494,20 +490,110 @@ def _build_native_block_command(
         str(stage_timestamp),
         "--signatures-dir",
         str(args.signatures_dir),
-        "--screen-restarts",
-        str(max(1, int(args.screen_restarts))),
-        "--full-restarts",
-        str(max(1, int(args.guided_restarts))),
-        "--full-das-subspace-dims",
-        ",".join(str(dim) for dim in normalized["regular_das_subspace_dims"]),
     ]
-    if normalized["guided_subspace_dims"] is not None:
-        command.extend(
-            [
-                "--guided-subspace-dims",
-                ",".join(str(dim) for dim in normalized["guided_subspace_dims"]),
-            ]
-        )
+    _append_optional_arg(command, "--dataset-config", args.dataset_config)
+    if bool(args.prompt_hf_login):
+        command.append("--prompt-hf-login")
+    return tuple(command)
+
+
+def _build_layer_das_command(
+    *,
+    args: argparse.Namespace,
+    normalized: dict[str, object],
+    stage_timestamp: str,
+    token_position_id: str,
+    layer: int,
+) -> tuple[str, ...]:
+    command = [
+        sys.executable,
+        "mcqa_plot_das_layer.py",
+        "--device",
+        str(args.device),
+        "--model-name",
+        str(args.model_name),
+        "--dataset-path",
+        str(args.dataset_path),
+        "--dataset-size",
+        str(int(args.dataset_size)),
+        "--split-seed",
+        str(int(args.split_seed)),
+        "--train-pool-size",
+        str(int(args.train_pool_size)),
+        "--calibration-pool-size",
+        str(int(args.calibration_pool_size)),
+        "--test-pool-size",
+        str(int(args.test_pool_size)),
+        "--batch-size",
+        str(int(args.batch_size)),
+        "--layer",
+        str(int(layer)),
+        "--token-position-id",
+        str(token_position_id),
+        "--signature-mode",
+        str(args.signature_mode),
+        "--das-subspace-dims",
+        ",".join(str(dim) for dim in normalized["regular_das_subspace_dims"]),
+        "--results-root",
+        str(args.results_root),
+        "--results-timestamp",
+        str(stage_timestamp),
+        "--signatures-dir",
+        str(args.signatures_dir),
+    ]
+    _append_optional_arg(command, "--dataset-config", args.dataset_config)
+    if bool(args.prompt_hf_login):
+        command.append("--prompt-hf-login")
+    return tuple(command)
+
+
+def _build_native_support_das_command(
+    *,
+    args: argparse.Namespace,
+    normalized: dict[str, object],
+    stage_timestamp: str,
+    native_support_path: Path,
+) -> tuple[str, ...]:
+    command = [
+        sys.executable,
+        "mcqa_plot_das_native_support.py",
+        "--device",
+        str(args.device),
+        "--model-name",
+        str(args.model_name),
+        "--dataset-path",
+        str(args.dataset_path),
+        "--dataset-size",
+        str(int(args.dataset_size)),
+        "--split-seed",
+        str(int(args.split_seed)),
+        "--train-pool-size",
+        str(int(args.train_pool_size)),
+        "--calibration-pool-size",
+        str(int(args.calibration_pool_size)),
+        "--test-pool-size",
+        str(int(args.test_pool_size)),
+        "--batch-size",
+        str(int(args.batch_size)),
+        "--native-support-path",
+        str(native_support_path),
+        "--guided-mask-names",
+        ",".join(str(mask_name) for mask_name in normalized["guided_mask_names"]),
+        "--guided-subspace-dims",
+        ",".join(str(dim) for dim in normalized["guided_subspace_dims"] or DEFAULT_DAS_SUBSPACE_DIMS),
+        "--guided-max-epochs",
+        str(int(args.guided_max_epochs)),
+        "--guided-min-epochs",
+        str(int(args.guided_min_epochs)),
+        "--guided-restarts",
+        str(max(1, int(args.guided_restarts))),
+        "--results-root",
+        str(args.results_root),
+        "--results-timestamp",
+        str(stage_timestamp),
+        "--signatures-dir",
+        str(args.signatures_dir),
+    ]
     _append_optional_arg(command, "--dataset-config", args.dataset_config)
     if bool(args.prompt_hf_login):
         command.append("--prompt-hf-login")
@@ -687,6 +773,15 @@ def _extract_stage_a_rankings(*, aggregate_path: Path) -> dict[str, list[dict[st
     aggregate_payload = _load_json(aggregate_path)
     if not isinstance(aggregate_payload, dict):
         raise ValueError(f"Unexpected Stage A payload at {aggregate_path}")
+    if str(aggregate_payload.get("kind")) == "mcqa_plot_layer":
+        rankings = aggregate_payload.get("rankings_by_var", {})
+        if not isinstance(rankings, dict):
+            raise ValueError(f"Malformed PLOT layer payload at {aggregate_path}")
+        return {
+            str(target_var): [dict(entry) for entry in entries if isinstance(entry, dict)]
+            for target_var, entries in rankings.items()
+            if isinstance(entries, list)
+        }
     if str(aggregate_path.name) == "layer_sweep_manifest.json":
         return _stage_a_rankings_from_layer_sweep(manifest_path=aggregate_path, manifest_payload=aggregate_payload)
     return _stage_a_rankings_from_joint_run(aggregate_path=aggregate_path, aggregate_payload=aggregate_payload)
@@ -754,6 +849,9 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
         layer_payload = _load_json(payload_path)
         if not isinstance(layer_payload, dict):
             continue
+        localization_runtime_seconds = float(
+            layer_payload.get("localization_runtime_seconds", layer_payload.get("runtime_seconds", 0.0))
+        )
         layer = int(layer_payload.get("layer"))
         token_position_id = str(layer_payload.get("token_position_id"))
         basis_source_mode = str(layer_payload.get("basis_source_mode"))
@@ -787,8 +885,8 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
                     "selection_score": _selection_score(result),
                     "epsilon": epsilon,
                     "site_label": result.get("site_label"),
-                    "runtime_seconds": method_payload.get("runtime_seconds"),
-                    "wall_runtime_seconds": method_payload.get("wall_runtime_seconds"),
+                    "runtime_seconds": float(localization_runtime_seconds),
+                    "wall_runtime_seconds": float(localization_runtime_seconds),
                     "signature_prepare_runtime_seconds": method_payload.get("signature_prepare_runtime_seconds"),
                     "layer_payload_path": str(payload_path),
                 }
@@ -826,105 +924,107 @@ def _format_stage_b_summary(*, rankings: dict[str, list[dict[str, object]]]) -> 
     return "\n".join(lines)
 
 
-def _extract_native_rankings(*, payload_paths: Iterable[Path]) -> tuple[dict[str, list[dict[str, object]]], dict[str, list[dict[str, object]]], dict[str, list[dict[str, object]]]]:
-    ot_rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
-    guided_rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
-    a_only_rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
-    grouped_ot: dict[tuple[str, int, int], dict[str, object]] = {}
-    seen_full_das_paths: set[str] = set()
+def _extract_native_support_rankings(*, payload_paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
+    rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     for payload_path in payload_paths:
         payload = _load_json(payload_path)
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or str(payload.get("kind")) != "mcqa_plot_native_support_layer":
             continue
         layer = int(payload.get("layer"))
-        resolution = int(payload.get("resolution"))
-        for ot_path_str in payload.get("ot_output_paths", []):
-            compare_payload = _load_json(Path(str(ot_path_str)))
-            if not isinstance(compare_payload, dict):
+        atomic_width = int(payload.get("atomic_width"))
+        runtime_seconds = float(payload.get("localization_runtime_seconds", payload.get("runtime_seconds", 0.0)))
+        method_by_var = payload.get("method_by_var", {})
+        support_by_var = payload.get("support_by_var", {})
+        for target_var, method_summary in method_by_var.items():
+            if not isinstance(method_summary, dict):
                 continue
-            epsilon = float(compare_payload.get("ot_epsilon", -1.0))
-            for method_payload in compare_payload.get("method_payloads", {}).get("ot", []):
-                if not isinstance(method_payload, dict):
-                    continue
-                results = method_payload.get("results", [])
-                if not results or not isinstance(results[0], dict):
-                    continue
-                result = results[0]
-                target_var = str(method_payload.get("target_var") or result.get("variable"))
-                entry = {
-                    "variable": target_var,
-                    "layer": layer,
-                    "resolution": resolution,
-                    "exact_acc": float(result.get("exact_acc", -1.0)),
-                    "selection_score": _selection_score(result),
-                    "epsilon": epsilon,
-                    "site_label": result.get("site_label"),
-                    "runtime_seconds": method_payload.get("runtime_seconds"),
-                    "wall_runtime_seconds": method_payload.get("wall_runtime_seconds"),
-                    "signature_prepare_runtime_seconds": method_payload.get("signature_prepare_runtime_seconds"),
+            support_summary = support_by_var.get(str(target_var), {}) if isinstance(support_by_var, dict) else {}
+            top_site_label = None
+            if isinstance(support_summary, dict):
+                ranked_site_labels = support_summary.get("ranked_site_labels", [])
+                if isinstance(ranked_site_labels, list) and ranked_site_labels:
+                    top_site_label = ranked_site_labels[0]
+            rankings.setdefault(str(target_var), []).append(
+                {
+                    "variable": str(target_var),
+                    "layer": int(layer),
+                    "atomic_width": int(atomic_width),
+                    "exact_acc": float(method_summary.get("exact_acc", 0.0)),
+                    "selection_score": float(method_summary.get("selection_score", 0.0)),
+                    "epsilon": float(method_summary.get("epsilon", 0.0)),
+                    "site_label": top_site_label or method_summary.get("site_label"),
+                    "runtime_seconds": float(runtime_seconds),
                     "payload_path": str(payload_path),
                 }
-                key = (target_var, layer, resolution)
-                current = grouped_ot.get(key)
-                if current is None or _score_tuple(entry) > _score_tuple(current):
-                    grouped_ot[key] = entry
-        block_output_paths = payload.get("block_output_paths", {})
-        if isinstance(block_output_paths, dict):
-            for target_var, block_path_str in block_output_paths.items():
-                block_payload = _load_json(Path(str(block_path_str)))
-                if not isinstance(block_payload, dict):
-                    continue
-                results = block_payload.get("results", [])
-                if not results or not isinstance(results[0], dict):
-                    continue
-                result = results[0]
-                guided_rankings.setdefault(str(target_var), []).append(
-                    {
-                        "variable": str(target_var),
-                        "layer": layer,
-                        "resolution": resolution,
-                        "exact_acc": float(result.get("exact_acc", -1.0)),
-                        "selection_score": _selection_score(result),
-                        "site_label": result.get("site_label"),
-                        "subspace_dim": result.get("subspace_dim"),
-                        "site_total_dim": result.get("site_total_dim"),
-                        "runtime_seconds": block_payload.get("runtime_seconds"),
-                    }
-                )
-        full_das_path = str(payload.get("das_full_output_path", ""))
-        if full_das_path and full_das_path not in seen_full_das_paths and Path(full_das_path).exists():
-            seen_full_das_paths.add(full_das_path)
-            full_payload = _load_json(Path(full_das_path))
-            if isinstance(full_payload, dict):
-                runtime_by_var: dict[str, object] = {}
-                method_payloads = full_payload.get("method_payloads", {})
-                if isinstance(method_payloads, dict):
-                    for method_payload in method_payloads.get("das", []):
-                        if isinstance(method_payload, dict):
-                            runtime_by_var[str(method_payload.get("target_var"))] = method_payload.get("runtime_seconds")
-                for result in full_payload.get("results", []):
-                    if not isinstance(result, dict):
-                        continue
-                    target_var = str(result.get("variable"))
-                    a_only_rankings.setdefault(target_var, []).append(
-                        {
-                            "variable": target_var,
-                            "layer": layer,
-                            "resolution": resolution,
-                            "exact_acc": float(result.get("exact_acc", -1.0)),
-                            "selection_score": _selection_score(result),
-                            "site_label": result.get("site_label"),
-                            "subspace_dim": result.get("subspace_dim"),
-                            "site_total_dim": result.get("site_total_dim"),
-                            "runtime_seconds": runtime_by_var.get(target_var),
-                        }
-                    )
-    for entry in grouped_ot.values():
-        ot_rankings.setdefault(str(entry["variable"]), []).append(entry)
-    for board in (ot_rankings, guided_rankings, a_only_rankings):
-        for target_var in list(board):
-            board[target_var] = _sort_best_first(board[target_var])
-    return ot_rankings, guided_rankings, a_only_rankings
+            )
+    for target_var in list(rankings):
+        rankings[target_var] = _sort_best_first(rankings[target_var])
+    return rankings
+
+
+def _extract_layer_das_rankings(*, payload_paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
+    rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+    for payload_path in payload_paths:
+        payload = _load_json(payload_path)
+        if not isinstance(payload, dict) or str(payload.get("kind")) != "mcqa_plot_das_layer":
+            continue
+        layer = int(payload.get("layer"))
+        runtime_seconds = float(payload.get("runtime_seconds", 0.0))
+        method_payloads = payload.get("method_payloads", {}).get("das", [])
+        for method_payload in method_payloads:
+            if not isinstance(method_payload, dict):
+                continue
+            results = method_payload.get("results", [])
+            if not results or not isinstance(results[0], dict):
+                continue
+            result = results[0]
+            target_var = str(method_payload.get("target_var") or result.get("variable"))
+            rankings.setdefault(target_var, []).append(
+                {
+                    "variable": target_var,
+                    "layer": int(layer),
+                    "exact_acc": float(result.get("exact_acc", 0.0)),
+                    "selection_score": _selection_score(result),
+                    "site_label": result.get("site_label"),
+                    "subspace_dim": result.get("subspace_dim"),
+                    "site_total_dim": result.get("site_total_dim"),
+                    "runtime_seconds": float(runtime_seconds),
+                }
+            )
+    for target_var in list(rankings):
+        rankings[target_var] = _sort_best_first(rankings[target_var])
+    return rankings
+
+
+def _extract_native_support_das_rankings(*, payload_paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
+    rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+    for payload_path in payload_paths:
+        payload = _load_json(payload_path)
+        if not isinstance(payload, dict) or str(payload.get("kind")) != "mcqa_plot_das_native_support":
+            continue
+        layer = int(payload.get("layer"))
+        for target_var, das_payload in payload.get("payloads_by_var", {}).items():
+            if not isinstance(das_payload, dict):
+                continue
+            results = das_payload.get("results", [])
+            if not results or not isinstance(results[0], dict):
+                continue
+            result = results[0]
+            rankings.setdefault(str(target_var), []).append(
+                {
+                    "variable": str(target_var),
+                    "layer": int(layer),
+                    "exact_acc": float(result.get("exact_acc", 0.0)),
+                    "selection_score": _selection_score(result),
+                    "site_label": result.get("site_label"),
+                    "subspace_dim": result.get("subspace_dim"),
+                    "site_total_dim": result.get("site_total_dim"),
+                    "runtime_seconds": float(das_payload.get("runtime_seconds", payload.get("runtime_seconds", 0.0))),
+                }
+            )
+    for target_var in list(rankings):
+        rankings[target_var] = _sort_best_first(rankings[target_var])
+    return rankings
 
 
 def _format_native_summary(*, title: str, rankings: dict[str, list[dict[str, object]]]) -> str:
@@ -932,9 +1032,10 @@ def _format_native_summary(*, title: str, rankings: dict[str, list[dict[str, obj
     for target_var in DEFAULT_TARGET_VARS:
         lines.append(f"[{target_var}]")
         for entry in rankings.get(target_var, []):
+            width_value = entry.get("resolution", entry.get("atomic_width"))
             parts = [
                 f"layer={int(entry['layer'])}",
-                f"res={entry.get('resolution')}",
+                f"width={width_value}",
                 f"exact={float(entry['exact_acc']):.4f}",
                 f"cal={float(entry['selection_score']):.4f}",
             ]
@@ -980,6 +1081,7 @@ def _extract_stage_c_rankings(*, payload_paths: Iterable[Path]) -> dict[str, lis
         layer_payload = _load_json(payload_path)
         if not isinstance(layer_payload, dict):
             continue
+        guided_summary_runtime = float(layer_payload.get("runtime_seconds", 0.0))
         layer = int(layer_payload.get("layer"))
         token_position_id = str(layer_payload.get("token_position_id"))
         basis_source_mode = str(layer_payload.get("basis_source_mode"))
@@ -1011,7 +1113,7 @@ def _extract_stage_c_rankings(*, payload_paths: Iterable[Path]) -> dict[str, lis
                     "site_label": result.get("site_label"),
                     "subspace_dim": result.get("subspace_dim"),
                     "site_total_dim": result.get("site_total_dim"),
-                    "runtime_seconds": guided_payload.get("runtime_seconds"),
+                    "runtime_seconds": float(guided_payload.get("runtime_seconds", guided_summary_runtime)),
                     "layer_payload_path": str(payload_path),
                 }
             )
@@ -1150,12 +1252,12 @@ def main() -> None:
 
     stage_a_rankings_by_token: dict[str, dict[str, list[dict[str, object]]]] = {}
     stage_a_summary_paths: list[Path] = []
-    if "stage_a_layer_ot" in normalized["stages"]:
+    if "stage_a_plot_layer" in normalized["stages"]:
         for token_position_id in normalized["stage_a_token_position_ids"]:
             stage_name = f"stage_a_{str(token_position_id)}"
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageA_{str(token_position_id)}"
-            run_root = results_root / f"{stage_timestamp}_mcqa_layer_sweep"
-            stage_output = run_root / "layer_sweep_manifest.json"
+            run_root = results_root / f"{stage_timestamp}_mcqa_plot_layer"
+            stage_output = run_root / f"mcqa_plot_layer_pos-{str(token_position_id)}_sig-{str(args.signature_mode)}.json"
             ranking_json_path = sweep_root / f"stage_a_{str(token_position_id)}_layer_rankings.json"
             ranking_txt_path = sweep_root / f"stage_a_{str(token_position_id)}_layer_rankings.txt"
             if _stage_output_is_valid(stage_output) and _stage_output_is_valid(ranking_json_path):
@@ -1181,8 +1283,8 @@ def main() -> None:
                 continue
             stage = SweepStage(
                 name=stage_name,
-                category="stage_a_layer_ot",
-                description=f"All-layer full-vector OT discovery at token position {token_position_id}.",
+                category="stage_a_plot_layer",
+                description=f"Joint layer-level OT discovery at token position {token_position_id}.",
                 stage_timestamp=stage_timestamp,
                 command=_build_stage_a_command(
                     args=args,
@@ -1242,7 +1344,7 @@ def main() -> None:
                     stage_a_summary_paths.append(ranking_json_path)
 
     native_payload_paths: list[Path] = []
-    if "stage_b_native_ot" in normalized["stages"]:
+    if "stage_b_plot_native_support" in normalized["stages"]:
         for token_position_id, rankings in stage_a_rankings_by_token.items():
             if str(token_position_id) != "last_token":
                 continue
@@ -1256,20 +1358,23 @@ def main() -> None:
                 continue
             stage_name = f"stage_b_native_{str(token_position_id)}"
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_native_{str(token_position_id)}"
-            native_root = results_root / f"{stage_timestamp}_mcqa_ot_das_block_focus"
+            native_root = results_root / f"{stage_timestamp}_mcqa_plot_native_support"
             expected_outputs = [str(native_root / "layer_sweep_manifest.json")]
             for layer in selected_layers:
-                for resolution in normalized["native_block_resolutions"]:
-                    expected_outputs.append(
-                        str(
-                            native_root
-                            / f"layer_{int(layer):02d}"
-                            / (
-                                f"mcqa_layer-{int(layer)}_pos-last_token_res-{int(resolution)}"
-                                f"_sig-{str(args.signature_mode)}_ot_das_block.json"
-                            )
+                native_widths = tuple(int(width) for width in normalized["native_block_resolutions"])
+                atomic_width = native_widths[0]
+                for width in native_widths[1:]:
+                    atomic_width = math.gcd(int(atomic_width), int(width))
+                expected_outputs.append(
+                    str(
+                        native_root
+                        / f"layer_{int(layer):02d}"
+                        / (
+                            f"mcqa_plot_native_support_layer-{int(layer)}_pos-last_token"
+                            f"_atomic-{int(atomic_width if atomic_width > 0 else 1)}_sig-{str(args.signature_mode)}.json"
                         )
                     )
+                )
             if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
                 native_payload_paths.extend(Path(path) for path in expected_outputs[1:])
                 _mark_stage(
@@ -1289,8 +1394,8 @@ def main() -> None:
                 continue
             stage = SweepStage(
                 name=stage_name,
-                category="stage_b_native_ot",
-                description=f"Native block OT and guided DAS for selected {token_position_id} layers {list(selected_layers)}.",
+                category="stage_b_plot_native_support",
+                description=f"Native support localization for selected {token_position_id} layers {list(selected_layers)}.",
                 stage_timestamp=stage_timestamp,
                 command=_build_native_block_command(
                     args=args,
@@ -1335,26 +1440,90 @@ def main() -> None:
                     "completed_at": datetime.now().isoformat(),
                 },
             )
-        native_ot_rankings, native_guided_rankings, a_only_rankings = _extract_native_rankings(payload_paths=native_payload_paths)
-        _write_json(sweep_root / "stage_b_native_rankings.json", native_ot_rankings)
+        native_ot_rankings = _extract_native_support_rankings(payload_paths=native_payload_paths)
+        _write_json(sweep_root / "stage_b_native_support_rankings.json", native_ot_rankings)
         _write_text(
-            sweep_root / "stage_b_native_rankings.txt",
-            _format_native_summary(title="MCQA Hierarchical Stage B Native OT Ranking", rankings=native_ot_rankings),
+            sweep_root / "stage_b_native_support_rankings.txt",
+            _format_native_summary(title="MCQA Hierarchical Stage B Native Support Ranking", rankings=native_ot_rankings),
         )
-        _write_json(sweep_root / "stage_c_native_guided_rankings.json", native_guided_rankings)
+
+    if "stage_c_plot_das_layer" in normalized["stages"]:
+        layer_das_payload_paths: list[Path] = []
+        for token_position_id, rankings in stage_a_rankings_by_token.items():
+            selected_layers = _select_stage_b_layers(
+                rankings=rankings,
+                top_layers_per_var=int(args.stage_b_top_layers_per_var),
+                neighbor_radius=int(args.stage_b_neighbor_radius),
+                max_layers_per_var=int(args.stage_b_max_layers_per_var),
+            )
+            for layer in selected_layers:
+                stage_name = f"stage_c_layer_{str(token_position_id)}_L{int(layer):02d}"
+                stage_timestamp = f"{str(normalized['results_timestamp'])}_stageC_layer_{str(token_position_id)}_L{int(layer):02d}"
+                run_root = results_root / f"{stage_timestamp}_mcqa_plot_das_layer"
+                payload_path = run_root / f"layer_{int(layer):02d}" / f"mcqa_plot_das_layer_layer-{int(layer)}_pos-{str(token_position_id)}_summary.json"
+                if not _stage_output_is_valid(payload_path):
+                    stage = SweepStage(
+                        name=stage_name,
+                        category="stage_c_plot_das_layer",
+                        description=f"Standalone layer DAS for token position {token_position_id} layer {int(layer)}.",
+                        stage_timestamp=stage_timestamp,
+                        command=_build_layer_das_command(
+                            args=args,
+                            normalized=normalized,
+                            stage_timestamp=stage_timestamp,
+                            token_position_id=str(token_position_id),
+                            layer=int(layer),
+                        ),
+                        expected_outputs=(str(payload_path),),
+                    )
+                    _run_stage_command(stage=stage, repo_root=repo_root)
+                if _stage_output_is_valid(payload_path):
+                    layer_das_payload_paths.append(payload_path)
+        layer_das_rankings = _extract_layer_das_rankings(payload_paths=layer_das_payload_paths)
+        _write_json(sweep_root / "stage_c_layer_das_rankings.json", layer_das_rankings)
         _write_text(
-            sweep_root / "stage_c_native_guided_rankings.txt",
-            _format_native_summary(title="MCQA Hierarchical Stage C Native Guided DAS Ranking", rankings=native_guided_rankings),
+            sweep_root / "stage_c_layer_das_rankings.txt",
+            _format_native_summary(title="MCQA Hierarchical Stage C Layer DAS Ranking", rankings=layer_das_rankings),
         )
-        _write_json(sweep_root / "stage_c_a_only_rankings.json", a_only_rankings)
+
+    if "stage_c_plot_das_native_support" in normalized["stages"] and native_payload_paths:
+        native_das_payload_paths: list[Path] = []
+        for native_payload_path in native_payload_paths:
+            native_payload = _load_json(native_payload_path)
+            if not isinstance(native_payload, dict):
+                continue
+            layer = int(native_payload.get("layer"))
+            stage_name = f"stage_c_native_L{int(layer):02d}"
+            stage_timestamp = f"{str(normalized['results_timestamp'])}_stageC_native_L{int(layer):02d}"
+            run_root = results_root / f"{stage_timestamp}_mcqa_plot_das_native_support"
+            payload_path = run_root / f"layer_{int(layer):02d}" / f"mcqa_plot_das_native_support_layer-{int(layer)}_summary.json"
+            if not _stage_output_is_valid(payload_path):
+                stage = SweepStage(
+                    name=stage_name,
+                    category="stage_c_plot_das_native_support",
+                    description=f"Standalone native-support DAS for layer {int(layer)}.",
+                    stage_timestamp=stage_timestamp,
+                    command=_build_native_support_das_command(
+                        args=args,
+                        normalized=normalized,
+                        stage_timestamp=stage_timestamp,
+                        native_support_path=native_payload_path,
+                    ),
+                    expected_outputs=(str(payload_path),),
+                )
+                _run_stage_command(stage=stage, repo_root=repo_root)
+            if _stage_output_is_valid(payload_path):
+                native_das_payload_paths.append(payload_path)
+        native_das_rankings = _extract_native_support_das_rankings(payload_paths=native_das_payload_paths)
+        _write_json(sweep_root / "stage_c_native_support_das_rankings.json", native_das_rankings)
         _write_text(
-            sweep_root / "stage_c_a_only_rankings.txt",
-            _format_native_summary(title="MCQA Hierarchical Stage C A-only DAS Ranking", rankings=a_only_rankings),
+            sweep_root / "stage_c_native_support_das_rankings.txt",
+            _format_native_summary(title="MCQA Hierarchical Stage C Native Support DAS Ranking", rankings=native_das_rankings),
         )
 
     stage_b_payload_paths: list[Path] = []
     stage_b_rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
-    if "stage_b_pca_ot" in normalized["stages"]:
+    if "stage_b_plot_pca_support" in normalized["stages"]:
         for token_position_id, rankings in stage_a_rankings_by_token.items():
             selected_layers = _select_stage_b_layers(
                 rankings=rankings,
@@ -1390,7 +1559,7 @@ def main() -> None:
                                     / f"layer_{int(layer):02d}"
                                     / (
                                         f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
-                                        f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_ot_pca.json"
+                                        f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_plot_pca_support.json"
                                     )
                                 )
                             )
@@ -1413,7 +1582,7 @@ def main() -> None:
                             continue
                         stage = SweepStage(
                             name=stage_name,
-                            category="stage_b_pca_ot",
+                            category="stage_b_plot_pca_support",
                             description=(
                                 f"PCA OT refinement at token position {token_position_id}, "
                                 f"basis={basis_source_mode}, menu={site_menu}, bands={num_bands}, "
@@ -1469,18 +1638,18 @@ def main() -> None:
                             },
                         )
         stage_b_rankings = _extract_stage_b_best_configs(payload_paths=stage_b_payload_paths)
-        stage_b_json_path = sweep_root / "stage_b_pca_rankings.json"
-        stage_b_txt_path = sweep_root / "stage_b_pca_rankings.txt"
+        stage_b_json_path = sweep_root / "stage_b_pca_support_rankings.json"
+        stage_b_txt_path = sweep_root / "stage_b_pca_support_rankings.txt"
         _write_json(stage_b_json_path, stage_b_rankings)
         _write_text(stage_b_txt_path, _format_stage_b_summary(rankings=stage_b_rankings))
     else:
-        stage_b_json_path = sweep_root / "stage_b_pca_rankings.json"
+        stage_b_json_path = sweep_root / "stage_b_pca_support_rankings.json"
         if _stage_output_is_valid(stage_b_json_path):
             payload = _load_json(stage_b_json_path)
             if isinstance(payload, dict):
                 stage_b_rankings = payload
 
-    if "stage_c_guided_das" in normalized["stages"]:
+    if "stage_c_plot_das_pca_support" in normalized["stages"]:
         selected_config_groups = _select_stage_c_configs(
             rankings=stage_b_rankings,
             top_configs_per_var=int(args.stage_c_top_configs_per_var),
@@ -1510,7 +1679,17 @@ def main() -> None:
                         / f"layer_{int(layer):02d}"
                         / (
                             f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
-                            f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_ot_pca.json"
+                            f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_plot_pca_support.json"
+                        )
+                    )
+                )
+                expected_outputs.append(
+                    str(
+                        sweep_run_root
+                        / f"layer_{int(layer):02d}"
+                        / (
+                            f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
+                            f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_plot_das_pca_support.json"
                         )
                     )
                 )
@@ -1526,7 +1705,7 @@ def main() -> None:
                         )
                     )
             if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
-                stage_c_payload_paths.extend(Path(path) for path in expected_outputs if path.endswith("_ot_pca.json"))
+                stage_c_payload_paths.extend(Path(path) for path in expected_outputs if path.endswith("_plot_das_pca_support.json"))
                 _mark_stage(
                     manifest_path=manifest_path,
                     repo_root=repo_root,
@@ -1544,7 +1723,7 @@ def main() -> None:
                 continue
             stage = SweepStage(
                 name=stage_name,
-                category="stage_c_guided_das",
+                category="stage_c_plot_das_pca_support",
                 description=(
                     f"Guided DAS on selected PCA OT config token_position={token_position_id}, "
                     f"basis={basis_source_mode}, menu={site_menu}, bands={num_bands}, layers={list(layers)}."
@@ -1581,7 +1760,7 @@ def main() -> None:
             missing_outputs = [path for path in expected_outputs if not _stage_output_is_valid(Path(path))]
             if missing_outputs:
                 raise RuntimeError(f"Stage {stage_name} missing outputs: {missing_outputs}")
-            stage_c_payload_paths.extend(Path(path) for path in expected_outputs if path.endswith("_ot_pca.json"))
+            stage_c_payload_paths.extend(Path(path) for path in expected_outputs if path.endswith("_plot_das_pca_support.json"))
             _mark_stage(
                 manifest_path=manifest_path,
                 repo_root=repo_root,
@@ -1599,8 +1778,8 @@ def main() -> None:
                 },
             )
         stage_c_rankings = _extract_stage_c_rankings(payload_paths=stage_c_payload_paths)
-        stage_c_json_path = sweep_root / "stage_c_guided_rankings.json"
-        stage_c_txt_path = sweep_root / "stage_c_guided_rankings.txt"
+        stage_c_json_path = sweep_root / "stage_c_pca_support_das_rankings.json"
+        stage_c_txt_path = sweep_root / "stage_c_pca_support_das_rankings.txt"
         _write_json(stage_c_json_path, stage_c_rankings)
         _write_text(stage_c_txt_path, _format_stage_c_summary(rankings=stage_c_rankings))
 
