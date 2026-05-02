@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import subprocess
 import sys
@@ -29,7 +28,7 @@ DEFAULT_PCA_NUM_BANDS_VALUES = (8, 16)
 DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_PCA_TOP_PREFIX_SIZES = (8, 16, 32, 64)
 DEFAULT_GUIDED_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
-DEFAULT_NATIVE_BLOCK_RESOLUTIONS = (128, 144, 192, 256, 288, 384, 576, 768)
+DEFAULT_NATIVE_RESOLUTIONS = [16, 32, 128, 256]
 DEFAULT_DAS_SUBSPACE_DIMS = (
     32,
     64,
@@ -111,6 +110,17 @@ def _selection_score(record: dict[str, object]) -> float:
     if "calibration_exact_acc" in record and record["calibration_exact_acc"] is not None:
         return float(record["calibration_exact_acc"])
     return -1.0
+
+
+def _normalize_native_resolutions(value: object) -> tuple[int, ...]:
+    if isinstance(value, (list, tuple, set)):
+        resolved = [int(item) for item in value]
+    else:
+        resolved = [int(value)]
+    filtered = [int(item) for item in resolved if int(item) > 0]
+    if not filtered:
+        raise ValueError("DEFAULT_NATIVE_RESOLUTIONS must contain at least one positive width")
+    return tuple(dict.fromkeys(filtered))
 
 
 def _best_result_record(payloads: Iterable[dict[str, object]]) -> dict[str, object] | None:
@@ -244,7 +254,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-b-top-layers-per-var", type=int, default=1)
     parser.add_argument("--stage-b-neighbor-radius", type=int, default=0)
     parser.add_argument("--stage-b-max-layers-per-var", type=int, default=1)
-    parser.add_argument("--native-block-resolutions", default="128,144,192,256,288,384,576,768")
+    parser.add_argument(
+        "--native-resolutions",
+        default=None,
+        help="Comma-separated native OT widths. Default: values from DEFAULT_NATIVE_RESOLUTIONS.",
+    )
     parser.add_argument("--pca-site-menus", default="partition,mixed")
     parser.add_argument("--pca-basis-source-modes", default="pair_bank,all_variants")
     parser.add_argument("--pca-num-bands-values", default="8,16")
@@ -256,7 +270,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guided-min-epochs", type=int, default=5)
     parser.add_argument("--screen-restarts", type=int, default=1)
     parser.add_argument("--guided-restarts", type=int, default=2)
-    parser.add_argument("--guided-subspace-dims", default="32,64,96,128,256,512,768,1024,1536,2048,2304")
+    parser.add_argument(
+        "--guided-subspace-dims",
+        default=None,
+        help="Optional comma-separated guided DAS dims override. Native support defaults to the standard DAS grid clipped to the support width.",
+    )
     parser.add_argument("--full-das-output", type=Path, action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument(
         "--regular-das-subspace-dims",
@@ -279,7 +297,9 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     pca_basis_source_modes = _parse_csv_strings(args.pca_basis_source_modes) or DEFAULT_PCA_BASIS_SOURCE_MODES
     pca_num_bands_values = _parse_csv_ints(args.pca_num_bands_values) or DEFAULT_PCA_NUM_BANDS_VALUES
     pca_top_prefix_sizes = _parse_csv_ints(args.pca_top_prefix_sizes) or DEFAULT_PCA_TOP_PREFIX_SIZES
-    native_block_resolutions = _parse_csv_ints(args.native_block_resolutions) or DEFAULT_NATIVE_BLOCK_RESOLUTIONS
+    native_resolutions = _normalize_native_resolutions(
+        _parse_csv_ints(args.native_resolutions) or DEFAULT_NATIVE_RESOLUTIONS
+    )
     ot_epsilons = _parse_csv_floats(args.ot_epsilons) or DEFAULT_OT_EPSILONS
     ot_top_k_values = _parse_csv_ints(args.ot_top_k_values) or DEFAULT_OT_TOP_K_VALUES
     ot_lambdas = _parse_csv_floats(args.ot_lambdas) or DEFAULT_OT_LAMBDAS
@@ -303,7 +323,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "pca_basis_source_modes": tuple(str(mode) for mode in pca_basis_source_modes),
         "pca_num_bands_values": tuple(int(value) for value in pca_num_bands_values),
         "pca_top_prefix_sizes": tuple(int(size) for size in pca_top_prefix_sizes),
-        "native_block_resolutions": tuple(int(resolution) for resolution in native_block_resolutions),
+        "native_resolutions": tuple(int(resolution) for resolution in native_resolutions),
         "ot_epsilons": tuple(float(epsilon) for epsilon in ot_epsilons),
         "ot_top_k_values": tuple(int(value) for value in ot_top_k_values),
         "ot_lambdas": tuple(float(value) for value in ot_lambdas),
@@ -478,8 +498,8 @@ def _build_native_block_command(
         str(int(args.batch_size)),
         "--layers",
         ",".join(str(layer) for layer in layers),
-        "--block-resolutions",
-        ",".join(str(resolution) for resolution in normalized["native_block_resolutions"]),
+        "--native-resolutions",
+        ",".join(str(resolution) for resolution in normalized["native_resolutions"]),
         "--ot-epsilons",
         ",".join(str(epsilon).rstrip("0").rstrip(".") if "." in str(epsilon) else str(epsilon) for epsilon in normalized["ot_epsilons"]),
         "--signature-mode",
@@ -579,8 +599,6 @@ def _build_native_support_das_command(
         str(native_support_path),
         "--guided-mask-names",
         ",".join(str(mask_name) for mask_name in normalized["guided_mask_names"]),
-        "--guided-subspace-dims",
-        ",".join(str(dim) for dim in normalized["guided_subspace_dims"] or DEFAULT_DAS_SUBSPACE_DIMS),
         "--guided-max-epochs",
         str(int(args.guided_max_epochs)),
         "--guided-min-epochs",
@@ -594,6 +612,13 @@ def _build_native_support_das_command(
         "--signatures-dir",
         str(args.signatures_dir),
     ]
+    if normalized["guided_subspace_dims"] is not None:
+        command.extend(
+            [
+                "--guided-subspace-dims",
+                ",".join(str(dim) for dim in normalized["guided_subspace_dims"]),
+            ]
+        )
     _append_optional_arg(command, "--dataset-config", args.dataset_config)
     if bool(args.prompt_hf_login):
         command.append("--prompt-hf-login")
@@ -931,7 +956,7 @@ def _extract_native_support_rankings(*, payload_paths: Iterable[Path]) -> dict[s
         if not isinstance(payload, dict) or str(payload.get("kind")) != "mcqa_plot_native_support_layer":
             continue
         layer = int(payload.get("layer"))
-        atomic_width = int(payload.get("atomic_width"))
+        native_resolution = int(payload.get("native_resolution", payload.get("atomic_width")))
         runtime_seconds = float(payload.get("localization_runtime_seconds", payload.get("runtime_seconds", 0.0)))
         method_by_var = payload.get("method_by_var", {})
         support_by_var = payload.get("support_by_var", {})
@@ -948,7 +973,7 @@ def _extract_native_support_rankings(*, payload_paths: Iterable[Path]) -> dict[s
                 {
                     "variable": str(target_var),
                     "layer": int(layer),
-                    "atomic_width": int(atomic_width),
+                    "native_resolution": int(native_resolution),
                     "exact_acc": float(method_summary.get("exact_acc", 0.0)),
                     "selection_score": float(method_summary.get("selection_score", 0.0)),
                     "epsilon": float(method_summary.get("epsilon", 0.0)),
@@ -1003,6 +1028,7 @@ def _extract_native_support_das_rankings(*, payload_paths: Iterable[Path]) -> di
         if not isinstance(payload, dict) or str(payload.get("kind")) != "mcqa_plot_das_native_support":
             continue
         layer = int(payload.get("layer"))
+        native_resolution = int(payload.get("native_resolution", payload.get("atomic_width")))
         for target_var, das_payload in payload.get("payloads_by_var", {}).items():
             if not isinstance(das_payload, dict):
                 continue
@@ -1014,6 +1040,7 @@ def _extract_native_support_das_rankings(*, payload_paths: Iterable[Path]) -> di
                 {
                     "variable": str(target_var),
                     "layer": int(layer),
+                    "native_resolution": int(native_resolution),
                     "exact_acc": float(result.get("exact_acc", 0.0)),
                     "selection_score": _selection_score(result),
                     "site_label": result.get("site_label"),
@@ -1032,7 +1059,7 @@ def _format_native_summary(*, title: str, rankings: dict[str, list[dict[str, obj
     for target_var in DEFAULT_TARGET_VARS:
         lines.append(f"[{target_var}]")
         for entry in rankings.get(target_var, []):
-            width_value = entry.get("resolution", entry.get("atomic_width"))
+            width_value = entry.get("native_resolution", entry.get("resolution", entry.get("atomic_width")))
             parts = [
                 f"layer={int(entry['layer'])}",
                 f"width={width_value}",
@@ -1186,7 +1213,7 @@ def _write_status(
             "stage_b_neighbor_radius": int(args.stage_b_neighbor_radius),
             "stage_b_max_layers_per_var": int(args.stage_b_max_layers_per_var),
             "stage_c_top_configs_per_var": int(args.stage_c_top_configs_per_var),
-            "native_block_resolutions": list(normalized["native_block_resolutions"]),
+            "native_resolutions": list(normalized["native_resolutions"]),
             "pca_site_menus": list(normalized["pca_site_menus"]),
             "pca_basis_source_modes": list(normalized["pca_basis_source_modes"]),
             "pca_num_bands_values": list(normalized["pca_num_bands_values"]),
@@ -1360,21 +1387,19 @@ def main() -> None:
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_native_{str(token_position_id)}"
             native_root = results_root / f"{stage_timestamp}_mcqa_plot_native_support"
             expected_outputs = [str(native_root / "layer_sweep_manifest.json")]
+            native_resolutions = tuple(int(width) for width in normalized["native_resolutions"])
             for layer in selected_layers:
-                native_widths = tuple(int(width) for width in normalized["native_block_resolutions"])
-                atomic_width = native_widths[0]
-                for width in native_widths[1:]:
-                    atomic_width = math.gcd(int(atomic_width), int(width))
-                expected_outputs.append(
-                    str(
-                        native_root
-                        / f"layer_{int(layer):02d}"
-                        / (
-                            f"mcqa_plot_native_support_layer-{int(layer)}_pos-last_token"
-                            f"_atomic-{int(atomic_width if atomic_width > 0 else 1)}_sig-{str(args.signature_mode)}.json"
+                for native_resolution in native_resolutions:
+                    expected_outputs.append(
+                        str(
+                            native_root
+                            / f"layer_{int(layer):02d}"
+                            / (
+                                f"mcqa_plot_native_support_layer-{int(layer)}_pos-last_token"
+                                f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}.json"
+                            )
                         )
                     )
-                )
             if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
                 native_payload_paths.extend(Path(path) for path in expected_outputs[1:])
                 _mark_stage(
@@ -1395,7 +1420,10 @@ def main() -> None:
             stage = SweepStage(
                 name=stage_name,
                 category="stage_b_plot_native_support",
-                description=f"Native support localization for selected {token_position_id} layers {list(selected_layers)}.",
+                description=(
+                    f"Native support localization for selected {token_position_id} layers {list(selected_layers)} "
+                    f"across widths {list(native_resolutions)}."
+                ),
                 stage_timestamp=stage_timestamp,
                 command=_build_native_block_command(
                     args=args,
@@ -1493,15 +1521,16 @@ def main() -> None:
             if not isinstance(native_payload, dict):
                 continue
             layer = int(native_payload.get("layer"))
-            stage_name = f"stage_c_native_L{int(layer):02d}"
-            stage_timestamp = f"{str(normalized['results_timestamp'])}_stageC_native_L{int(layer):02d}"
+            native_resolution = int(native_payload.get("native_resolution", native_payload.get("atomic_width")))
+            stage_name = f"stage_c_native_L{int(layer):02d}_W{int(native_resolution):04d}"
+            stage_timestamp = f"{str(normalized['results_timestamp'])}_stageC_native_L{int(layer):02d}_W{int(native_resolution):04d}"
             run_root = results_root / f"{stage_timestamp}_mcqa_plot_das_native_support"
             payload_path = run_root / f"layer_{int(layer):02d}" / f"mcqa_plot_das_native_support_layer-{int(layer)}_summary.json"
             if not _stage_output_is_valid(payload_path):
                 stage = SweepStage(
                     name=stage_name,
                     category="stage_c_plot_das_native_support",
-                    description=f"Standalone native-support DAS for layer {int(layer)}.",
+                    description=f"Standalone native-support DAS for layer {int(layer)} width {int(native_resolution)}.",
                     stage_timestamp=stage_timestamp,
                     command=_build_native_support_das_command(
                         args=args,

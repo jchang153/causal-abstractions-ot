@@ -128,6 +128,8 @@ def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, 
                 "site_label": str(result.get("site_label", "")),
                 "epsilon": float(epsilon),
                 "selected_hyperparameters": dict(payload.get("selected_hyperparameters", {})),
+                "selected_site_labels": list(result.get("selected_site_labels", [])),
+                "ranking": [dict(entry) for entry in payload.get("ranking", []) if isinstance(entry, dict)],
             }
             previous = best_by_var.get(target_var)
             if previous is None or (
@@ -154,6 +156,8 @@ def _rank_layers_from_support(
         site_evidence = dict(support_summary.get("site_evidence", {}))
         mean_target_site_mass = dict(support_summary.get("mean_target_site_mass", {}))
         best = best_ot_by_var.get(str(target_var), {})
+        selected_hyperparameters = dict(best.get("selected_hyperparameters", {}))
+        selected_site_labels = list(best.get("selected_site_labels", []))
         rankings[str(target_var)] = [
             {
                 "variable": str(target_var),
@@ -165,6 +169,9 @@ def _rank_layers_from_support(
                 "ot_selection_score": float(best.get("selection_score", 0.0)),
                 "epsilon": float(best.get("epsilon", 0.0)),
                 "site_label": sites[site_index].label,
+                "selected_top_k": int(selected_hyperparameters.get("top_k", len(selected_site_labels) or 1)),
+                "selected_lambda": float(selected_hyperparameters.get("lambda", 0.0)),
+                "selected_site_labels": selected_site_labels,
                 "runtime_seconds": float(runtime_seconds),
                 "selection_basis": "support_evidence_from_joint_layer_ot",
             }
@@ -195,6 +202,14 @@ def _format_summary(
             f"eps={float(best.get('epsilon', 0.0)):g} "
             f"site={best.get('site_label')}"
         )
+        selected_hyperparameters = dict(best.get("selected_hyperparameters", {}))
+        selected_site_labels = list(best.get("selected_site_labels", []))
+        if selected_hyperparameters:
+            lines.append(
+                f"selected_handle top_k={int(selected_hyperparameters.get('top_k', len(selected_site_labels) or 1))} "
+                f"lambda={float(selected_hyperparameters.get('lambda', 0.0)):g} "
+                f"layers={selected_site_labels}"
+            )
         support_summary = support_by_var.get(str(target_var), {})
         if support_summary:
             lines.append(

@@ -17,6 +17,7 @@ from mcqa_experiment.support import build_ordered_composite_sites_from_support
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
 DEFAULT_GUIDED_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
+DEFAULT_GUIDED_SUBSPACE_DIMS = (32, 64, 96, 128, 256, 512, 768, 1024, 1536, 2048, 2304)
 
 
 def _parse_csv_strings(value: str | None) -> list[str] | None:
@@ -47,7 +48,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--native-support-path", required=True)
     parser.add_argument("--guided-mask-names", help="Comma-separated support masks. Default: Top1,Top2,Top4,S50,S80")
-    parser.add_argument("--guided-subspace-dims", default="32,64,96,128,256,512,768,1024,1536,2048,2304")
+    parser.add_argument(
+        "--guided-subspace-dims",
+        default=None,
+        help="Optional comma-separated DAS dims override. By default native support uses the standard DAS grid clipped to the support width.",
+    )
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
     parser.add_argument("--guided-restarts", type=int, default=2)
@@ -101,9 +106,15 @@ def _filter_support_summary(support_summary: dict[str, object], mask_names: tupl
     }
 
 
-def _guided_subspace_dims(max_width: int, explicit_dims: tuple[int, ...]) -> tuple[int, ...]:
-    filtered = tuple(int(dim) for dim in explicit_dims if 0 < int(dim) <= int(max_width))
-    return filtered or (int(max_width),)
+def _native_support_subspace_dims(
+    *,
+    support_total_dim: int,
+    explicit_dims: tuple[int, ...] | None,
+) -> tuple[int, ...]:
+    capped_support_total_dim = max(1, int(support_total_dim))
+    candidate_dims = DEFAULT_GUIDED_SUBSPACE_DIMS if explicit_dims is None else tuple(int(dim) for dim in explicit_dims)
+    filtered = tuple(int(dim) for dim in candidate_dims if 0 < int(dim) <= capped_support_total_dim)
+    return filtered or (int(capped_support_total_dim),)
 
 
 def main() -> None:
@@ -115,7 +126,7 @@ def main() -> None:
     native_payload = _load_json(native_support_path)
     layer = int(native_payload["layer"])
     token_position_id = str(native_payload["token_position_id"])
-    atomic_width = int(native_payload["atomic_width"])
+    native_resolution = int(native_payload.get("native_resolution", native_payload["atomic_width"]))
 
     results_root = Path(args.results_root)
     results_timestamp = args.results_timestamp or os.environ.get("RESULTS_TIMESTAMP") or base_run.RUN_TIMESTAMP
@@ -135,12 +146,12 @@ def main() -> None:
         num_layers=int(model.config.num_hidden_layers),
         hidden_size=hidden_size,
         token_position_ids=token_position_ids,
-        resolution=int(atomic_width),
+        resolution=int(native_resolution),
         layers=(int(layer),),
         selected_token_position_ids=(str(token_position_id),),
     )
     mask_names = tuple(_parse_csv_strings(args.guided_mask_names) or list(DEFAULT_GUIDED_MASK_NAMES))
-    explicit_dims = tuple(_parse_csv_ints(args.guided_subspace_dims) or [])
+    explicit_dims = _parse_csv_ints(args.guided_subspace_dims)
 
     layer_dir = sweep_root / f"layer_{int(layer):02d}"
     layer_dir.mkdir(parents=True, exist_ok=True)
@@ -156,8 +167,22 @@ def main() -> None:
         )
         if not support_sites:
             continue
-        max_width = max(int(site_total_width(site, model_hidden_size=hidden_size)) for site in support_sites)
-        subspace_dims = _guided_subspace_dims(max_width, explicit_dims)
+        subspace_dims_by_site_label = {
+            site.label: _native_support_subspace_dims(
+                support_total_dim=int(site_total_width(site, model_hidden_size=hidden_size)),
+                explicit_dims=None if explicit_dims is None else tuple(explicit_dims),
+            )
+            for site in support_sites
+        }
+        unique_subspace_dims = tuple(
+            sorted(
+                {
+                    int(dim)
+                    for site_dims in subspace_dims_by_site_label.values()
+                    for dim in site_dims
+                }
+            )
+        )
         output_path = layer_dir / f"mcqa_plot_das_native_support_layer-{int(layer)}_{str(target_var)}.json"
         summary_path = layer_dir / f"mcqa_plot_das_native_support_layer-{int(layer)}_{str(target_var)}.txt"
         payload = _load_json(output_path) if output_path.exists() else None
@@ -178,7 +203,8 @@ def main() -> None:
                     plateau_patience=int(base_run.DAS_PLATEAU_PATIENCE),
                     plateau_rel_delta=float(base_run.DAS_PLATEAU_REL_DELTA),
                     learning_rate=float(base_run.DAS_LEARNING_RATE),
-                    subspace_dims=subspace_dims,
+                    subspace_dims=unique_subspace_dims,
+                    subspace_dims_by_site_label=subspace_dims_by_site_label,
                     store_candidate_holdout_metrics=False,
                     restarts=max(1, int(args.guided_restarts)),
                     verbose=True,
@@ -186,6 +212,10 @@ def main() -> None:
             )
             payload["support_summary"] = filtered_summary
             payload["mask_names"] = [str(mask_name) for mask_name in mask_names]
+            payload["guided_subspace_dims_by_site_label"] = {
+                str(label): [int(dim) for dim in dims]
+                for label, dims in subspace_dims_by_site_label.items()
+            }
             write_json(output_path, payload)
             write_text_report(
                 summary_path,
@@ -195,7 +225,8 @@ def main() -> None:
                         f"target_var: {target_var}",
                         f"layer: {int(layer)}",
                         f"mask_names: {list(mask_names)}",
-                        f"subspace_dims: {list(int(dim) for dim in subspace_dims)}",
+                        f"unique_subspace_dims: {list(int(dim) for dim in unique_subspace_dims)}",
+                        f"subspace_dims_by_site_label: {payload['guided_subspace_dims_by_site_label']}",
                     ]
                 ),
             )
@@ -205,7 +236,7 @@ def main() -> None:
         "kind": "mcqa_plot_das_native_support",
         "layer": int(layer),
         "token_position_id": str(token_position_id),
-        "atomic_width": int(atomic_width),
+        "native_resolution": int(native_resolution),
         "native_support_path": str(native_support_path),
         "guided_mask_names": [str(mask_name) for mask_name in mask_names],
         "payloads_by_var": payloads_by_var,

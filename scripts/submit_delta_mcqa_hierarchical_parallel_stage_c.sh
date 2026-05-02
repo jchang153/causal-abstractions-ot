@@ -23,8 +23,9 @@ echo "[submit-delta-hpar-c] timestamp=${TIMESTAMP}"
 echo "[submit-delta-hpar-c] delta_account=${DELTA_ACCOUNT}"
 echo "[submit-delta-hpar-c] delta_partition=${DELTA_PARTITION}"
 echo "[submit-delta-hpar-c] array_throttle=${ARRAY_THROTTLE}"
+echo "[submit-delta-hpar-c] native_resolutions=${NATIVE_RESOLUTIONS:-}"
 echo "[submit-delta-hpar-c] regular_das_subspace_dims=${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
-echo "[submit-delta-hpar-c] guided_subspace_dims=${GUIDED_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
+echo "[submit-delta-hpar-c] guided_subspace_dims=${GUIDED_SUBSPACE_DIMS:-auto}"
 echo "[submit-delta-hpar-c] split_seed=${SPLIT_SEED}"
 
 COMMON_ARGS=(
@@ -45,7 +46,6 @@ COMMON_ARGS=(
   --stage-b-top-layers-per-var "${STAGE_B_TOP_LAYERS_PER_VAR:-1}"
   --stage-b-neighbor-radius "${STAGE_B_NEIGHBOR_RADIUS:-0}"
   --stage-b-max-layers-per-var "${STAGE_B_MAX_LAYERS_PER_VAR:-1}"
-  --native-block-resolutions "${NATIVE_BLOCK_RESOLUTIONS:-128,144,192,256,288,384,576,768}"
   --pca-site-menus "${PCA_SITE_MENUS:-partition,mixed}"
   --pca-basis-source-modes "${PCA_BASIS_SOURCE_MODES:-pair_bank,all_variants}"
   --pca-num-bands-values "${PCA_NUM_BANDS_VALUES:-8,16}"
@@ -62,6 +62,9 @@ COMMON_ARGS=(
 
 if [[ -n "${STAGE_A_LAYER_INDICES:-}" ]]; then
   COMMON_ARGS+=(--stage-a-layer-indices "${STAGE_A_LAYER_INDICES}")
+fi
+if [[ -n "${NATIVE_RESOLUTIONS:-}" ]]; then
+  COMMON_ARGS+=(--native-resolutions "${NATIVE_RESOLUTIONS}")
 fi
 if [[ -n "${GUIDED_SUBSPACE_DIMS:-}" ]]; then
   COMMON_ARGS+=(--guided-subspace-dims "${GUIDED_SUBSPACE_DIMS}")

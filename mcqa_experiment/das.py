@@ -27,6 +27,7 @@ class DASConfig:
     plateau_rel_delta: float = 5e-3
     learning_rate: float = 1e-3
     subspace_dims: tuple[int, ...] | None = None
+    subspace_dims_by_site_label: dict[str, tuple[int, ...]] | None = None
     store_candidate_holdout_metrics: bool = False
     restarts: int = 1
     verbose: bool = True
@@ -186,15 +187,22 @@ def run_das_pipeline(
     train_calibrate_seconds = 0.0
     candidate_holdout_seconds = 0.0
     hidden_size = int(model.config.hidden_size)
-    subspace_dims = tuple(range(1, hidden_size + 1)) if config.subspace_dims is None else tuple(config.subspace_dims)
-    subspace_dims_by_site = {
-        site: tuple(
+    default_subspace_dims = (
+        tuple(range(1, hidden_size + 1))
+        if config.subspace_dims is None
+        else tuple(config.subspace_dims)
+    )
+    subspace_dims_by_site = {}
+    for site in sites:
+        site_specific_dims = None
+        if config.subspace_dims_by_site_label is not None:
+            site_specific_dims = config.subspace_dims_by_site_label.get(site.label)
+        candidate_dims = default_subspace_dims if site_specific_dims is None else tuple(site_specific_dims)
+        subspace_dims_by_site[site] = tuple(
             int(dim)
-            for dim in subspace_dims
+            for dim in candidate_dims
             if 0 < int(dim) <= int(site_total_width(site, model_hidden_size=hidden_size))
         )
-        for site in sites
-    }
     for site, site_dims in list(subspace_dims_by_site.items()):
         if site_dims:
             continue
@@ -210,7 +218,7 @@ def run_das_pipeline(
     if config.verbose:
         print(
             f"[{config.method_name.upper()}] start variable={train_bank.target_var} "
-            f"sites={len(sites)} subspace_dims={list(subspace_dims)} total_candidates={total_candidates}"
+            f"sites={len(sites)} subspace_dims={list(default_subspace_dims)} total_candidates={total_candidates}"
         )
     for site in sites:
         for subspace_dim in subspace_dims_by_site[site]:

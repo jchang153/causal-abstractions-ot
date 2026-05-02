@@ -44,7 +44,7 @@ export CALIBRATION_FAMILY_WEIGHTS="${CALIBRATION_FAMILY_WEIGHTS:-1,1,1}"
 export STAGE_B_TOP_LAYERS_PER_VAR="${STAGE_B_TOP_LAYERS_PER_VAR:-1}"
 export STAGE_B_NEIGHBOR_RADIUS="${STAGE_B_NEIGHBOR_RADIUS:-0}"
 export STAGE_B_MAX_LAYERS_PER_VAR="${STAGE_B_MAX_LAYERS_PER_VAR:-1}"
-export NATIVE_BLOCK_RESOLUTIONS="${NATIVE_BLOCK_RESOLUTIONS:-128,144,192,256,288,384,576,768}"
+export NATIVE_RESOLUTIONS="${NATIVE_RESOLUTIONS:-}"
 export PCA_SITE_MENUS="${PCA_SITE_MENUS:-partition,mixed}"
 export PCA_BASIS_SOURCE_MODES="${PCA_BASIS_SOURCE_MODES:-pair_bank,all_variants}"
 export PCA_NUM_BANDS_VALUES="${PCA_NUM_BANDS_VALUES:-8,16}"
@@ -82,7 +82,6 @@ ARGS=(
   --stage-b-top-layers-per-var "${STAGE_B_TOP_LAYERS_PER_VAR}"
   --stage-b-neighbor-radius "${STAGE_B_NEIGHBOR_RADIUS}"
   --stage-b-max-layers-per-var "${STAGE_B_MAX_LAYERS_PER_VAR}"
-  --native-block-resolutions "${NATIVE_BLOCK_RESOLUTIONS}"
   --pca-site-menus "${PCA_SITE_MENUS}"
   --pca-basis-source-modes "${PCA_BASIS_SOURCE_MODES}"
   --pca-num-bands-values "${PCA_NUM_BANDS_VALUES}"
@@ -99,6 +98,10 @@ ARGS=(
 
 if [[ -n "${STAGE_A_LAYER_INDICES}" ]]; then
   ARGS+=(--stage-a-layer-indices "${STAGE_A_LAYER_INDICES}")
+fi
+
+if [[ -n "${NATIVE_RESOLUTIONS}" ]]; then
+  ARGS+=(--native-resolutions "${NATIVE_RESOLUTIONS}")
 fi
 
 if [[ -n "${GUIDED_SUBSPACE_DIMS}" ]]; then
