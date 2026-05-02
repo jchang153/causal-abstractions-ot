@@ -200,9 +200,17 @@ def _iter_run_payloads(path: Path) -> list[dict[str, object]]:
 def _full_das_record(full_das_outputs: list[Path]) -> dict[str, object] | None:
     if not full_das_outputs:
         return None
+    summary_payloads: list[dict[str, object]] = []
     runtimes_by_var: dict[str, float] = {}
     single_payload_runtimes: list[float] = []
     for path in full_das_outputs:
+        if path.exists():
+            maybe_summary = _load_json(path)
+            if isinstance(maybe_summary, dict) and maybe_summary.get("method") == "Full DAS" and maybe_summary.get(
+                "serial_runtime_seconds"
+            ) is not None:
+                summary_payloads.append(maybe_summary)
+                continue
         for payload in _iter_run_payloads(path):
             if payload.get("runtime_seconds") is not None:
                 single_payload_runtimes.append(_as_float(payload.get("runtime_seconds")))
@@ -218,7 +226,16 @@ def _full_das_record(full_das_outputs: list[Path]) -> dict[str, object] | None:
                             method_payload.get("runtime_seconds")
                         )
 
-    if single_payload_runtimes:
+    if summary_payloads:
+        serial = sum(_as_float(payload.get("serial_runtime_seconds")) for payload in summary_payloads)
+        parallel = max(_as_float(payload.get("parallel_runtime_seconds")) for payload in summary_payloads)
+        for payload in summary_payloads:
+            runtime_seconds_by_var = payload.get("runtime_seconds_by_var")
+            if isinstance(runtime_seconds_by_var, dict):
+                for var in TARGET_VARS:
+                    runtimes_by_var[var] = _as_float(runtimes_by_var.get(var)) + _as_float(runtime_seconds_by_var.get(var))
+        notes = "Using layer-parallel Full DAS summary; serial sums layer payloads, parallel uses max layer payload runtime."
+    elif single_payload_runtimes:
         serial = sum(single_payload_runtimes)
         parallel = max(single_payload_runtimes)
         notes = "Using recorded joint Full DAS payload runtime; not double-counting AP/AT."
