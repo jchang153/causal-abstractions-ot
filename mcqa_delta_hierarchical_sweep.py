@@ -832,7 +832,7 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
         display_entry = display_method_by_var.get(target_var) if isinstance(display_method_by_var, dict) else None
         if isinstance(display_entry, dict):
             lines.append(
-                "  display "
+                "  method "
                 + " ".join(
                     [
                         f"layer={int(display_entry.get('layer', -1))}",

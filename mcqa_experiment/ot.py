@@ -29,6 +29,18 @@ def _synchronize_if_cuda(device: torch.device | str) -> None:
         torch.cuda.synchronize(resolved)
 
 
+def _shared_site_signature_mode(signature_mode: str) -> bool:
+    return signature_mode in {
+        "whole_vocab_kl_t1",
+        "family_slot_label_delta",
+        "family_slot_label_delta_norm",
+        "family_label_delta",
+        "family_label_delta_norm",
+        "family_label_logit_delta",
+        "family_label_logit_delta_norm",
+    }
+
+
 def _squared_euclidean_cost(u_points: torch.Tensor, v_points: torch.Tensor) -> torch.Tensor:
     """Compute squared Euclidean transport costs between two point clouds."""
     u = u_points.to(dtype=torch.float32)
@@ -304,26 +316,95 @@ def prepare_alignment_artifacts(
     """Build reusable factual logits and neural site signatures for OT/UOT runs."""
     device = torch.device(device)
     start = perf_counter()
-    base_logits_by_var = {
-        target_var: collect_base_logits(
+    target_vars = list(fit_banks_by_var.keys())
+    if config.selection_verbose:
+        print(
+            f"[OT prep] start signature_mode={config.signature_mode} "
+            f"candidate_sites={len(sites)} target_vars={target_vars}"
+        )
+    if _shared_site_signature_mode(config.signature_mode):
+        reference_target_var = str(target_vars[0])
+        reference_bank = fit_banks_by_var[reference_target_var]
+        if config.selection_verbose:
+            print(
+                f"[OT prep] using shared site signatures across targets; "
+                f"reference_target={reference_target_var} split={reference_bank.split} examples={reference_bank.size}"
+            )
+            print(
+                "[OT prep] rationale: the neural site signature depends only on the shared training rows "
+                f"for signature_mode={config.signature_mode}, while only the abstract variable signature is target-specific."
+            )
+            print(
+                f"[OT prep] collecting shared base logits target={reference_target_var} "
+                f"split={reference_bank.split} examples={reference_bank.size}"
+            )
+        shared_base_logits = collect_base_logits(
             model=model,
-            bank=bank,
+            bank=reference_bank,
             batch_size=config.batch_size,
             device=device,
         )
-        for target_var, bank in fit_banks_by_var.items()
-    }
-    site_signatures_by_var = collect_multi_variable_site_signatures(
-        model=model,
-        banks_by_var=fit_banks_by_var,
-        sites=sites,
-        base_logits_by_var=base_logits_by_var,
-        batch_size=config.batch_size,
-        device=device,
-        signature_mode=config.signature_mode,
-        show_progress=config.selection_verbose,
-        pca_bases_by_id=pca_bases_by_id,
-    )
+        if config.selection_verbose:
+            print(
+                f"[OT prep] collecting one shared site-signature pass "
+                f"target={reference_target_var} sites={len(sites)}"
+            )
+        shared_site_signatures = collect_site_signatures(
+            model=model,
+            bank=reference_bank,
+            sites=sites,
+            base_logits=shared_base_logits,
+            batch_size=config.batch_size,
+            device=device,
+            signature_mode=config.signature_mode,
+            show_progress=config.selection_verbose,
+            pca_bases_by_id=pca_bases_by_id,
+        )
+        base_logits_by_var = {
+            str(target_var): shared_base_logits
+            for target_var in target_vars
+        }
+        site_signatures_by_var = {
+            str(target_var): shared_site_signatures
+            for target_var in target_vars
+        }
+    else:
+        if config.selection_verbose:
+            print(
+                "[OT prep] signature mode requires target-specific site signatures; "
+                "collecting separate passes per target variable"
+            )
+        base_logits_by_var = {}
+        for target_var, bank in fit_banks_by_var.items():
+            if config.selection_verbose:
+                print(
+                    f"[OT prep] collecting base logits target={target_var} "
+                    f"split={bank.split} examples={bank.size}"
+                )
+            base_logits_by_var[target_var] = collect_base_logits(
+                model=model,
+                bank=bank,
+                batch_size=config.batch_size,
+                device=device,
+            )
+        if config.selection_verbose:
+            print("[OT prep] collecting target-specific site signatures")
+        site_signatures_by_var = collect_multi_variable_site_signatures(
+            model=model,
+            banks_by_var=fit_banks_by_var,
+            sites=sites,
+            base_logits_by_var=base_logits_by_var,
+            batch_size=config.batch_size,
+            device=device,
+            signature_mode=config.signature_mode,
+            show_progress=config.selection_verbose,
+            pca_bases_by_id=pca_bases_by_id,
+        )
+    if config.selection_verbose:
+        print(
+            f"[OT prep] complete target_vars={list(site_signatures_by_var.keys())} "
+            f"runtime={float(perf_counter() - start):.2f}s"
+        )
     return {
         "base_logits_by_var": base_logits_by_var,
         "site_signatures_by_var": site_signatures_by_var,
@@ -911,6 +992,8 @@ def run_alignment_pipeline(
     signature_prepare_wall_seconds = 0.0
     artifact_prepare_load_seconds = 0.0
     if prepared_artifacts is None:
+        if config.selection_verbose:
+            print(f"[{config.method.upper()}] no prepared artifacts supplied; building signatures inline")
         signature_start = perf_counter()
         prepared_artifacts = prepare_alignment_artifacts(
             model=model,
@@ -924,18 +1007,31 @@ def run_alignment_pipeline(
         signature_prepare_wall_seconds = float(perf_counter() - signature_start)
     else:
         artifact_prepare_load_seconds = 0.0
+        if config.selection_verbose:
+            print(
+                f"[{config.method.upper()}] using prepared artifacts "
+                f"cache_hit={bool(prepared_artifacts.get('artifact_cache_hit', False))} "
+                f"loaded_from_disk={bool(prepared_artifacts.get('loaded_from_disk', False))}"
+            )
     artifact_cache_hit = bool(prepared_artifacts.get("loaded_from_disk", False))
     artifact_prepare_recorded_seconds = float(prepared_artifacts.get("prepare_runtime_seconds", 0.0))
     artifact_prepare_create_seconds = float(signature_prepare_wall_seconds)
     signature_prepare_runtime_seconds = float(signature_prepare_wall_seconds)
     site_signatures_by_var = prepared_artifacts["site_signatures_by_var"]
     variable_signature_start = perf_counter()
+    if config.selection_verbose:
+        print(f"[{config.method.upper()}] building abstract variable signatures for sources={list(config.source_target_vars)}")
     variable_signatures_by_var = {
         target_var: build_variable_signature(fit_banks_by_var[target_var], config.signature_mode)
         for target_var in config.source_target_vars
     }
     _synchronize_if_cuda(device)
     variable_signature_seconds = float(perf_counter() - variable_signature_start)
+    if config.selection_verbose:
+        print(
+            f"[{config.method.upper()}] solving transport rows={len(config.source_target_vars)} "
+            f"cols={len(sites)}"
+        )
     transport_start = perf_counter()
     if config.method == "ot":
         transport, transport_meta = solve_ot_transport(variable_signatures_by_var, site_signatures_by_var, config)

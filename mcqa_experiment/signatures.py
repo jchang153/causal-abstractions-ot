@@ -97,8 +97,13 @@ def collect_site_signatures(
     """Measure each residual site's intervention effect signature."""
     signatures = []
     site_iterator = sites
+    target_var = str(bank.target_var)
     if show_progress and tqdm is not None:
-        site_iterator = tqdm(sites, desc=f"Building {signature_mode} signatures", leave=False)
+        site_iterator = tqdm(
+            sites,
+            desc=f"Site signatures ({target_var}, {signature_mode}, {len(sites)} sites)",
+            leave=False,
+        )
     with torch.no_grad():
         for site in site_iterator:
             site_logits_chunks = []
@@ -146,8 +151,15 @@ def collect_multi_variable_site_signatures(
     pca_bases_by_id: dict[str, LayerPCABasis] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Collect site signatures separately for each abstract variable."""
-    return {
-        target_var: collect_site_signatures(
+    signatures_by_var: dict[str, torch.Tensor] = {}
+    total_targets = len(banks_by_var)
+    for index, (target_var, bank) in enumerate(banks_by_var.items(), start=1):
+        if show_progress:
+            print(
+                f"[OT prep] collecting site signatures target={target_var} "
+                f"pass={index}/{total_targets} sites={len(sites)} split={bank.split}"
+            )
+        signatures_by_var[target_var] = collect_site_signatures(
             model=model,
             bank=bank,
             sites=sites,
@@ -158,5 +170,4 @@ def collect_multi_variable_site_signatures(
             show_progress=show_progress,
             pca_bases_by_id=pca_bases_by_id,
         )
-        for target_var, bank in banks_by_var.items()
-    }
+    return signatures_by_var

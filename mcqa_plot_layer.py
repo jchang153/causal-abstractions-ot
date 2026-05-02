@@ -33,6 +33,7 @@ DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_DISPLAY_TOP_LAYER_COUNT = 3
+DEFAULT_STAGE_A_SINGLE_LAYER_LAMBDAS = (1.0,)
 
 
 def _synchronize_if_cuda(device: torch.device | str) -> None:
@@ -148,60 +149,114 @@ def _target_row_ranking(payload: dict[str, object], *, sites) -> list[dict[str, 
     )
 
 
-def _best_ot_records(ot_compare_payloads: list[dict[str, object]], *, sites) -> dict[str, dict[str, object]]:
-    best_by_var: dict[str, dict[str, object]] = {}
-    for compare_payload in ot_compare_payloads:
-        epsilon = float(compare_payload.get("ot_epsilon", 0.0))
-        for payload in compare_payload.get("method_payloads", {}).get("ot", []):
-            result = payload.get("results", [{}])[0]
-            target_var = str(payload.get("target_var"))
-            candidate = {
-                "exact_acc": float(result.get("exact_acc", 0.0)),
-                "selection_score": float(result.get("selection_score", 0.0)),
-                "site_label": str(result.get("site_label", "")),
-                "epsilon": float(epsilon),
-                "selected_hyperparameters": dict(payload.get("selected_hyperparameters", {})),
-                "selected_site_labels": list(result.get("selected_site_labels", [])),
-                "ranking": [dict(entry) for entry in payload.get("ranking", []) if isinstance(entry, dict)],
-                "target_row_ranking": _target_row_ranking(payload, sites=sites),
-            }
-            previous = best_by_var.get(target_var)
-            if previous is None or (
-                float(candidate["selection_score"]),
-                float(candidate["exact_acc"]),
-            ) > (
-                float(previous["selection_score"]),
-                float(previous["exact_acc"]),
-            ):
-                best_by_var[target_var] = candidate
-    return best_by_var
+def _select_layer_method_by_var(
+    *,
+    model,
+    tokenizer,
+    banks_by_split: dict[str, dict[str, object]],
+    sites,
+    ot_compare_payloads: list[dict[str, object]],
+    device,
+    batch_size: int,
+    signature_mode: str,
+) -> dict[str, dict[str, object]]:
+    selected_by_var: dict[str, dict[str, object]] = {}
+    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
+    for target_var in target_vars:
+        best_record: dict[str, object] | None = None
+        for compare_payload in ot_compare_payloads:
+            epsilon = float(compare_payload.get("ot_epsilon", 0.0))
+            for payload in compare_payload.get("method_payloads", {}).get("ot", []):
+                if str(payload.get("target_var")) != str(target_var):
+                    continue
+                row_ranking = _target_row_ranking(payload, sites=sites)
+                ranked_site_indices = [
+                    int(entry.get("site_index", -1))
+                    for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]
+                    if int(entry.get("site_index", -1)) >= 0
+                ]
+                if not ranked_site_indices:
+                    ranked_site_indices = list(range(min(DEFAULT_DISPLAY_TOP_LAYER_COUNT, len(sites))))
+                candidate_sites = [
+                    sites[site_index]
+                    for site_index in ranked_site_indices
+                    if 0 <= int(site_index) < len(sites)
+                ]
+                if not candidate_sites:
+                    continue
+                brute_payload = run_bruteforce_site_pipeline(
+                    model=model,
+                    calibration_bank=banks_by_split["calibration"][str(target_var)],
+                    holdout_bank=banks_by_split["test"][str(target_var)],
+                    sites=candidate_sites,
+                    device=device,
+                    tokenizer=tokenizer,
+                    config=OTConfig(
+                        method="bruteforce",
+                        batch_size=int(batch_size),
+                        epsilon=1.0,
+                        signature_mode=str(signature_mode),
+                        top_k_values=(1,),
+                        lambda_values=DEFAULT_STAGE_A_SINGLE_LAYER_LAMBDAS,
+                        selection_verbose=True,
+                        source_target_vars=target_vars,
+                        calibration_metric=DEFAULT_CALIBRATION_METRIC,
+                        calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
+                        lambda_values_by_var={str(target_var): DEFAULT_STAGE_A_SINGLE_LAYER_LAMBDAS},
+                    ),
+                )
+                result = brute_payload.get("results", [{}])[0]
+                selected_hyperparameters = dict(brute_payload.get("selected_hyperparameters", {}))
+                candidate = {
+                    "variable": str(target_var),
+                    "exact_acc": float(result.get("exact_acc", 0.0)),
+                    "selection_score": float(result.get("selection_score", 0.0)),
+                    "site_label": str(result.get("site_label", selected_hyperparameters.get("site_label", ""))),
+                    "layer": int(result.get("layer", candidate_sites[0].layer)),
+                    "lambda": float(selected_hyperparameters.get("lambda", result.get("lambda", 0.0))),
+                    "epsilon": float(epsilon),
+                    "candidate_site_labels": [site.label for site in candidate_sites],
+                    "candidate_layers": [int(site.layer) for site in candidate_sites],
+                    "selection_basis": f"best_single_layer_among_top_{DEFAULT_DISPLAY_TOP_LAYER_COUNT}_coupling_layers",
+                    "target_row_ranking": row_ranking,
+                    "payload": brute_payload,
+                }
+                if best_record is None or (
+                    float(candidate["selection_score"]),
+                    float(candidate["exact_acc"]),
+                ) > (
+                    float(best_record["selection_score"]),
+                    float(best_record["exact_acc"]),
+                ):
+                    best_record = candidate
+        if best_record is not None:
+            selected_by_var[str(target_var)] = best_record
+    return selected_by_var
 
 
 def _rank_layers_from_target_row(
     *,
-    best_ot_by_var: dict[str, dict[str, object]],
+    selected_method_by_var: dict[str, dict[str, object]],
     runtime_seconds: float,
 ) -> dict[str, list[dict[str, object]]]:
     rankings: dict[str, list[dict[str, object]]] = {}
-    for target_var, best in best_ot_by_var.items():
-        row_ranking = [dict(entry) for entry in best.get("target_row_ranking", []) if isinstance(entry, dict)]
-        selected_hyperparameters = dict(best.get("selected_hyperparameters", {}))
-        selected_site_labels = list(best.get("selected_site_labels", []))
+    for target_var, selected in selected_method_by_var.items():
+        row_ranking = [dict(entry) for entry in selected.get("target_row_ranking", []) if isinstance(entry, dict)]
         rankings[str(target_var)] = [
             {
                 "variable": str(target_var),
                 "layer": int(entry.get("layer", -1)),
                 "selection_score": float(entry.get("transport_mass", 0.0)),
                 "target_row_transport_mass": float(entry.get("transport_mass", 0.0)),
-                "exact_acc": float(best.get("exact_acc", 0.0)),
-                "ot_selection_score": float(best.get("selection_score", 0.0)),
-                "epsilon": float(best.get("epsilon", 0.0)),
+                "exact_acc": float(selected.get("exact_acc", 0.0)),
+                "selection_exact_acc": float(selected.get("exact_acc", 0.0)),
+                "method_selection_score": float(selected.get("selection_score", 0.0)),
+                "epsilon": float(selected.get("epsilon", 0.0)),
                 "site_label": entry.get("site_label"),
-                "selected_top_k": int(selected_hyperparameters.get("top_k", len(selected_site_labels) or 1)),
-                "selected_lambda": float(selected_hyperparameters.get("lambda", 0.0)),
-                "selected_site_labels": selected_site_labels,
+                "selected_lambda": float(selected.get("lambda", 0.0)),
+                "selected_site_label": selected.get("site_label"),
                 "runtime_seconds": float(runtime_seconds),
-                "selection_basis": "target_row_mass_from_joint_layer_ot",
+                "selection_basis": "target_row_mass_from_selected_top3_single_layer_method",
             }
             for entry in row_ranking
         ]
@@ -213,8 +268,7 @@ def _format_summary(
     token_position_id: str,
     layers: tuple[int, ...],
     support_by_var: dict[str, dict[str, object]],
-    best_ot_by_var: dict[str, dict[str, object]],
-    display_method_by_var: dict[str, dict[str, object]],
+    method_by_var: dict[str, dict[str, object]],
 ) -> str:
     lines = [
         "MCQA PLOT Layer Summary",
@@ -223,111 +277,31 @@ def _format_summary(
         "",
     ]
     for target_var in DEFAULT_TARGET_VARS:
-        best = best_ot_by_var.get(str(target_var), {})
-        display = display_method_by_var.get(str(target_var), {})
+        selected = method_by_var.get(str(target_var), {})
         lines.append(f"[{target_var}]")
-        lines.append(
-            f"best_ot exact={float(best.get('exact_acc', 0.0)):.4f} "
-            f"cal={float(best.get('selection_score', 0.0)):.4f} "
-            f"eps={float(best.get('epsilon', 0.0)):g} "
-            f"site={best.get('site_label')}"
-        )
-        selected_hyperparameters = dict(best.get("selected_hyperparameters", {}))
-        selected_site_labels = list(best.get("selected_site_labels", []))
-        if selected_hyperparameters:
+        if selected:
             lines.append(
-                f"selected_handle top_k={int(selected_hyperparameters.get('top_k', len(selected_site_labels) or 1))} "
-                f"lambda={float(selected_hyperparameters.get('lambda', 0.0)):g} "
-                f"layers={selected_site_labels}"
+                f"selected_single_layer exact={float(selected.get('exact_acc', 0.0)):.4f} "
+                f"cal={float(selected.get('selection_score', 0.0)):.4f} "
+                f"eps={float(selected.get('epsilon', 0.0)):g} "
+                f"site={selected.get('site_label')} "
+                f"lambda={float(selected.get('lambda', 0.0)):g} "
+                f"top_candidates={selected.get('candidate_site_labels', [])}"
             )
-        if display:
+        if selected.get("target_row_ranking"):
             lines.append(
-                f"display_single_layer exact={float(display.get('exact_acc', 0.0)):.4f} "
-                f"cal={float(display.get('selection_score', 0.0)):.4f} "
-                f"site={display.get('site_label')} "
-                f"lambda={float(display.get('lambda', 0.0)):g} "
-                f"top_candidates={display.get('candidate_site_labels', [])}"
-            )
-        if best.get("target_row_ranking"):
-            lines.append(
-                f"coupling_row_layers={[entry.get('site_label') for entry in best.get('target_row_ranking', [])[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]]}"
+                f"coupling_row_layers={[entry.get('site_label') for entry in selected.get('target_row_ranking', [])[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]]}"
             )
         support_summary = support_by_var.get(str(target_var), {})
         if support_summary:
             lines.append(
-                f"support masks={[candidate.get('name') for candidate in support_summary.get('mask_candidates', [])]}"
+                f"support_diagnostic_masks={[candidate.get('name') for candidate in support_summary.get('mask_candidates', [])]}"
             )
             lines.append(
-                f"ranked_layers={support_summary.get('ranked_site_labels', [])}"
+                f"support_diagnostic_ranked_layers={support_summary.get('ranked_site_labels', [])}"
             )
         lines.append("")
     return "\n".join(lines)
-
-
-def _display_method_by_var(
-    *,
-    model,
-    tokenizer,
-    banks_by_split: dict[str, dict[str, object]],
-    sites,
-    best_ot_by_var: dict[str, dict[str, object]],
-    device,
-    batch_size: int,
-    signature_mode: str,
-) -> dict[str, dict[str, object]]:
-    display_by_var: dict[str, dict[str, object]] = {}
-    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
-    for target_var in target_vars:
-        ranked_site_indices = [
-            int(entry.get("site_index", -1))
-            for entry in best_ot_by_var.get(str(target_var), {}).get("target_row_ranking", [])[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]
-            if int(entry.get("site_index", -1)) >= 0
-        ]
-        if not ranked_site_indices:
-            ranked_site_indices = list(range(min(DEFAULT_DISPLAY_TOP_LAYER_COUNT, len(sites))))
-        candidate_sites = [
-            sites[site_index]
-            for site_index in ranked_site_indices
-            if 0 <= int(site_index) < len(sites)
-        ]
-        if not candidate_sites:
-            continue
-        payload = run_bruteforce_site_pipeline(
-            model=model,
-            calibration_bank=banks_by_split["calibration"][str(target_var)],
-            holdout_bank=banks_by_split["test"][str(target_var)],
-            sites=candidate_sites,
-            device=device,
-            tokenizer=tokenizer,
-            config=OTConfig(
-                method="bruteforce",
-                batch_size=int(batch_size),
-                epsilon=1.0,
-                signature_mode=str(signature_mode),
-                top_k_values=(1,),
-                lambda_values=DEFAULT_OT_LAMBDAS,
-                selection_verbose=True,
-                source_target_vars=target_vars,
-                calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                lambda_values_by_var={str(target_var): DEFAULT_OT_LAMBDAS},
-            ),
-        )
-        result = payload.get("results", [{}])[0]
-        selected_hyperparameters = dict(payload.get("selected_hyperparameters", {}))
-        display_by_var[str(target_var)] = {
-            "variable": str(target_var),
-            "exact_acc": float(result.get("exact_acc", 0.0)),
-            "selection_score": float(result.get("selection_score", 0.0)),
-            "site_label": str(result.get("site_label", selected_hyperparameters.get("site_label", ""))),
-            "layer": int(result.get("layer", candidate_sites[0].layer)),
-            "lambda": float(selected_hyperparameters.get("lambda", result.get("lambda", 0.0))),
-            "candidate_site_labels": [site.label for site in candidate_sites],
-            "candidate_layers": [int(site.layer) for site in candidate_sites],
-            "selection_basis": f"best_single_layer_among_top_{DEFAULT_DISPLAY_TOP_LAYER_COUNT}_coupling_layers",
-            "payload": payload,
-        }
-    return display_by_var
 
 
 def main() -> None:
@@ -356,6 +330,10 @@ def main() -> None:
     )
     if not resolved_layers:
         raise ValueError("No layers selected")
+    print(
+        f"[stageA] start token_position={str(args.token_position_id)} "
+        f"layers={len(resolved_layers)} target_vars={list(target_vars)}"
+    )
     token_position_ids = tuple(token_position.id for token_position in token_positions)
     sites = enumerate_residual_sites(
         num_layers=int(model.config.num_hidden_layers),
@@ -386,6 +364,7 @@ def main() -> None:
     artifact_prepare_load_seconds = float(perf_counter() - artifact_load_start)
     artifact_prepare_create_seconds = 0.0
     if prepared_artifacts is None:
+        print(f"[stageA] signature cache miss path={cache_path}")
         artifact_prepare_start = perf_counter()
         prepared_artifacts = prepare_alignment_artifacts(
             model=model,
@@ -412,11 +391,19 @@ def main() -> None:
             prepared_artifacts=prepared_artifacts,
             cache_spec=cache_spec,
         )
+        print(f"[stageA] signature cache saved path={cache_path}")
+    else:
+        print(
+            f"[stageA] signature cache hit path={cache_path} "
+            f"loaded_from_disk={bool(prepared_artifacts.get('loaded_from_disk', False))}"
+        )
     _synchronize_if_cuda(device)
 
     ot_compare_payloads: list[dict[str, object]] = []
     ot_localization_start = perf_counter()
+    print(f"[stageA] running joint layer OT epsilon_sweep={list(ot_epsilons)}")
     for epsilon in ot_epsilons:
+        print(f"[stageA] epsilon={float(epsilon):g} joint layer OT")
         output_stem = f"mcqa_plot_layer_pos-{str(args.token_position_id)}_sig-{str(args.signature_mode)}_eps-{float(epsilon):g}_ot"
         output_path = sweep_root / f"{output_stem}.json"
         summary_path = sweep_root / f"{output_stem}.txt"
@@ -450,31 +437,37 @@ def main() -> None:
                 ),
                 prepared_ot_artifacts=prepared_artifacts,
             )
+        else:
+            print(f"[stageA] reusing existing epsilon payload path={output_path}")
         ot_compare_payloads.append(compare_payload)
     _synchronize_if_cuda(device)
     ot_localization_seconds = float(perf_counter() - ot_localization_start)
 
     support_start = perf_counter()
+    print("[stageA] extracting OT support diagnostics")
     support_by_var = extract_ordered_site_support(
         ot_run_payloads=ot_compare_payloads,
         sites=sites,
         score_slack=float(args.support_score_slack),
     )
     support_extract_seconds = float(perf_counter() - support_start)
-    best_ot_by_var = _best_ot_records(ot_compare_payloads, sites=sites)
-    display_method_by_var = _display_method_by_var(
+    print(
+        f"[stageA] selecting PLOT(layer) winner by testing top {DEFAULT_DISPLAY_TOP_LAYER_COUNT} "
+        "coupling-ranked single layers per variable"
+    )
+    method_by_var = _select_layer_method_by_var(
         model=model,
         tokenizer=tokenizer,
         banks_by_split=banks_by_split,
         sites=sites,
-        best_ot_by_var=best_ot_by_var,
+        ot_compare_payloads=ot_compare_payloads,
         device=device,
         batch_size=int(args.batch_size),
         signature_mode=str(args.signature_mode),
     )
     total_seconds = float(perf_counter() - stage_start)
     rankings_by_var = _rank_layers_from_target_row(
-        best_ot_by_var=best_ot_by_var,
+        selected_method_by_var=method_by_var,
         runtime_seconds=total_seconds,
     )
 
@@ -488,8 +481,7 @@ def main() -> None:
             token_position_id=str(args.token_position_id),
             layers=resolved_layers,
             support_by_var=support_by_var,
-            best_ot_by_var=best_ot_by_var,
-            display_method_by_var=display_method_by_var,
+            method_by_var=method_by_var,
         ),
     )
     write_json(
@@ -505,8 +497,8 @@ def main() -> None:
             "support_path": str(support_path),
             "support_by_var": support_by_var,
             "rankings_by_var": rankings_by_var,
-            "display_method_by_var": display_method_by_var,
-            "method_by_var": best_ot_by_var,
+            "display_method_by_var": method_by_var,
+            "method_by_var": method_by_var,
             "ot_output_paths": [
                 str(sweep_root / f"mcqa_plot_layer_pos-{str(args.token_position_id)}_sig-{str(args.signature_mode)}_eps-{float(epsilon):g}_ot.json")
                 for epsilon in ot_epsilons

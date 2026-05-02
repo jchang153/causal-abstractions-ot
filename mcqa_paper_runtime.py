@@ -231,7 +231,7 @@ def build_paper_runtime_summary(
             stage_a_seconds=stage_a_seconds,
             downstream_by_var={var: 0.0 for var in TARGET_VARS},
             entries_by_var={var: _stage_a_display_entry(stage_a_rankings, var) for var in TARGET_VARS},
-            notes="Stage A layer localization with display accuracy chosen from the top evidence-ranked single-layer candidates.",
+            notes="Stage A layer localization with method accuracy chosen from the top coupling-ranked single-layer candidates.",
         )
     )
 

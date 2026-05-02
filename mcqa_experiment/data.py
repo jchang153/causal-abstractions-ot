@@ -392,14 +392,14 @@ def filter_correct_examples(
 ) -> dict[str, list[dict[str, object]]]:
     """Keep only examples where Gemma predicts both the base and source answer tokens."""
 
-    def predict_next_token_ids(prompts: list[str]) -> list[int]:
+    def predict_next_token_ids(prompts: list[str], *, progress_label: str) -> list[int]:
         predicted_ids_all: list[int] = []
         batch_starts = range(0, len(prompts), batch_size)
         batch_iterator = batch_starts
         if tqdm is not None:
             batch_iterator = tqdm(
                 batch_starts,
-                desc="Filtering batch",
+                desc=progress_label,
                 leave=False,
                 total=(len(prompts) + batch_size - 1) // batch_size,
             )
@@ -433,8 +433,16 @@ def filter_correct_examples(
         source_expected_answer_variant_ids = [
             _encode_symbol_token_variants(expected, tokenizer) for expected in source_expected_answers
         ]
-        base_predicted_ids = predict_next_token_ids(base_prompts)
-        source_predicted_ids = predict_next_token_ids(source_prompts)
+        print(f"[filter] dataset={dataset_name} checking base prompts")
+        base_predicted_ids = predict_next_token_ids(
+            base_prompts,
+            progress_label=f"Filtering base prompts ({dataset_name})",
+        )
+        print(f"[filter] dataset={dataset_name} checking source prompts")
+        source_predicted_ids = predict_next_token_ids(
+            source_prompts,
+            progress_label=f"Filtering source prompts ({dataset_name})",
+        )
         keep_mask: list[bool] = []
         for (
             base_predicted_id,
