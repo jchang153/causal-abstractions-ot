@@ -802,11 +802,19 @@ def _extract_stage_a_rankings(*, aggregate_path: Path) -> dict[str, list[dict[st
         rankings = aggregate_payload.get("rankings_by_var", {})
         if not isinstance(rankings, dict):
             raise ValueError(f"Malformed PLOT layer payload at {aggregate_path}")
-        return {
+        resolved = {
             str(target_var): [dict(entry) for entry in entries if isinstance(entry, dict)]
             for target_var, entries in rankings.items()
             if isinstance(entries, list)
         }
+        display_method_by_var = aggregate_payload.get("display_method_by_var", {})
+        if isinstance(display_method_by_var, dict):
+            resolved["_display_method_by_var"] = {
+                str(target_var): dict(entry)
+                for target_var, entry in display_method_by_var.items()
+                if isinstance(entry, dict)
+            }
+        return resolved
     if str(aggregate_path.name) == "layer_sweep_manifest.json":
         return _stage_a_rankings_from_layer_sweep(manifest_path=aggregate_path, manifest_payload=aggregate_payload)
     return _stage_a_rankings_from_joint_run(aggregate_path=aggregate_path, aggregate_payload=aggregate_payload)
@@ -818,13 +826,28 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
         f"token_position_id: {token_position_id}",
         "",
     ]
+    display_method_by_var = rankings.get("_display_method_by_var", {}) if isinstance(rankings, dict) else {}
     for target_var in DEFAULT_TARGET_VARS:
         lines.append(f"[{target_var}]")
+        display_entry = display_method_by_var.get(target_var) if isinstance(display_method_by_var, dict) else None
+        if isinstance(display_entry, dict):
+            lines.append(
+                "  display "
+                + " ".join(
+                    [
+                        f"layer={int(display_entry.get('layer', -1))}",
+                        f"exact={float(display_entry.get('exact_acc', -1.0)):.4f}",
+                        f"cal={float(display_entry.get('selection_score', -1.0)):.4f}",
+                        f"site={display_entry.get('site_label')}",
+                        f"lambda={float(display_entry.get('lambda', 0.0)):g}",
+                        f"candidates={display_entry.get('candidate_site_labels', [])}",
+                    ]
+                )
+            )
         for entry in rankings.get(target_var, []):
             parts = [
                 f"layer={int(entry['layer'])}",
-                f"exact={float(entry.get('exact_acc', -1.0)):.4f}",
-                f"cal={float(entry.get('selection_score', -1.0)):.4f}",
+                f"row_mass={float(entry.get('target_row_transport_mass', entry.get('support_evidence', entry.get('selection_score', 0.0)))):.4f}",
             ]
             if "epsilon" in entry:
                 parts.append(f"eps={float(entry.get('epsilon', -1.0)):g}")
@@ -832,10 +855,10 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
                 parts.append(f"site={entry.get('site_label')}")
             if entry.get("runtime_seconds") is not None:
                 parts.append(f"runtime={float(entry['runtime_seconds']):.2f}s")
-            if "row_dominant_mass" in entry:
-                parts.append(f"row_dom={float(entry.get('row_dominant_mass', 0.0)):.4f}")
-            if "mass_share" in entry:
-                parts.append(f"mass_share={float(entry.get('mass_share', 0.0)):.4f}")
+            if "mean_target_site_mass" in entry:
+                parts.append(f"mean_mass={float(entry.get('mean_target_site_mass', 0.0)):.4f}")
+            if "selected_site_labels" in entry:
+                parts.append(f"selected_handle={entry.get('selected_site_labels')}")
             lines.append("  - " + " ".join(parts))
         lines.append("")
     return "\n".join(lines)

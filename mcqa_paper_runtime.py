@@ -39,6 +39,15 @@ def _first_entry(rankings: dict[str, object], target_var: str) -> dict[str, obje
     return first if isinstance(first, dict) else None
 
 
+def _stage_a_display_entry(rankings: dict[str, object], target_var: str) -> dict[str, object] | None:
+    display_by_var = rankings.get("_display_method_by_var")
+    if isinstance(display_by_var, dict):
+        entry = display_by_var.get(target_var)
+        if isinstance(entry, dict):
+            return entry
+    return _first_entry(rankings, target_var)
+
+
 def _read_rankings(sweep_root: Path, filename: str) -> dict[str, object]:
     path = sweep_root / filename
     if not path.exists():
@@ -221,8 +230,8 @@ def build_paper_runtime_summary(
             method="PLOT (layer)",
             stage_a_seconds=stage_a_seconds,
             downstream_by_var={var: 0.0 for var in TARGET_VARS},
-            entries_by_var={var: _first_entry(stage_a_rankings, var) for var in TARGET_VARS},
-            notes="Joint Stage A layer localization over full-layer sites.",
+            entries_by_var={var: _stage_a_display_entry(stage_a_rankings, var) for var in TARGET_VARS},
+            notes="Stage A layer localization with display accuracy chosen from the top evidence-ranked single-layer candidates.",
         )
     )
 
