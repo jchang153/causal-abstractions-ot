@@ -78,6 +78,35 @@ def _parse_csv_floats(value: str | None) -> tuple[float, ...]:
     return tuple(float(item) for item in _parse_csv_strings(value))
 
 
+def _parse_stage_a_fixed_layers(value: str | None) -> dict[str, int]:
+    if value is None or str(value).strip() == "":
+        return {}
+    resolved: dict[str, int] = {}
+    for item in _parse_csv_strings(value):
+        if ":" not in item:
+            raise ValueError(
+                "--stage-a-fixed-layers entries must look like "
+                "'answer_pointer:17,answer_token:24'"
+            )
+        target_var, layer_text = item.split(":", 1)
+        target_var = str(target_var).strip()
+        if target_var not in DEFAULT_TARGET_VARS:
+            raise ValueError(
+                f"Unsupported target var in --stage-a-fixed-layers: {target_var}. "
+                f"Expected one of {list(DEFAULT_TARGET_VARS)}."
+            )
+        if target_var in resolved:
+            raise ValueError(f"Duplicate target var in --stage-a-fixed-layers: {target_var}")
+        resolved[target_var] = int(layer_text.strip())
+    missing = [target_var for target_var in DEFAULT_TARGET_VARS if target_var not in resolved]
+    if missing:
+        raise ValueError(
+            "--stage-a-fixed-layers must specify every target var. "
+            f"Missing: {missing}"
+        )
+    return resolved
+
+
 def _append_optional_arg(args: list[str], name: str, value: str | None) -> None:
     if value is None or value == "":
         return
@@ -246,6 +275,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--stage-a-token-position-ids", default="last_token")
     parser.add_argument("--stage-a-layer-indices", default=None, help="Comma-separated layer indices. Default: all layers.")
+    parser.add_argument(
+        "--stage-a-fixed-layers",
+        default=None,
+        help=(
+            "Optional fixed Stage A layer override like "
+            "'answer_pointer:17,answer_token:24'. When set, Stage A transport "
+            "is skipped and downstream stages use these layers."
+        ),
+    )
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
     parser.add_argument("--ot-epsilons", default="0.5,1,2,4")
     parser.add_argument("--stage-a-uot-beta-neurals", default="0.1,0.3,1,3")
@@ -295,6 +333,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     target_vars = _parse_csv_strings(args.target_vars) or DEFAULT_TARGET_VARS
     stage_a_token_position_ids = _parse_csv_strings(args.stage_a_token_position_ids) or DEFAULT_STAGE_A_TOKEN_POSITION_IDS
     stage_a_layer_indices = _parse_csv_ints(args.stage_a_layer_indices) if args.stage_a_layer_indices is not None else ()
+    stage_a_fixed_layers = _parse_stage_a_fixed_layers(args.stage_a_fixed_layers)
     pca_site_menus = _parse_csv_strings(args.pca_site_menus) or DEFAULT_PCA_SITE_MENUS
     pca_basis_source_modes = _parse_csv_strings(args.pca_basis_source_modes) or DEFAULT_PCA_BASIS_SOURCE_MODES
     pca_num_bands_values = _parse_csv_ints(args.pca_num_bands_values) or DEFAULT_PCA_NUM_BANDS_VALUES
@@ -322,6 +361,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "target_vars": tuple(str(target_var) for target_var in target_vars),
         "stage_a_token_position_ids": tuple(str(token_position_id) for token_position_id in stage_a_token_position_ids),
         "stage_a_layer_indices": tuple(int(layer) for layer in stage_a_layer_indices),
+        "stage_a_fixed_layers": {str(target_var): int(layer) for target_var, layer in stage_a_fixed_layers.items()},
         "pca_site_menus": tuple(str(site_menu) for site_menu in pca_site_menus),
         "pca_basis_source_modes": tuple(str(mode) for mode in pca_basis_source_modes),
         "pca_num_bands_values": tuple(int(value) for value in pca_num_bands_values),
@@ -840,12 +880,17 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
         lines.append(f"[{target_var}]")
         display_entry = display_method_by_var.get(target_var) if isinstance(display_method_by_var, dict) else None
         if isinstance(display_entry, dict):
+            exact_acc = display_entry.get("exact_acc")
+            selection_score = display_entry.get("selection_score")
             parts = [
                 f"method={display_entry.get('method')}",
                 f"layer={int(display_entry.get('layer', -1))}",
-                f"exact={float(display_entry.get('exact_acc', -1.0)):.4f}",
-                f"cal={float(display_entry.get('selection_score', -1.0)):.4f}",
-                f"eps={float(display_entry.get('epsilon', 0.0)):g}",
+                f"exact={float(exact_acc):.4f}" if exact_acc is not None else "exact=NA",
+                f"cal={float(selection_score):.4f}" if selection_score is not None else "cal=NA",
+                (
+                    f"eps={float(display_entry.get('epsilon', 0.0)):g}"
+                    if display_entry.get("epsilon") is not None else "eps=NA"
+                ),
                 f"site={display_entry.get('site_label')}",
                 f"candidates={display_entry.get('candidate_site_labels', [])}",
             ]
@@ -870,6 +915,50 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
             lines.append("  - " + " ".join(parts))
         lines.append("")
     return "\n".join(lines)
+
+
+def _fixed_stage_a_rankings(
+    *,
+    token_position_id: str,
+    fixed_layers_by_var: dict[str, int],
+) -> dict[str, list[dict[str, object]]]:
+    rankings: dict[str, list[dict[str, object]]] = {}
+    display_method_by_var: dict[str, dict[str, object]] = {}
+    for target_var in DEFAULT_TARGET_VARS:
+        layer = int(fixed_layers_by_var[str(target_var)])
+        site_label = f"L{int(layer)}:{str(token_position_id)}"
+        rankings[str(target_var)] = [
+            {
+                "layer": int(layer),
+                "selection_score": 1.0,
+                "target_row_transport_mass": 1.0,
+                "site_label": site_label,
+                "runtime_seconds": 0.0,
+                "selection_basis": "manual_fixed_stage_a_layer_override",
+            }
+        ]
+        display_method_by_var[str(target_var)] = {
+            "method": "fixed_layer_override",
+            "layer": int(layer),
+            "exact_acc": None,
+            "selection_score": None,
+            "epsilon": None,
+            "site_label": site_label,
+            "candidate_site_labels": [site_label],
+            "selection_basis": "manual_fixed_stage_a_layer_override",
+        }
+    rankings["_display_method_by_var"] = display_method_by_var
+    return rankings
+
+
+def _print_stage_a_fixed_layer_override(*, token_position_id: str, fixed_layers_by_var: dict[str, int]) -> None:
+    print("")
+    print(f"[stageA] using fixed layer override for token_position={token_position_id}")
+    for target_var in DEFAULT_TARGET_VARS:
+        print("")
+        print(f"  [{target_var}]")
+        print(f"  fixed_layer={int(fixed_layers_by_var[str(target_var)])}")
+    print("")
 
 
 def _select_stage_b_layers(
@@ -1374,10 +1463,49 @@ def main() -> None:
     layer_indices = normalized["stage_a_layer_indices"]
     if not layer_indices:
         layer_indices = _all_layer_indices(str(args.model_name))
+    fixed_stage_a_layers = normalized["stage_a_fixed_layers"]
 
     stage_a_rankings_by_token: dict[str, dict[str, list[dict[str, object]]]] = {}
     stage_a_summary_paths: list[Path] = []
-    if "stage_a_plot_layer" in normalized["stages"]:
+    if fixed_stage_a_layers:
+        for token_position_id in normalized["stage_a_token_position_ids"]:
+            ranking_json_path = sweep_root / f"stage_a_{str(token_position_id)}_layer_rankings.json"
+            ranking_txt_path = sweep_root / f"stage_a_{str(token_position_id)}_layer_rankings.txt"
+            rankings = _fixed_stage_a_rankings(
+                token_position_id=str(token_position_id),
+                fixed_layers_by_var={str(target_var): int(layer) for target_var, layer in fixed_stage_a_layers.items()},
+            )
+            _write_json(ranking_json_path, rankings)
+            _write_text(
+                ranking_txt_path,
+                _format_stage_a_summary(token_position_id=str(token_position_id), rankings=rankings),
+            )
+            _print_stage_a_fixed_layer_override(
+                token_position_id=str(token_position_id),
+                fixed_layers_by_var={str(target_var): int(layer) for target_var, layer in fixed_stage_a_layers.items()},
+            )
+            stage_a_rankings_by_token[str(token_position_id)] = rankings
+            stage_a_summary_paths.extend([ranking_json_path, ranking_txt_path])
+            _mark_stage(
+                manifest_path=manifest_path,
+                repo_root=repo_root,
+                args=args,
+                normalized=normalized,
+                stage_statuses=stage_statuses,
+                stage_name=f"stage_a_{str(token_position_id)}",
+                payload={
+                    "state": "skipped_fixed_layers",
+                    "stage_timestamp": None,
+                    "expected_outputs": [str(ranking_json_path), str(ranking_txt_path)],
+                    "runtime_seconds": 0.0,
+                    "wall_runtime_seconds": 0.0,
+                    "fixed_layers_by_var": {
+                        str(target_var): int(layer) for target_var, layer in fixed_stage_a_layers.items()
+                    },
+                    "completed_at": datetime.now().isoformat(),
+                },
+            )
+    elif "stage_a_plot_layer" in normalized["stages"]:
         for token_position_id in normalized["stage_a_token_position_ids"]:
             stage_name = f"stage_a_{str(token_position_id)}"
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageA_{str(token_position_id)}"
