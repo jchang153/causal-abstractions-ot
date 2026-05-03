@@ -816,7 +816,7 @@ def _select_hyperparameters(
     top_k_values, lambda_values = _resolve_calibration_grids(
         target_var=calibration_bank.target_var,
         config=config,
-        num_sites=normalized_transport.shape[1],
+        num_sites=selection_transport.shape[1],
     )
     best = None
     sweep_records: list[dict[str, object]] = []
