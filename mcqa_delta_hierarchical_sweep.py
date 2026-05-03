@@ -944,6 +944,27 @@ def _print_stage_b_layer_selection(
     print("")
 
 
+def _expected_stage_b_native_payload_paths(
+    *,
+    native_root: Path,
+    selected_layers: tuple[int, ...],
+    native_resolutions: tuple[int, ...],
+    signature_mode: str,
+) -> list[Path]:
+    payload_paths: list[Path] = []
+    for layer in selected_layers:
+        for native_resolution in native_resolutions:
+            payload_paths.append(
+                native_root
+                / f"layer_{int(layer):02d}"
+                / (
+                    f"mcqa_plot_native_support_layer-{int(layer)}_pos-last_token"
+                    f"_atomic-{int(native_resolution)}_sig-{str(signature_mode)}.json"
+                )
+            )
+    return payload_paths
+
+
 def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
     grouped: dict[tuple[str, str, int, str, str, int], dict[str, object]] = {}
     for payload_path in payload_paths:
@@ -1476,22 +1497,17 @@ def main() -> None:
             stage_name = f"stage_b_native_{str(token_position_id)}"
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_native_{str(token_position_id)}"
             native_root = results_root / f"{stage_timestamp}_mcqa_plot_native_support"
-            expected_outputs = [str(native_root / "layer_sweep_manifest.json")]
             native_resolutions = tuple(int(width) for width in normalized["native_resolutions"])
-            for layer in selected_layers:
-                for native_resolution in native_resolutions:
-                    expected_outputs.append(
-                        str(
-                            native_root
-                            / f"layer_{int(layer):02d}"
-                            / (
-                                f"mcqa_plot_native_support_layer-{int(layer)}_pos-last_token"
-                                f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}.json"
-                            )
-                        )
-                    )
-            if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
-                native_payload_paths.extend(Path(path) for path in expected_outputs[1:])
+            manifest_output_path = native_root / "layer_sweep_manifest.json"
+            payload_output_paths = _expected_stage_b_native_payload_paths(
+                native_root=native_root,
+                selected_layers=selected_layers,
+                native_resolutions=native_resolutions,
+                signature_mode=str(args.signature_mode),
+            )
+            expected_outputs = [str(manifest_output_path), *[str(path) for path in payload_output_paths]]
+            if all(_stage_output_is_valid(path) for path in payload_output_paths):
+                native_payload_paths.extend(payload_output_paths)
                 _mark_stage(
                     manifest_path=manifest_path,
                     repo_root=repo_root,
@@ -1538,10 +1554,10 @@ def main() -> None:
                 },
             )
             stage_runtime_seconds = _run_stage_command(stage=stage, repo_root=repo_root)
-            missing_outputs = [path for path in expected_outputs if not _stage_output_is_valid(Path(path))]
+            missing_outputs = [str(path) for path in payload_output_paths if not _stage_output_is_valid(path)]
             if missing_outputs:
                 raise RuntimeError(f"Stage {stage_name} missing outputs: {missing_outputs}")
-            native_payload_paths.extend(Path(path) for path in expected_outputs[1:])
+            native_payload_paths.extend(payload_output_paths)
             _mark_stage(
                 manifest_path=manifest_path,
                 repo_root=repo_root,
@@ -1564,6 +1580,31 @@ def main() -> None:
             sweep_root / "stage_b_native_support_rankings.txt",
             _format_native_summary(title="MCQA Hierarchical Stage B Native Support Ranking", rankings=native_ot_rankings),
         )
+    elif "stage_c_plot_das_native_support" in normalized["stages"]:
+        for token_position_id, rankings in stage_a_rankings_by_token.items():
+            if str(token_position_id) != "last_token":
+                continue
+            selected_layers = _select_stage_b_layers(
+                rankings=rankings,
+                top_layers_per_var=int(args.stage_b_top_layers_per_var),
+                neighbor_radius=int(args.stage_b_neighbor_radius),
+                max_layers_per_var=int(args.stage_b_max_layers_per_var),
+            )
+            if not selected_layers:
+                continue
+            stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_native_{str(token_position_id)}"
+            native_root = results_root / f"{stage_timestamp}_mcqa_plot_native_support"
+            native_resolutions = tuple(int(width) for width in normalized["native_resolutions"])
+            native_payload_paths.extend(
+                path
+                for path in _expected_stage_b_native_payload_paths(
+                    native_root=native_root,
+                    selected_layers=selected_layers,
+                    native_resolutions=native_resolutions,
+                    signature_mode=str(args.signature_mode),
+                )
+                if _stage_output_is_valid(path)
+            )
 
     if "stage_c_plot_das_layer" in normalized["stages"]:
         layer_das_payload_paths: list[Path] = []
