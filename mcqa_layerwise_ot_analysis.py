@@ -19,11 +19,14 @@ from mcqa_experiment.data import canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
     load_prepared_alignment_artifacts,
+    normalize_transport_rows,
     prepare_alignment_artifacts,
-    run_alignment_pipeline,
     run_bruteforce_site_pipeline,
     save_prepared_alignment_artifacts,
+    solve_ot_transport,
+    solve_uot_transport,
 )
+from mcqa_experiment.metrics import build_variable_signature
 from mcqa_experiment.reporting import write_text_report
 from mcqa_experiment.runtime import write_json
 from mcqa_experiment.sites import enumerate_residual_sites
@@ -412,8 +415,8 @@ def _transport_output_name(config: dict[str, object]) -> str:
     method = str(config["method"])
     epsilon = float(config["ot_epsilon"])
     if method == "ot":
-        return f"ot_eps-{epsilon:g}.json"
-    return f"uot_eps-{epsilon:g}_betan-{float(config['uot_beta_neural']):g}.json"
+        return f"ot_eps-{epsilon:g}_transport_only.json"
+    return f"uot_eps-{epsilon:g}_betan-{float(config['uot_beta_neural']):g}_transport_only.json"
 
 
 def _single_layer_entry_by_layer(entries: list[dict[str, object]]) -> dict[int, dict[str, object]]:
@@ -448,6 +451,17 @@ def _run_transport_sweeps(
     )
     runs: list[dict[str, object]] = []
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
+    variable_signatures_by_var = {
+        str(target_var): build_variable_signature(
+            banks_by_split["train"][str(target_var)],
+            str(signature_mode),
+        )
+        for target_var in target_vars
+    }
+    site_signatures_by_var = {
+        str(target_var): tensor
+        for target_var, tensor in prepared_artifacts["site_signatures_by_var"].items()
+    }
     iterator = configs
     if tqdm is not None:
         iterator = tqdm(configs, desc="Transport sweeps", leave=False)
@@ -459,42 +473,63 @@ def _run_transport_sweeps(
         payload = _load_existing_payload(output_path)
         if payload is None:
             print(
-                f"[layerwise] transport method={method} epsilon={epsilon:g}"
+                f"[layerwise] transport-only method={method} epsilon={epsilon:g}"
                 + ("" if beta_neural is None else f" uot_beta_neural={float(beta_neural):g}")
             )
-            per_var_payloads: dict[str, dict[str, object]] = {}
-            for target_var in target_vars:
-                per_var_payloads[str(target_var)] = run_alignment_pipeline(
-                    model=model,
-                    fit_banks_by_var={source_var: banks_by_split["train"][source_var] for source_var in target_vars},
-                    calibration_bank=banks_by_split["calibration"][str(target_var)],
-                    holdout_bank=banks_by_split["test"][str(target_var)],
-                    sites=sites,
-                    device=device,
-                    tokenizer=tokenizer,
-                    config=OTConfig(
-                        method=method,
-                        batch_size=int(batch_size),
-                        epsilon=float(epsilon),
-                        uot_beta_neural=1.0 if beta_neural is None else float(beta_neural),
-                        signature_mode=str(signature_mode),
-                        top_k_values=top_k_values,
-                        lambda_values=lambda_values,
-                        selection_verbose=True,
-                        source_target_vars=target_vars,
-                        calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                        calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                        top_k_values_by_var={str(target_var): top_k_values for target_var in target_vars},
-                        lambda_values_by_var={str(target_var): lambda_values for target_var in target_vars},
-                    ),
-                    prepared_artifacts=prepared_artifacts,
+            config = OTConfig(
+                method=method,
+                batch_size=int(batch_size),
+                epsilon=float(epsilon),
+                uot_beta_neural=1.0 if beta_neural is None else float(beta_neural),
+                signature_mode=str(signature_mode),
+                top_k_values=top_k_values,
+                lambda_values=lambda_values,
+                selection_verbose=True,
+                source_target_vars=target_vars,
+                calibration_metric=DEFAULT_CALIBRATION_METRIC,
+                calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
+                top_k_values_by_var={str(target_var): top_k_values for target_var in target_vars},
+                lambda_values_by_var={str(target_var): lambda_values for target_var in target_vars},
+            )
+            if method == "ot":
+                transport, transport_meta = solve_ot_transport(
+                    variable_signatures_by_var,
+                    site_signatures_by_var,
+                    config,
                 )
+            elif method == "uot":
+                transport, transport_meta = solve_uot_transport(
+                    variable_signatures_by_var,
+                    site_signatures_by_var,
+                    config,
+                )
+            else:
+                raise ValueError(f"Unsupported transport method {method}")
+            normalized_transport = normalize_transport_rows(transport)
+            per_var_payloads: dict[str, dict[str, object]] = {}
+            for target_row_index, target_var in enumerate(target_vars):
+                target_transport = transport[target_row_index : target_row_index + 1]
+                target_normalized_transport = normalized_transport[target_row_index : target_row_index + 1]
+                per_var_payloads[str(target_var)] = {
+                    "kind": "mcqa_layerwise_transport_target_row",
+                    "method": method,
+                    "target_var": str(target_var),
+                    "ot_epsilon": float(epsilon),
+                    "uot_beta_neural": None if beta_neural is None else float(beta_neural),
+                    "target_row_index": int(target_row_index),
+                    "target_transport": target_transport.tolist(),
+                    "target_normalized_transport": target_normalized_transport.tolist(),
+                    "transport_meta": dict(transport_meta),
+                    "selection_basis": "coupling_row_argmax_then_fixed_strength_single_layer_lookup",
+                }
             payload = {
-                "kind": "mcqa_layerwise_transport_analysis_run",
+                "kind": "mcqa_layerwise_transport_analysis_run_transport_only",
                 "method": method,
                 "ot_epsilon": float(epsilon),
                 "uot_beta_neural": None if beta_neural is None else float(beta_neural),
                 "target_vars": list(target_vars),
+                "selection_basis": "coupling_row_argmax_then_fixed_strength_single_layer_lookup",
+                "transport_meta": dict(transport_meta),
                 "by_var": per_var_payloads,
             }
             output_path.parent.mkdir(parents=True, exist_ok=True)
