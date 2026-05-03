@@ -126,7 +126,15 @@ def main() -> None:
     native_payload = _load_json(native_support_path)
     layer = int(native_payload["layer"])
     token_position_id = str(native_payload["token_position_id"])
-    native_resolution = int(native_payload.get("native_resolution", native_payload["atomic_width"]))
+    native_resolution_value = native_payload.get("native_resolution")
+    if native_resolution_value is None:
+        native_resolution_value = native_payload.get("atomic_width")
+    if native_resolution_value is None:
+        raise KeyError(
+            f"Native support payload {native_support_path} is missing both "
+            "'native_resolution' and legacy 'atomic_width'."
+        )
+    native_resolution = int(native_resolution_value)
 
     results_root = Path(args.results_root)
     results_timestamp = args.results_timestamp or os.environ.get("RESULTS_TIMESTAMP") or base_run.RUN_TIMESTAMP

@@ -69,6 +69,7 @@ DAS_MIN_EPOCHS = 5
 DAS_PLATEAU_PATIENCE = 1
 DAS_PLATEAU_REL_DELTA = 1e-3
 DAS_LEARNING_RATE = 1e-3
+DAS_RESTARTS = 2
 DAS_SUBSPACE_DIMS = [
     32,
     64,
@@ -414,6 +415,7 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                     das_plateau_patience=DAS_PLATEAU_PATIENCE,
                     das_plateau_rel_delta=DAS_PLATEAU_REL_DELTA,
                     das_learning_rate=DAS_LEARNING_RATE,
+                    das_restarts=DAS_RESTARTS,
                     das_subspace_dims=tuple(DAS_SUBSPACE_DIMS),
                     resolution=resolved_resolution,
                     layers=tuple(selected_layers),

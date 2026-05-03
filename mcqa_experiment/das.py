@@ -38,6 +38,30 @@ def _sync_if_cuda(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _module_device(module: torch.nn.Module) -> torch.device | None:
+    parameter = next(module.parameters(), None)
+    if parameter is not None:
+        return parameter.device
+    buffer = next(module.buffers(), None)
+    if buffer is not None:
+        return buffer.device
+    return None
+
+
+def _ensure_model_on_device(model, device: torch.device, *, verbose: bool, method_name: str) -> torch.device | None:
+    current_device = _module_device(model)
+    if current_device == device:
+        return current_device
+    if verbose:
+        print(
+            f"[{method_name.upper()}] moving model to device={device} "
+            f"(current_device={current_device})"
+        )
+    model.to(device)
+    _sync_if_cuda(device)
+    return _module_device(model)
+
+
 def _mini_bank_from_batch(bank: MCQAPairBank, batch: dict[str, object]) -> MCQAPairBank:
     """Rebuild a lightweight bank for one minibatch using the current schema."""
 
@@ -182,6 +206,12 @@ def run_das_pipeline(
     pca_bases_by_id: dict[str, LayerPCABasis] | None = None,
 ) -> dict[str, object]:
     device = torch.device(device)
+    model_device = _ensure_model_on_device(
+        model,
+        device,
+        verbose=bool(config.verbose),
+        method_name=str(config.method_name),
+    )
     _sync_if_cuda(device)
     total_start = perf_counter()
     train_calibrate_seconds = 0.0
@@ -218,7 +248,8 @@ def run_das_pipeline(
     if config.verbose:
         print(
             f"[{config.method_name.upper()}] start variable={train_bank.target_var} "
-            f"sites={len(sites)} subspace_dims={list(default_subspace_dims)} total_candidates={total_candidates}"
+            f"device={device} model_device={model_device} sites={len(sites)} "
+            f"subspace_dims={list(default_subspace_dims)} total_candidates={total_candidates}"
         )
     for site in sites:
         for subspace_dim in subspace_dims_by_site[site]:
