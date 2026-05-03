@@ -78,15 +78,15 @@ def _parse_csv_floats(value: str | None) -> tuple[float, ...]:
     return tuple(float(item) for item in _parse_csv_strings(value))
 
 
-def _parse_stage_a_fixed_layers(value: str | None) -> dict[str, int]:
+def _parse_stage_a_fixed_layers(value: str | None) -> dict[str, tuple[int, ...]]:
     if value is None or str(value).strip() == "":
         return {}
-    resolved: dict[str, int] = {}
+    resolved: dict[str, tuple[int, ...]] = {}
     for item in _parse_csv_strings(value):
         if ":" not in item:
             raise ValueError(
                 "--stage-a-fixed-layers entries must look like "
-                "'answer_pointer:17,answer_token:24'"
+                "'answer_pointer:17|18|19,answer_token:24|23|22'"
             )
         target_var, layer_text = item.split(":", 1)
         target_var = str(target_var).strip()
@@ -97,7 +97,21 @@ def _parse_stage_a_fixed_layers(value: str | None) -> dict[str, int]:
             )
         if target_var in resolved:
             raise ValueError(f"Duplicate target var in --stage-a-fixed-layers: {target_var}")
-        resolved[target_var] = int(layer_text.strip())
+        layer_values = tuple(
+            int(layer.strip())
+            for layer in str(layer_text).split("|")
+            if str(layer).strip() != ""
+        )
+        if not layer_values:
+            raise ValueError(
+                f"--stage-a-fixed-layers must provide at least one layer for {target_var}"
+            )
+        deduped = tuple(dict.fromkeys(int(layer) for layer in layer_values if int(layer) >= 0))
+        if not deduped:
+            raise ValueError(
+                f"--stage-a-fixed-layers must provide at least one non-negative layer for {target_var}"
+            )
+        resolved[target_var] = deduped
     missing = [target_var for target_var in DEFAULT_TARGET_VARS if target_var not in resolved]
     if missing:
         raise ValueError(
@@ -280,8 +294,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional fixed Stage A layer override like "
-            "'answer_pointer:17,answer_token:24'. When set, Stage A transport "
-            "is skipped and downstream stages use these layers."
+            "'answer_pointer:17|18|19,answer_token:24|23|22'. When set, Stage A "
+            "transport is skipped and downstream stages use these ordered layers."
         ),
     )
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
@@ -361,7 +375,10 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "target_vars": tuple(str(target_var) for target_var in target_vars),
         "stage_a_token_position_ids": tuple(str(token_position_id) for token_position_id in stage_a_token_position_ids),
         "stage_a_layer_indices": tuple(int(layer) for layer in stage_a_layer_indices),
-        "stage_a_fixed_layers": {str(target_var): int(layer) for target_var, layer in stage_a_fixed_layers.items()},
+        "stage_a_fixed_layers": {
+            str(target_var): tuple(int(layer) for layer in layers)
+            for target_var, layers in stage_a_fixed_layers.items()
+        },
         "pca_site_menus": tuple(str(site_menu) for site_menu in pca_site_menus),
         "pca_basis_source_modes": tuple(str(mode) for mode in pca_basis_source_modes),
         "pca_num_bands_values": tuple(int(value) for value in pca_num_bands_values),
@@ -920,44 +937,48 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
 def _fixed_stage_a_rankings(
     *,
     token_position_id: str,
-    fixed_layers_by_var: dict[str, int],
+    fixed_layers_by_var: dict[str, tuple[int, ...]],
 ) -> dict[str, list[dict[str, object]]]:
     rankings: dict[str, list[dict[str, object]]] = {}
     display_method_by_var: dict[str, dict[str, object]] = {}
     for target_var in DEFAULT_TARGET_VARS:
-        layer = int(fixed_layers_by_var[str(target_var)])
-        site_label = f"L{int(layer)}:{str(token_position_id)}"
-        rankings[str(target_var)] = [
-            {
-                "layer": int(layer),
-                "selection_score": 1.0,
-                "target_row_transport_mass": 1.0,
-                "site_label": site_label,
-                "runtime_seconds": 0.0,
-                "selection_basis": "manual_fixed_stage_a_layer_override",
-            }
-        ]
+        layers = tuple(int(layer) for layer in fixed_layers_by_var[str(target_var)])
+        rankings[str(target_var)] = []
+        for index, layer in enumerate(layers):
+            score = float(len(layers) - index)
+            site_label = f"L{int(layer)}:{str(token_position_id)}"
+            rankings[str(target_var)].append(
+                {
+                    "layer": int(layer),
+                    "selection_score": score,
+                    "target_row_transport_mass": score,
+                    "site_label": site_label,
+                    "runtime_seconds": 0.0,
+                    "selection_basis": "manual_fixed_stage_a_layer_override",
+                }
+            )
+        lead_layer = int(layers[0])
         display_method_by_var[str(target_var)] = {
             "method": "fixed_layer_override",
-            "layer": int(layer),
+            "layer": int(lead_layer),
             "exact_acc": None,
             "selection_score": None,
             "epsilon": None,
-            "site_label": site_label,
-            "candidate_site_labels": [site_label],
+            "site_label": f"L{int(lead_layer)}:{str(token_position_id)}",
+            "candidate_site_labels": [f"L{int(layer)}:{str(token_position_id)}" for layer in layers],
             "selection_basis": "manual_fixed_stage_a_layer_override",
         }
     rankings["_display_method_by_var"] = display_method_by_var
     return rankings
 
 
-def _print_stage_a_fixed_layer_override(*, token_position_id: str, fixed_layers_by_var: dict[str, int]) -> None:
+def _print_stage_a_fixed_layer_override(*, token_position_id: str, fixed_layers_by_var: dict[str, tuple[int, ...]]) -> None:
     print("")
     print(f"[stageA] using fixed layer override for token_position={token_position_id}")
     for target_var in DEFAULT_TARGET_VARS:
         print("")
         print(f"  [{target_var}]")
-        print(f"  fixed_layer={int(fixed_layers_by_var[str(target_var)])}")
+        print(f"  fixed_layers={list(int(layer) for layer in fixed_layers_by_var[str(target_var)])}")
     print("")
 
 
@@ -1473,7 +1494,10 @@ def main() -> None:
             ranking_txt_path = sweep_root / f"stage_a_{str(token_position_id)}_layer_rankings.txt"
             rankings = _fixed_stage_a_rankings(
                 token_position_id=str(token_position_id),
-                fixed_layers_by_var={str(target_var): int(layer) for target_var, layer in fixed_stage_a_layers.items()},
+                fixed_layers_by_var={
+                    str(target_var): tuple(int(layer) for layer in layers)
+                    for target_var, layers in fixed_stage_a_layers.items()
+                },
             )
             _write_json(ranking_json_path, rankings)
             _write_text(
@@ -1482,7 +1506,10 @@ def main() -> None:
             )
             _print_stage_a_fixed_layer_override(
                 token_position_id=str(token_position_id),
-                fixed_layers_by_var={str(target_var): int(layer) for target_var, layer in fixed_stage_a_layers.items()},
+                fixed_layers_by_var={
+                    str(target_var): tuple(int(layer) for layer in layers)
+                    for target_var, layers in fixed_stage_a_layers.items()
+                },
             )
             stage_a_rankings_by_token[str(token_position_id)] = rankings
             stage_a_summary_paths.extend([ranking_json_path, ranking_txt_path])
@@ -1500,7 +1527,8 @@ def main() -> None:
                     "runtime_seconds": 0.0,
                     "wall_runtime_seconds": 0.0,
                     "fixed_layers_by_var": {
-                        str(target_var): int(layer) for target_var, layer in fixed_stage_a_layers.items()
+                        str(target_var): [int(layer) for layer in layers]
+                        for target_var, layers in fixed_stage_a_layers.items()
                     },
                     "completed_at": datetime.now().isoformat(),
                 },
