@@ -104,6 +104,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--single-layer-lambdas",
         help="Single fixed intervention strength for per-layer single-site evaluation. Default: 1.0",
     )
+    parser.add_argument(
+        "--single-layer-results-path",
+        help=(
+            "Optional path to a prior layerwise_ot_results.json file whose fixed-strength brute-force "
+            "single-layer results should be reused instead of recomputed."
+        ),
+    )
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument("--results-root", default="results")
     parser.add_argument("--results-timestamp")
@@ -142,6 +149,36 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _load_single_layer_results_payload(path: Path) -> tuple[dict[str, list[dict[str, object]]], dict[str, dict[str, list[dict[str, object]]]]]:
+    payload = _load_existing_payload(path)
+    if payload is None:
+        raise FileNotFoundError(f"Could not load single-layer results payload from {path}")
+    single_layer_by_var = payload.get("single_layer_by_var")
+    if not isinstance(single_layer_by_var, dict):
+        raise ValueError(f"single_layer_by_var missing or invalid in {path}")
+    normalized_single_layer_by_var: dict[str, list[dict[str, object]]] = {}
+    for target_var, entries in single_layer_by_var.items():
+        if not isinstance(entries, list):
+            raise ValueError(f"single_layer_by_var[{target_var!r}] is not a list in {path}")
+        normalized_single_layer_by_var[str(target_var)] = [
+            dict(entry) for entry in entries if isinstance(entry, dict)
+        ]
+    single_layer_rankings_by_var = payload.get("single_layer_rankings_by_var")
+    if isinstance(single_layer_rankings_by_var, dict):
+        normalized_rankings_by_var: dict[str, dict[str, list[dict[str, object]]]] = {}
+        for target_var, ranking_payload in single_layer_rankings_by_var.items():
+            if not isinstance(ranking_payload, dict):
+                continue
+            normalized_rankings_by_var[str(target_var)] = {
+                str(label): [dict(entry) for entry in entries if isinstance(entry, dict)]
+                for label, entries in ranking_payload.items()
+                if isinstance(entries, list)
+            }
+    else:
+        normalized_rankings_by_var = _build_single_layer_rankings(normalized_single_layer_by_var)
+    return normalized_single_layer_by_var, normalized_rankings_by_var
 
 
 def _format_strength_tag(value: float) -> str:
@@ -860,20 +897,28 @@ def main() -> None:
         )
     _synchronize_if_cuda(device)
 
-    single_layer_root = sweep_root / "single_layer"
     transport_root = sweep_root / "transport"
-    single_layer_by_var = _evaluate_all_layers(
-        model=model,
-        tokenizer=tokenizer,
-        banks_by_split=banks_by_split,
-        sites=sites,
-        device=device,
-        batch_size=int(args.batch_size),
-        signature_mode=str(args.signature_mode),
-        lambda_values=single_layer_lambdas,
-        output_root=single_layer_root,
-    )
-    single_layer_rankings_by_var = _build_single_layer_rankings(single_layer_by_var)
+    reused_single_layer_results_path = None
+    if args.single_layer_results_path:
+        reused_single_layer_results_path = Path(str(args.single_layer_results_path))
+        print(f"[layerwise] reusing single-layer brute-force results from {reused_single_layer_results_path}")
+        single_layer_by_var, single_layer_rankings_by_var = _load_single_layer_results_payload(
+            reused_single_layer_results_path
+        )
+    else:
+        single_layer_root = sweep_root / "single_layer"
+        single_layer_by_var = _evaluate_all_layers(
+            model=model,
+            tokenizer=tokenizer,
+            banks_by_split=banks_by_split,
+            sites=sites,
+            device=device,
+            batch_size=int(args.batch_size),
+            signature_mode=str(args.signature_mode),
+            lambda_values=single_layer_lambdas,
+            output_root=single_layer_root,
+        )
+        single_layer_rankings_by_var = _build_single_layer_rankings(single_layer_by_var)
     transport_runs: list[dict[str, object]] = []
     transport_summaries: list[dict[str, object]] = []
     if methods:
@@ -923,6 +968,7 @@ def main() -> None:
             "ot_top_k_values": [int(value) for value in ot_top_k_values],
             "ot_lambdas": [float(value) for value in ot_lambdas],
             "single_layer_lambdas": [float(value) for value in single_layer_lambdas],
+            "single_layer_results_path": None if reused_single_layer_results_path is None else str(reused_single_layer_results_path),
             "site_labels": [site.label for site in sites],
             "context_timing_seconds": context_timing_seconds,
             "timing_seconds": {
