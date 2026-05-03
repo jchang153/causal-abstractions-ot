@@ -804,7 +804,8 @@ def _select_hyperparameters(
     model,
     calibration_bank: MCQAPairBank,
     sites: list[SiteLike],
-    normalized_transport: np.ndarray,
+    selection_transport: np.ndarray,
+    renormalize_selected_transport: bool,
     batch_size: int,
     device: torch.device,
     tokenizer,
@@ -834,7 +835,11 @@ def _select_hyperparameters(
             leave=False,
         )
     for top_k, strength in candidate_iterator:
-        truncated = truncate_transport_rows(normalized_transport, top_k, renormalize=True)
+        truncated = truncate_transport_rows(
+            selection_transport,
+            top_k,
+            renormalize=renormalize_selected_transport,
+        )
         result, ranking = _evaluate_soft_intervention(
             model=model,
             bank=calibration_bank,
@@ -1058,7 +1063,8 @@ def run_alignment_pipeline(
         model=model,
         calibration_bank=calibration_bank,
         sites=sites,
-        normalized_transport=selection_transport,
+        selection_transport=selection_transport,
+        renormalize_selected_transport=renormalize_selected_transport,
         batch_size=config.batch_size,
         device=device,
         tokenizer=tokenizer,

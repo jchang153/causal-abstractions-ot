@@ -166,6 +166,100 @@ def _iter_stage_a_transport_payloads(compare_payload: dict[str, object]) -> list
     return payloads
 
 
+def _evaluate_stage_a_config(
+    *,
+    model,
+    tokenizer,
+    banks_by_split: dict[str, dict[str, object]],
+    sites,
+    compare_payload: dict[str, object],
+    device,
+    batch_size: int,
+    signature_mode: str,
+) -> dict[str, object]:
+    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
+    epsilon = float(compare_payload.get("ot_epsilon", 0.0))
+    compare_beta = compare_payload.get("uot_beta_neural")
+    per_var_records: dict[str, dict[str, object]] = {}
+    for target_var in target_vars:
+        for method_name, payload in _iter_stage_a_transport_payloads(compare_payload):
+            if str(payload.get("target_var")) != str(target_var):
+                continue
+            row_ranking = _target_row_ranking(payload, sites=sites)
+            top_site_index = int(row_ranking[0].get("site_index", -1)) if row_ranking else -1
+            if top_site_index < 0 and sites:
+                top_site_index = 0
+            candidate_sites = [sites[top_site_index]] if 0 <= int(top_site_index) < len(sites) else []
+            if not candidate_sites:
+                continue
+            brute_payload = run_bruteforce_site_pipeline(
+                model=model,
+                calibration_bank=banks_by_split["calibration"][str(target_var)],
+                holdout_bank=banks_by_split["test"][str(target_var)],
+                sites=candidate_sites,
+                device=device,
+                tokenizer=tokenizer,
+                config=OTConfig(
+                    method="bruteforce",
+                    batch_size=int(batch_size),
+                    epsilon=1.0,
+                    signature_mode=str(signature_mode),
+                    top_k_values=(1,),
+                    lambda_values=DEFAULT_STAGE_A_SINGLE_LAYER_LAMBDAS,
+                    selection_verbose=True,
+                    source_target_vars=target_vars,
+                    calibration_metric=DEFAULT_CALIBRATION_METRIC,
+                    calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
+                    lambda_values_by_var={str(target_var): DEFAULT_STAGE_A_SINGLE_LAYER_LAMBDAS},
+                ),
+            )
+            result = brute_payload.get("results", [{}])[0]
+            calibration_result = brute_payload.get("selected_calibration_result", result)
+            record = {
+                "method": str(payload.get("method", method_name)),
+                "variable": str(target_var),
+                "exact_acc": float(result.get("exact_acc", 0.0)),
+                "selection_score": float(calibration_result.get("exact_acc", result.get("selection_score", 0.0))),
+                "site_label": str(result.get("site_label", candidate_sites[0].label)),
+                "layer": int(result.get("layer", candidate_sites[0].layer)),
+                "epsilon": float(epsilon),
+                "uot_beta_neural": None
+                if payload.get("uot_beta_neural", compare_beta) is None
+                else float(payload.get("uot_beta_neural", compare_beta)),
+                "candidate_site_labels": [site.label for site in candidate_sites],
+                "candidate_layers": [int(site.layer) for site in candidate_sites],
+                "coupling_argmax_site_label": candidate_sites[0].label,
+                "coupling_argmax_layer": int(candidate_sites[0].layer),
+                "coupling_top_site_labels": [str(entry.get("site_label", "")) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
+                "coupling_top_layers": [int(entry.get("layer", -1)) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
+                "selection_basis": "single_site_on_coupling_argmax_layer_fixed_strength",
+                "target_row_ranking": row_ranking,
+                "payload": brute_payload,
+            }
+            per_var_records[str(target_var)] = record
+            break
+    calibration_scores = [
+        float(record.get("selection_score", 0.0))
+        for target_var in target_vars
+        for record in [per_var_records.get(str(target_var))]
+        if isinstance(record, dict)
+    ]
+    exact_scores = [
+        float(record.get("exact_acc", 0.0))
+        for target_var in target_vars
+        for record in [per_var_records.get(str(target_var))]
+        if isinstance(record, dict)
+    ]
+    return {
+        "method": "uot",
+        "epsilon": float(epsilon),
+        "uot_beta_neural": None if compare_beta is None else float(compare_beta),
+        "per_var_records": per_var_records,
+        "mean_calibration_score": float(sum(calibration_scores) / len(calibration_scores)) if calibration_scores else 0.0,
+        "mean_exact_acc": float(sum(exact_scores) / len(exact_scores)) if exact_scores else 0.0,
+    }
+
+
 def _select_layer_method_by_var(
     *,
     model,
@@ -177,79 +271,33 @@ def _select_layer_method_by_var(
     batch_size: int,
     signature_mode: str,
 ) -> dict[str, dict[str, object]]:
-    selected_by_var: dict[str, dict[str, object]] = {}
-    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
-    for target_var in target_vars:
-        best_record: dict[str, object] | None = None
-        for compare_payload in ot_compare_payloads:
-            epsilon = float(compare_payload.get("ot_epsilon", 0.0))
-            compare_beta = compare_payload.get("uot_beta_neural")
-            for method_name, payload in _iter_stage_a_transport_payloads(compare_payload):
-                if str(payload.get("target_var")) != str(target_var):
-                    continue
-                row_ranking = _target_row_ranking(payload, sites=sites)
-                top_site_index = int(row_ranking[0].get("site_index", -1)) if row_ranking else -1
-                if top_site_index < 0 and sites:
-                    top_site_index = 0
-                candidate_sites = [sites[top_site_index]] if 0 <= int(top_site_index) < len(sites) else []
-                if not candidate_sites:
-                    continue
-                brute_payload = run_bruteforce_site_pipeline(
-                    model=model,
-                    calibration_bank=banks_by_split["calibration"][str(target_var)],
-                    holdout_bank=banks_by_split["test"][str(target_var)],
-                    sites=candidate_sites,
-                    device=device,
-                    tokenizer=tokenizer,
-                    config=OTConfig(
-                        method="bruteforce",
-                        batch_size=int(batch_size),
-                        epsilon=1.0,
-                        signature_mode=str(signature_mode),
-                        top_k_values=(1,),
-                        lambda_values=DEFAULT_STAGE_A_SINGLE_LAYER_LAMBDAS,
-                        selection_verbose=True,
-                        source_target_vars=target_vars,
-                        calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                        calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                        lambda_values_by_var={str(target_var): DEFAULT_STAGE_A_SINGLE_LAYER_LAMBDAS},
-                    ),
-                )
-                result = brute_payload.get("results", [{}])[0]
-                selected_hyperparameters = dict(brute_payload.get("selected_hyperparameters", {}))
-                candidate = {
-                    "method": str(payload.get("method", method_name)),
-                    "variable": str(target_var),
-                    "exact_acc": float(result.get("exact_acc", 0.0)),
-                    "selection_score": float(result.get("selection_score", 0.0)),
-                    "site_label": str(result.get("site_label", selected_hyperparameters.get("site_label", ""))),
-                    "layer": int(result.get("layer", candidate_sites[0].layer)),
-                    "lambda": float(selected_hyperparameters.get("lambda", result.get("lambda", 0.0))),
-                    "epsilon": float(epsilon),
-                    "uot_beta_neural": None
-                    if payload.get("uot_beta_neural", compare_beta) is None
-                    else float(payload.get("uot_beta_neural", compare_beta)),
-                    "candidate_site_labels": [site.label for site in candidate_sites],
-                    "candidate_layers": [int(site.layer) for site in candidate_sites],
-                    "coupling_argmax_site_label": candidate_sites[0].label,
-                    "coupling_argmax_layer": int(candidate_sites[0].layer),
-                    "coupling_top_site_labels": [str(entry.get("site_label", "")) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
-                    "coupling_top_layers": [int(entry.get("layer", -1)) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
-                    "selection_basis": "single_site_on_coupling_argmax_layer",
-                    "target_row_ranking": row_ranking,
-                    "payload": brute_payload,
-                }
-                if best_record is None or (
-                    float(candidate["selection_score"]),
-                    float(candidate["exact_acc"]),
-                ) > (
-                    float(best_record["selection_score"]),
-                    float(best_record["exact_acc"]),
-                ):
-                    best_record = candidate
-        if best_record is not None:
-            selected_by_var[str(target_var)] = best_record
-    return selected_by_var
+    best_config: dict[str, object] | None = None
+    for compare_payload in ot_compare_payloads:
+        candidate_config = _evaluate_stage_a_config(
+            model=model,
+            tokenizer=tokenizer,
+            banks_by_split=banks_by_split,
+            sites=sites,
+            compare_payload=compare_payload,
+            device=device,
+            batch_size=batch_size,
+            signature_mode=signature_mode,
+        )
+        if best_config is None or (
+            float(candidate_config["mean_calibration_score"]),
+            float(candidate_config["mean_exact_acc"]),
+        ) > (
+            float(best_config["mean_calibration_score"]),
+            float(best_config["mean_exact_acc"]),
+        ):
+            best_config = candidate_config
+    if best_config is None:
+        return {}
+    return {
+        str(target_var): dict(record)
+        for target_var, record in best_config.get("per_var_records", {}).items()
+        if isinstance(record, dict)
+    }
 
 
 def _rank_layers_from_target_row(
@@ -273,7 +321,6 @@ def _rank_layers_from_target_row(
                 "epsilon": float(selected.get("epsilon", 0.0)),
                 "uot_beta_neural": selected.get("uot_beta_neural"),
                 "site_label": entry.get("site_label"),
-                "selected_lambda": float(selected.get("lambda", 0.0)),
                 "selected_site_label": selected.get("site_label"),
                 "runtime_seconds": float(runtime_seconds),
                 "selection_basis": "target_row_mass_from_selected_single_layer_method",
@@ -306,7 +353,6 @@ def _format_summary(
                 f"cal={float(selected.get('selection_score', 0.0)):.4f} "
                 f"eps={float(selected.get('epsilon', 0.0)):g} "
                 f"site={selected.get('site_label')} "
-                f"strength={float(selected.get('lambda', 0.0)):g} "
                 + (
                     f"beta_n={float(selected.get('uot_beta_neural')):g} "
                     if selected.get("uot_beta_neural") is not None

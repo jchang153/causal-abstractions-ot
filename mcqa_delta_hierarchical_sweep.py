@@ -847,7 +847,6 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
                 f"cal={float(display_entry.get('selection_score', -1.0)):.4f}",
                 f"eps={float(display_entry.get('epsilon', 0.0)):g}",
                 f"site={display_entry.get('site_label')}",
-                f"lambda={float(display_entry.get('lambda', 0.0)):g}",
                 f"candidates={display_entry.get('candidate_site_labels', [])}",
             ]
             if display_entry.get("uot_beta_neural") is not None:
@@ -898,6 +897,51 @@ def _select_stage_b_layers(
         ][: max(1, int(max_layers_per_var))]
         selected.extend(row_selected)
     return tuple(sorted(dict.fromkeys(selected)))
+
+
+def _select_stage_b_layers_by_var(
+    *,
+    rankings: dict[str, list[dict[str, object]]],
+    top_layers_per_var: int,
+    neighbor_radius: int = 1,
+    max_layers_per_var: int = 5,
+) -> dict[str, tuple[int, ...]]:
+    selected_by_var: dict[str, tuple[int, ...]] = {}
+    for target_var in DEFAULT_TARGET_VARS:
+        row_entries = rankings.get(target_var, [])
+        row_selected: list[int] = [
+            int(entry["layer"])
+            for entry in row_entries[: max(1, int(top_layers_per_var))]
+        ]
+        if row_entries:
+            best_layer = int(row_entries[0]["layer"])
+            for offset in range(-max(0, int(neighbor_radius)), max(0, int(neighbor_radius)) + 1):
+                row_selected.append(int(best_layer) + int(offset))
+        row_selected = [
+            layer
+            for layer in sorted(dict.fromkeys(row_selected))
+            if layer >= 0
+        ][: max(1, int(max_layers_per_var))]
+        selected_by_var[str(target_var)] = tuple(int(layer) for layer in row_selected)
+    return selected_by_var
+
+
+def _print_stage_b_layer_selection(
+    *,
+    token_position_id: str,
+    selected_by_var: dict[str, tuple[int, ...]],
+    selected_layers: tuple[int, ...],
+) -> None:
+    print("")
+    print(f"[stageB] selected Stage A layers for token_position={token_position_id}")
+    for target_var in DEFAULT_TARGET_VARS:
+        layers = list(int(layer) for layer in selected_by_var.get(str(target_var), ()))
+        print("")
+        print(f"  [{target_var}]")
+        print(f"  selected_layers={layers}")
+    print("")
+    print(f"  union_layers={list(int(layer) for layer in selected_layers)}")
+    print("")
 
 
 def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
@@ -1404,10 +1448,17 @@ def main() -> None:
                     stage_a_summary_paths.append(ranking_json_path)
 
     native_payload_paths: list[Path] = []
+    stage_b_selection_logged: set[str] = set()
     if "stage_b_plot_native_support" in normalized["stages"]:
         for token_position_id, rankings in stage_a_rankings_by_token.items():
             if str(token_position_id) != "last_token":
                 continue
+            selected_layers_by_var = _select_stage_b_layers_by_var(
+                rankings=rankings,
+                top_layers_per_var=int(args.stage_b_top_layers_per_var),
+                neighbor_radius=int(args.stage_b_neighbor_radius),
+                max_layers_per_var=int(args.stage_b_max_layers_per_var),
+            )
             selected_layers = _select_stage_b_layers(
                 rankings=rankings,
                 top_layers_per_var=int(args.stage_b_top_layers_per_var),
@@ -1416,6 +1467,12 @@ def main() -> None:
             )
             if not selected_layers:
                 continue
+            _print_stage_b_layer_selection(
+                token_position_id=str(token_position_id),
+                selected_by_var=selected_layers_by_var,
+                selected_layers=selected_layers,
+            )
+            stage_b_selection_logged.add(str(token_position_id))
             stage_name = f"stage_b_native_{str(token_position_id)}"
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_native_{str(token_position_id)}"
             native_root = results_root / f"{stage_timestamp}_mcqa_plot_native_support"
@@ -1587,6 +1644,12 @@ def main() -> None:
     stage_b_rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     if "stage_b_plot_pca_support" in normalized["stages"]:
         for token_position_id, rankings in stage_a_rankings_by_token.items():
+            selected_layers_by_var = _select_stage_b_layers_by_var(
+                rankings=rankings,
+                top_layers_per_var=int(args.stage_b_top_layers_per_var),
+                neighbor_radius=int(args.stage_b_neighbor_radius),
+                max_layers_per_var=int(args.stage_b_max_layers_per_var),
+            )
             selected_layers = _select_stage_b_layers(
                 rankings=rankings,
                 top_layers_per_var=int(args.stage_b_top_layers_per_var),
@@ -1595,6 +1658,13 @@ def main() -> None:
             )
             if not selected_layers:
                 continue
+            if str(token_position_id) not in stage_b_selection_logged:
+                _print_stage_b_layer_selection(
+                    token_position_id=str(token_position_id),
+                    selected_by_var=selected_layers_by_var,
+                    selected_layers=selected_layers,
+                )
+                stage_b_selection_logged.add(str(token_position_id))
             for basis_source_mode in normalized["pca_basis_source_modes"]:
                 for site_menu in normalized["pca_site_menus"]:
                     for num_bands in _normalize_num_bands_values(normalized["pca_num_bands_values"], str(site_menu)):
