@@ -235,7 +235,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration-pool-size", type=int, default=100)
     parser.add_argument("--test-pool-size", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--results-root", default="results/delta")
+    parser.add_argument("--results-root", default="results")
     parser.add_argument("--results-timestamp")
     parser.add_argument("--signatures-dir", default="signatures")
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)

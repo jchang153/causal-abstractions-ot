@@ -349,6 +349,14 @@ def _transport_output_name(config: dict[str, object]) -> str:
     return f"uot_eps-{epsilon:g}_betan-{float(config['uot_beta_neural']):g}.json"
 
 
+def _single_layer_entry_by_layer(entries: list[dict[str, object]]) -> dict[int, dict[str, object]]:
+    return {
+        int(entry["layer"]): entry
+        for entry in entries
+        if "layer" in entry
+    }
+
+
 def _run_transport_sweeps(
     *,
     model,
@@ -451,7 +459,12 @@ def _summarize_transport_runs(
             if not isinstance(payload, dict):
                 continue
             ranking = _target_row_ranking(payload, sites=sites)
-            result = payload.get("results", [{}])[0]
+            argmax_entry = ranking[0] if ranking else None
+            single_layer_lookup = _single_layer_entry_by_layer(single_layer_by_var.get(str(target_var), []))
+            selected_single_layer = (
+                single_layer_lookup.get(int(argmax_entry["layer"]))
+                if isinstance(argmax_entry, dict) and "layer" in argmax_entry else None
+            )
             calibration_compare = _ranking_comparison(
                 coupling_ranking=ranking,
                 actual_entries=single_layer_by_var.get(str(target_var), []),
@@ -471,13 +484,17 @@ def _summarize_transport_runs(
                     }
                     for entry in ranking[:10]
                 ],
-                "selected_transport_method_test_exact_acc": float(result.get("exact_acc", 0.0)),
-                "selected_transport_method_calibration_exact_acc": float(
-                    result.get("calibration_exact_acc", result.get("selection_exact_acc", 0.0))
-                ),
-                "selected_transport_method_calibration_score": float(result.get("selection_score", 0.0)),
-                "selected_top_k": int(payload.get("selected_hyperparameters", {}).get("top_k", 0)),
-                "selected_lambda": float(payload.get("selected_hyperparameters", {}).get("lambda", 0.0)),
+                "selected_coupling_layer": None if not isinstance(argmax_entry, dict) else int(argmax_entry["layer"]),
+                "selected_coupling_site_label": None if not isinstance(argmax_entry, dict) else str(argmax_entry.get("site_label")),
+                "selected_coupling_transport_mass": 0.0 if not isinstance(argmax_entry, dict) else float(argmax_entry.get("transport_mass", 0.0)),
+                "selected_coupling_layer_test_exact_acc": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("test_exact_acc", 0.0)),
+                "selected_coupling_layer_calibration_exact_acc": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("calibration_exact_acc", 0.0)),
+                "selected_coupling_layer_calibration_score": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("calibration_score", 0.0)),
+                "selected_coupling_layer_lambda": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("selected_lambda", 0.0)),
+                "selected_coupling_layer_output_path": None if not isinstance(selected_single_layer, dict) else str(selected_single_layer.get("output_path", "")),
+                "selected_transport_method_test_exact_acc": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("test_exact_acc", 0.0)),
+                "selected_transport_method_calibration_exact_acc": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("calibration_exact_acc", 0.0)),
+                "selected_transport_method_calibration_score": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("calibration_score", 0.0)),
                 "matched_mass": float(payload.get("transport_meta", {}).get("matched_mass", 1.0)),
                 "transport_meta": dict(payload.get("transport_meta", {})),
                 "calibration_ranking_comparison": calibration_compare,
@@ -550,8 +567,10 @@ def _format_transport_summary(transport_summaries: list[dict[str, object]]) -> l
             lines.append(
                 f"    coupling_top5={[item.get('layer') for item in top_layers[:5]]} "
                 f"matched_mass={float(entry.get('matched_mass', 1.0)):.4f} "
-                f"selected_top_k={int(entry.get('selected_top_k', 0))} "
-                f"selected_lambda={float(entry.get('selected_lambda', 0.0)):g}"
+                f"selected_layer={entry.get('selected_coupling_layer')} "
+                f"lambda={float(entry.get('selected_coupling_layer_lambda', 0.0)):g} "
+                f"cal={float(entry.get('selected_coupling_layer_calibration_exact_acc', 0.0)):.4f} "
+                f"test={float(entry.get('selected_coupling_layer_test_exact_acc', 0.0)):.4f}"
             )
             for label in ("calibration_ranking_comparison", "test_ranking_comparison"):
                 compare = entry.get(label, {})
@@ -591,6 +610,7 @@ def _format_summary(
         f"layers: {list(int(layer) for layer in layers)}",
         "",
         "This analysis compares joint 26-layer coupling rankings against per-layer single-site intervention accuracies.",
+        "Reported method accuracy uses the argmax layer from each target-variable coupling row, evaluated as a single-site intervention with a lambda sweep.",
         "",
     ]
     lines.extend(_format_single_layer_summary(single_layer_by_var))

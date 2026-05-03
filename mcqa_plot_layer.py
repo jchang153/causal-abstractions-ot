@@ -80,7 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--support-score-slack", type=float, default=0.05)
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
-    parser.add_argument("--results-root", default="results/delta")
+    parser.add_argument("--results-root", default="results")
     parser.add_argument("--results-timestamp")
     parser.add_argument("--signatures-dir", default="signatures")
     parser.add_argument("--prompt-hf-login", action="store_true")
@@ -170,18 +170,10 @@ def _select_layer_method_by_var(
                 if str(payload.get("target_var")) != str(target_var):
                     continue
                 row_ranking = _target_row_ranking(payload, sites=sites)
-                ranked_site_indices = [
-                    int(entry.get("site_index", -1))
-                    for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]
-                    if int(entry.get("site_index", -1)) >= 0
-                ]
-                if not ranked_site_indices:
-                    ranked_site_indices = list(range(min(DEFAULT_DISPLAY_TOP_LAYER_COUNT, len(sites))))
-                candidate_sites = [
-                    sites[site_index]
-                    for site_index in ranked_site_indices
-                    if 0 <= int(site_index) < len(sites)
-                ]
+                top_site_index = int(row_ranking[0].get("site_index", -1)) if row_ranking else -1
+                if top_site_index < 0 and sites:
+                    top_site_index = 0
+                candidate_sites = [sites[top_site_index]] if 0 <= int(top_site_index) < len(sites) else []
                 if not candidate_sites:
                     continue
                 brute_payload = run_bruteforce_site_pipeline(
@@ -217,7 +209,11 @@ def _select_layer_method_by_var(
                     "epsilon": float(epsilon),
                     "candidate_site_labels": [site.label for site in candidate_sites],
                     "candidate_layers": [int(site.layer) for site in candidate_sites],
-                    "selection_basis": f"best_single_layer_among_top_{DEFAULT_DISPLAY_TOP_LAYER_COUNT}_coupling_layers",
+                    "coupling_argmax_site_label": candidate_sites[0].label,
+                    "coupling_argmax_layer": int(candidate_sites[0].layer),
+                    "coupling_top_site_labels": [str(entry.get("site_label", "")) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
+                    "coupling_top_layers": [int(entry.get("layer", -1)) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
+                    "selection_basis": "single_site_on_coupling_argmax_layer",
                     "target_row_ranking": row_ranking,
                     "payload": brute_payload,
                 }
@@ -286,7 +282,7 @@ def _format_summary(
                 f"eps={float(selected.get('epsilon', 0.0)):g} "
                 f"site={selected.get('site_label')} "
                 f"lambda={float(selected.get('lambda', 0.0)):g} "
-                f"top_candidates={selected.get('candidate_site_labels', [])}"
+                f"coupling_argmax={selected.get('coupling_argmax_site_label')}"
             )
         if selected.get("target_row_ranking"):
             lines.append(
@@ -452,8 +448,8 @@ def main() -> None:
     )
     support_extract_seconds = float(perf_counter() - support_start)
     print(
-        f"[stageA] selecting PLOT(layer) winner by testing top {DEFAULT_DISPLAY_TOP_LAYER_COUNT} "
-        "coupling-ranked single layers per variable"
+        "[stageA] selecting PLOT(layer) winner by testing the argmax layer "
+        "from each target-variable coupling row"
     )
     method_by_var = _select_layer_method_by_var(
         model=model,
