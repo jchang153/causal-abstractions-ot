@@ -60,6 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
+    parser.add_argument("--target-vars", default="answer_pointer,answer_token")
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument("--das-subspace-dims", help="Comma-separated DAS dims. Default: paper grid.")
     parser.add_argument("--das-max-epochs", type=int, default=100)
@@ -122,7 +123,8 @@ def main() -> None:
     token_positions = context["token_positions"]
     banks_by_split = context["banks_by_split"]
     device = context["device"]
-    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
+    requested_target_vars = _parse_csv_strings(args.target_vars) or list(DEFAULT_TARGET_VARS)
+    target_vars = tuple(canonicalize_target_var(target_var) for target_var in requested_target_vars)
     das_subspace_dims = tuple(_parse_csv_ints(args.das_subspace_dims) or list(DEFAULT_DAS_SUBSPACE_DIMS))
 
     layer_dir = sweep_root / f"layer_{int(args.layer):02d}"
@@ -162,6 +164,7 @@ def main() -> None:
         "kind": "mcqa_plot_das_layer",
         "layer": int(args.layer),
         "token_position_id": str(args.token_position_id),
+        "target_vars": [str(target_var) for target_var in target_vars],
         "signature_mode": str(args.signature_mode),
         "das_subspace_dims": [int(dim) for dim in das_subspace_dims],
         "compare_output_path": str(compare_output_path),
@@ -175,12 +178,13 @@ def main() -> None:
         layer_dir / f"mcqa_plot_das_layer_layer-{int(args.layer)}_pos-{str(args.token_position_id)}_summary.txt",
         "\n".join(
             [
-                "MCQA PLOT-DAS (layer) Summary",
-                f"layer: {int(args.layer)}",
-                f"token_position_id: {str(args.token_position_id)}",
-                f"compare_output_path: {compare_output_path}",
-            ]
-        ),
+                        "MCQA PLOT-DAS (layer) Summary",
+                        f"layer: {int(args.layer)}",
+                        f"token_position_id: {str(args.token_position_id)}",
+                        f"target_vars: {list(str(target_var) for target_var in target_vars)}",
+                        f"compare_output_path: {compare_output_path}",
+                    ]
+                ),
     )
     print(f"Wrote layer DAS payload to {payload_path}")
 

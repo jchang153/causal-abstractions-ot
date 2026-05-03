@@ -47,6 +47,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-pool-size", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--native-support-path", required=True)
+    parser.add_argument("--target-vars", default="answer_pointer,answer_token")
     parser.add_argument("--guided-mask-names", help="Comma-separated support masks. Default: Top1,Top2,Top4,S50,S80")
     parser.add_argument(
         "--guided-subspace-dims",
@@ -159,12 +160,13 @@ def main() -> None:
         selected_token_position_ids=(str(token_position_id),),
     )
     mask_names = tuple(_parse_csv_strings(args.guided_mask_names) or list(DEFAULT_GUIDED_MASK_NAMES))
+    target_vars = tuple(_parse_csv_strings(args.target_vars) or list(DEFAULT_TARGET_VARS))
     explicit_dims = _parse_csv_ints(args.guided_subspace_dims)
 
     layer_dir = sweep_root / f"layer_{int(layer):02d}"
     layer_dir.mkdir(parents=True, exist_ok=True)
     payloads_by_var: dict[str, dict[str, object]] = {}
-    for target_var in DEFAULT_TARGET_VARS:
+    for target_var in target_vars:
         support_summary = native_payload.get("support_by_var", {}).get(str(target_var))
         if not isinstance(support_summary, dict):
             continue
@@ -245,6 +247,7 @@ def main() -> None:
         "layer": int(layer),
         "token_position_id": str(token_position_id),
         "native_resolution": int(native_resolution),
+        "target_vars": [str(target_var) for target_var in target_vars],
         "native_support_path": str(native_support_path),
         "guided_mask_names": [str(mask_name) for mask_name in mask_names],
         "payloads_by_var": payloads_by_var,

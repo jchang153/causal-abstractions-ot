@@ -283,6 +283,28 @@ def _select_layer_method_by_var(
             batch_size=batch_size,
             signature_mode=signature_mode,
         )
+        epsilon = float(candidate_config.get("epsilon", 0.0))
+        beta_neural = candidate_config.get("uot_beta_neural")
+        print(
+            f"[stageA] config_result eps={epsilon:g} "
+            + (
+                f"beta_neural={float(beta_neural):g} "
+                if beta_neural is not None else ""
+            )
+            + f"mean_cal={float(candidate_config.get('mean_calibration_score', 0.0)):.4f} "
+            + f"mean_test={float(candidate_config.get('mean_exact_acc', 0.0)):.4f}"
+        )
+        for target_var in target_vars:
+            record = candidate_config.get("per_var_records", {}).get(str(target_var))
+            if not isinstance(record, dict):
+                continue
+            print(
+                f"  [{str(target_var)}] "
+                f"chosen_layer={int(record.get('layer', -1))} "
+                f"cal={float(record.get('selection_score', 0.0)):.4f} "
+                f"test={float(record.get('exact_acc', 0.0)):.4f} "
+                f"top_layers={list(int(layer) for layer in record.get('coupling_top_layers', []))}"
+            )
         if best_config is None or (
             float(candidate_config["mean_calibration_score"]),
             float(candidate_config["mean_exact_acc"]),

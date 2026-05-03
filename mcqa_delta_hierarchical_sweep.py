@@ -590,6 +590,7 @@ def _build_layer_das_command(
     stage_timestamp: str,
     token_position_id: str,
     layer: int,
+    target_vars: tuple[str, ...],
 ) -> tuple[str, ...]:
     command = [
         sys.executable,
@@ -616,6 +617,8 @@ def _build_layer_das_command(
         str(int(layer)),
         "--token-position-id",
         str(token_position_id),
+        "--target-vars",
+        ",".join(str(target_var) for target_var in target_vars),
         "--signature-mode",
         str(args.signature_mode),
         "--das-subspace-dims",
@@ -639,6 +642,7 @@ def _build_native_support_das_command(
     normalized: dict[str, object],
     stage_timestamp: str,
     native_support_path: Path,
+    target_vars: tuple[str, ...],
 ) -> tuple[str, ...]:
     command = [
         sys.executable,
@@ -663,6 +667,8 @@ def _build_native_support_das_command(
         str(int(args.batch_size)),
         "--native-support-path",
         str(native_support_path),
+        "--target-vars",
+        ",".join(str(target_var) for target_var in target_vars),
         "--guided-mask-names",
         ",".join(str(mask_name) for mask_name in normalized["guided_mask_names"]),
         "--guided-max-epochs",
@@ -1052,6 +1058,53 @@ def _print_stage_b_layer_selection(
     print("")
     print(f"  union_layers={list(int(layer) for layer in selected_layers)}")
     print("")
+
+
+def _selected_target_vars_by_layer(
+    *,
+    selected_by_var: dict[str, tuple[int, ...]],
+) -> dict[int, tuple[str, ...]]:
+    resolved: dict[int, list[str]] = {}
+    for target_var in DEFAULT_TARGET_VARS:
+        for layer in selected_by_var.get(str(target_var), ()):
+            resolved.setdefault(int(layer), []).append(str(target_var))
+    return {
+        int(layer): tuple(dict.fromkeys(str(target_var) for target_var in target_vars))
+        for layer, target_vars in resolved.items()
+    }
+
+
+def _das_payload_matches_target_vars(*, payload_path: Path, expected_target_vars: tuple[str, ...]) -> bool:
+    if not _stage_output_is_valid(payload_path):
+        return False
+    payload = _load_json(payload_path)
+    if not isinstance(payload, dict):
+        return False
+    expected = tuple(str(target_var) for target_var in expected_target_vars)
+    actual = payload.get("target_vars")
+    if isinstance(actual, list):
+        return tuple(str(target_var) for target_var in actual) == expected
+    kind = str(payload.get("kind"))
+    if kind == "mcqa_plot_das_native_support":
+        payloads_by_var = payload.get("payloads_by_var", {})
+        if not isinstance(payloads_by_var, dict):
+            return False
+        return tuple(str(target_var) for target_var in payloads_by_var.keys()) == expected
+    if kind == "mcqa_plot_das_layer":
+        method_payloads = payload.get("method_payloads", {}).get("das", [])
+        actual_target_vars: list[str] = []
+        for method_payload in method_payloads:
+            if not isinstance(method_payload, dict):
+                continue
+            target_var = method_payload.get("target_var")
+            if target_var is None:
+                results = method_payload.get("results", [])
+                if results and isinstance(results[0], dict):
+                    target_var = results[0].get("variable")
+            if target_var is not None:
+                actual_target_vars.append(str(target_var))
+        return tuple(dict.fromkeys(actual_target_vars)) == expected
+    return False
 
 
 def _expected_stage_b_native_payload_paths(
@@ -1765,6 +1818,13 @@ def main() -> None:
     if "stage_c_plot_das_layer" in normalized["stages"]:
         layer_das_payload_paths: list[Path] = []
         for token_position_id, rankings in stage_a_rankings_by_token.items():
+            selected_layers_by_var = _select_stage_b_layers_by_var(
+                rankings=rankings,
+                top_layers_per_var=int(args.stage_b_top_layers_per_var),
+                neighbor_radius=int(args.stage_b_neighbor_radius),
+                max_layers_per_var=int(args.stage_b_max_layers_per_var),
+            )
+            selected_target_vars_by_layer = _selected_target_vars_by_layer(selected_by_var=selected_layers_by_var)
             selected_layers = _select_stage_b_layers(
                 rankings=rankings,
                 top_layers_per_var=int(args.stage_b_top_layers_per_var),
@@ -1772,15 +1832,19 @@ def main() -> None:
                 max_layers_per_var=int(args.stage_b_max_layers_per_var),
             )
             for layer in selected_layers:
+                target_vars = selected_target_vars_by_layer.get(int(layer), tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS))
                 stage_name = f"stage_c_layer_{str(token_position_id)}_L{int(layer):02d}"
                 stage_timestamp = f"{str(normalized['results_timestamp'])}_stageC_layer_{str(token_position_id)}_L{int(layer):02d}"
                 run_root = results_root / f"{stage_timestamp}_mcqa_plot_das_layer"
                 payload_path = run_root / f"layer_{int(layer):02d}" / f"mcqa_plot_das_layer_layer-{int(layer)}_pos-{str(token_position_id)}_summary.json"
-                if not _stage_output_is_valid(payload_path):
+                if not _das_payload_matches_target_vars(payload_path=payload_path, expected_target_vars=target_vars):
                     stage = SweepStage(
                         name=stage_name,
                         category="stage_c_plot_das_layer",
-                        description=f"Standalone layer DAS for token position {token_position_id} layer {int(layer)}.",
+                        description=(
+                            f"Standalone layer DAS for token position {token_position_id} layer {int(layer)} "
+                            f"target_vars={list(target_vars)}."
+                        ),
                         stage_timestamp=stage_timestamp,
                         command=_build_layer_das_command(
                             args=args,
@@ -1788,6 +1852,7 @@ def main() -> None:
                             stage_timestamp=stage_timestamp,
                             token_position_id=str(token_position_id),
                             layer=int(layer),
+                            target_vars=target_vars,
                         ),
                         expected_outputs=(str(payload_path),),
                     )
@@ -1803,27 +1868,42 @@ def main() -> None:
 
     if "stage_c_plot_das_native_support" in normalized["stages"] and native_payload_paths:
         native_das_payload_paths: list[Path] = []
+        native_target_vars_by_layer: dict[int, tuple[str, ...]] = {}
+        for token_position_id, rankings in stage_a_rankings_by_token.items():
+            selected_layers_by_var = _select_stage_b_layers_by_var(
+                rankings=rankings,
+                top_layers_per_var=int(args.stage_b_top_layers_per_var),
+                neighbor_radius=int(args.stage_b_neighbor_radius),
+                max_layers_per_var=int(args.stage_b_max_layers_per_var),
+            )
+            for layer, target_vars in _selected_target_vars_by_layer(selected_by_var=selected_layers_by_var).items():
+                native_target_vars_by_layer[int(layer)] = tuple(str(target_var) for target_var in target_vars)
         for native_payload_path in native_payload_paths:
             native_payload = _load_json(native_payload_path)
             if not isinstance(native_payload, dict):
                 continue
             layer = int(native_payload.get("layer"))
+            target_vars = native_target_vars_by_layer.get(int(layer), tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS))
             native_resolution = int(native_payload.get("native_resolution", native_payload.get("atomic_width")))
             stage_name = f"stage_c_native_L{int(layer):02d}_W{int(native_resolution):04d}"
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageC_native_L{int(layer):02d}_W{int(native_resolution):04d}"
             run_root = results_root / f"{stage_timestamp}_mcqa_plot_das_native_support"
             payload_path = run_root / f"layer_{int(layer):02d}" / f"mcqa_plot_das_native_support_layer-{int(layer)}_summary.json"
-            if not _stage_output_is_valid(payload_path):
+            if not _das_payload_matches_target_vars(payload_path=payload_path, expected_target_vars=target_vars):
                 stage = SweepStage(
                     name=stage_name,
                     category="stage_c_plot_das_native_support",
-                    description=f"Standalone native-support DAS for layer {int(layer)} width {int(native_resolution)}.",
+                    description=(
+                        f"Standalone native-support DAS for layer {int(layer)} width {int(native_resolution)} "
+                        f"target_vars={list(target_vars)}."
+                    ),
                     stage_timestamp=stage_timestamp,
                     command=_build_native_support_das_command(
                         args=args,
                         normalized=normalized,
                         stage_timestamp=stage_timestamp,
                         native_support_path=native_payload_path,
+                        target_vars=target_vars,
                     ),
                     expected_outputs=(str(payload_path),),
                 )
