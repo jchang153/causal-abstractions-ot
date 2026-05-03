@@ -8,15 +8,17 @@ from time import perf_counter
 
 import mcqa_run as base_run
 import torch
-from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparison
 from mcqa_experiment.data import canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
+    _evaluate_single_site_intervention,
     load_prepared_alignment_artifacts,
+    normalize_transport_rows,
     prepare_alignment_artifacts,
-    run_bruteforce_site_pipeline,
     save_prepared_alignment_artifacts,
+    solve_uot_transport,
 )
+from mcqa_experiment.metrics import build_variable_signature
 from mcqa_experiment.reporting import write_text_report
 from mcqa_experiment.runtime import write_json
 from mcqa_experiment.sites import enumerate_residual_sites
@@ -31,10 +33,8 @@ DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_UOT_BETA_NEURALS = (0.1, 0.3, 1.0, 3.0)
-DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
-DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_DISPLAY_TOP_LAYER_COUNT = 3
-DEFAULT_STAGE_A_SINGLE_LAYER_LAMBDAS = (1.0,)
+DEFAULT_STAGE_A_INTERVENTION_STRENGTH = 1.0
 
 
 def _synchronize_if_cuda(device: torch.device | str) -> None:
@@ -166,6 +166,123 @@ def _iter_stage_a_transport_payloads(compare_payload: dict[str, object]) -> list
     return payloads
 
 
+def _build_transport_only_compare_payload(
+    *,
+    target_vars: tuple[str, ...],
+    variable_signatures_by_var: dict[str, torch.Tensor],
+    site_signatures_by_var: dict[str, torch.Tensor],
+    epsilon: float,
+    beta_neural: float,
+    signature_mode: str,
+) -> dict[str, object]:
+    solve_start = perf_counter()
+    config = OTConfig(
+        method="uot",
+        batch_size=1,
+        epsilon=float(epsilon),
+        uot_beta_neural=float(beta_neural),
+        signature_mode=str(signature_mode),
+        selection_verbose=True,
+        source_target_vars=target_vars,
+        calibration_metric=DEFAULT_CALIBRATION_METRIC,
+        calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
+    )
+    transport, transport_meta = solve_uot_transport(
+        variable_signatures_by_var,
+        site_signatures_by_var,
+        config,
+    )
+    runtime_seconds = float(perf_counter() - solve_start)
+    normalized_transport = normalize_transport_rows(transport)
+    method_payloads: list[dict[str, object]] = []
+    for target_row_index, target_var in enumerate(target_vars):
+        method_payloads.append(
+            {
+                "kind": "mcqa_plot_layer_transport_target_row",
+                "method": "uot",
+                "target_var": str(target_var),
+                "ot_epsilon": float(epsilon),
+                "uot_beta_neural": float(beta_neural),
+                "source_target_vars": [str(var) for var in target_vars],
+                "target_var_row_index": int(target_row_index),
+                "transport": transport.tolist(),
+                "target_transport": transport[target_row_index : target_row_index + 1].tolist(),
+                "target_normalized_transport": normalized_transport[target_row_index : target_row_index + 1].tolist(),
+                "transport_meta": dict(transport_meta),
+                "runtime_seconds": float(runtime_seconds),
+                "wall_runtime_seconds": float(runtime_seconds),
+                "results": [],
+            }
+        )
+    return {
+        "kind": "mcqa_plot_layer_transport_only_compare",
+        "method_payloads": {"uot": method_payloads},
+        "ot_epsilon": float(epsilon),
+        "uot_beta_neural": float(beta_neural),
+        "source_target_vars": [str(var) for var in target_vars],
+        "transport_meta": dict(transport_meta),
+        "runtime_seconds": float(runtime_seconds),
+        "wall_runtime_seconds": float(runtime_seconds),
+    }
+
+
+def _sanitize_stage_a_eval_result(record: dict[str, object]) -> dict[str, object]:
+    cleaned = dict(record)
+    cleaned.pop("top_k", None)
+    cleaned.pop("lambda", None)
+    return cleaned
+
+
+def _evaluate_fixed_single_layer(
+    *,
+    model,
+    tokenizer,
+    calibration_bank,
+    holdout_bank,
+    site,
+    site_index: int,
+    device,
+    batch_size: int,
+) -> dict[str, object]:
+    calibration_result, calibration_ranking = _evaluate_single_site_intervention(
+        model=model,
+        bank=calibration_bank,
+        site=site,
+        site_index=int(site_index),
+        strength=float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
+        batch_size=int(batch_size),
+        device=device,
+        tokenizer=tokenizer,
+        include_details=True,
+    )
+    holdout_result, holdout_ranking = _evaluate_single_site_intervention(
+        model=model,
+        bank=holdout_bank,
+        site=site,
+        site_index=int(site_index),
+        strength=float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
+        batch_size=int(batch_size),
+        device=device,
+        tokenizer=tokenizer,
+        include_details=True,
+    )
+    calibration_result = _sanitize_stage_a_eval_result(calibration_result)
+    holdout_result = _sanitize_stage_a_eval_result(holdout_result)
+    holdout_result["method"] = "single_layer_full_swap"
+    holdout_result["selection_score"] = float(calibration_result.get("exact_acc", 0.0))
+    holdout_result["selection_exact_acc"] = float(calibration_result.get("exact_acc", 0.0))
+    holdout_result["calibration_exact_acc"] = float(calibration_result.get("exact_acc", 0.0))
+    return {
+        "target_var": str(holdout_bank.target_var),
+        "selected_site_label": str(site.label),
+        "selected_layer": int(site.layer),
+        "selected_calibration_result": calibration_result,
+        "selected_calibration_ranking": calibration_ranking,
+        "ranking": holdout_ranking,
+        "results": [holdout_result],
+    }
+
+
 def _evaluate_stage_a_config(
     *,
     model,
@@ -192,29 +309,18 @@ def _evaluate_stage_a_config(
             candidate_sites = [sites[top_site_index]] if 0 <= int(top_site_index) < len(sites) else []
             if not candidate_sites:
                 continue
-            brute_payload = run_bruteforce_site_pipeline(
+            direct_eval_payload = _evaluate_fixed_single_layer(
                 model=model,
+                tokenizer=tokenizer,
                 calibration_bank=banks_by_split["calibration"][str(target_var)],
                 holdout_bank=banks_by_split["test"][str(target_var)],
-                sites=candidate_sites,
+                site=candidate_sites[0],
+                site_index=int(top_site_index),
                 device=device,
-                tokenizer=tokenizer,
-                config=OTConfig(
-                    method="bruteforce",
-                    batch_size=int(batch_size),
-                    epsilon=1.0,
-                    signature_mode=str(signature_mode),
-                    top_k_values=(1,),
-                    lambda_values=DEFAULT_STAGE_A_SINGLE_LAYER_LAMBDAS,
-                    selection_verbose=True,
-                    source_target_vars=target_vars,
-                    calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                    calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                    lambda_values_by_var={str(target_var): DEFAULT_STAGE_A_SINGLE_LAYER_LAMBDAS},
-                ),
+                batch_size=int(batch_size),
             )
-            result = brute_payload.get("results", [{}])[0]
-            calibration_result = brute_payload.get("selected_calibration_result", result)
+            result = direct_eval_payload.get("results", [{}])[0]
+            calibration_result = direct_eval_payload.get("selected_calibration_result", result)
             record = {
                 "method": str(payload.get("method", method_name)),
                 "variable": str(target_var),
@@ -234,8 +340,17 @@ def _evaluate_stage_a_config(
                 "coupling_top_layers": [int(entry.get("layer", -1)) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
                 "selection_basis": "single_site_on_coupling_argmax_layer_fixed_strength",
                 "target_row_ranking": row_ranking,
-                "payload": brute_payload,
+                "payload": direct_eval_payload,
             }
+            payload["results"] = [
+                {
+                    "selection_score": float(record["selection_score"]),
+                    "exact_acc": float(record["exact_acc"]),
+                    "site_label": str(record["site_label"]),
+                    "layer": int(record["layer"]),
+                    "variable": str(target_var),
+                }
+            ]
             per_var_records[str(target_var)] = record
             break
     calibration_scores = [
@@ -272,6 +387,7 @@ def _select_layer_method_by_var(
     signature_mode: str,
 ) -> dict[str, dict[str, object]]:
     best_config: dict[str, object] | None = None
+    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
     for compare_payload in ot_compare_payloads:
         candidate_config = _evaluate_stage_a_config(
             model=model,
@@ -472,13 +588,9 @@ def main() -> None:
                 epsilon=float(ot_epsilons[0]),
                 uot_beta_neural=float(uot_beta_neurals[0]),
                 signature_mode=str(args.signature_mode),
-                top_k_values=DEFAULT_OT_TOP_K_VALUES,
-                lambda_values=DEFAULT_OT_LAMBDAS,
                 source_target_vars=target_vars,
                 calibration_metric=DEFAULT_CALIBRATION_METRIC,
                 calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                top_k_values_by_var={target_var: DEFAULT_OT_TOP_K_VALUES for target_var in target_vars},
-                lambda_values_by_var={target_var: DEFAULT_OT_LAMBDAS for target_var in target_vars},
             ),
         )
         artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
@@ -494,6 +606,17 @@ def main() -> None:
             f"loaded_from_disk={bool(prepared_artifacts.get('loaded_from_disk', False))}"
         )
     _synchronize_if_cuda(device)
+    variable_signatures_by_var = {
+        str(target_var): build_variable_signature(
+            banks_by_split["train"][str(target_var)],
+            str(args.signature_mode),
+        )
+        for target_var in target_vars
+    }
+    site_signatures_by_var = {
+        str(target_var): tensor
+        for target_var, tensor in prepared_artifacts["site_signatures_by_var"].items()
+    }
 
     ot_compare_payloads: list[dict[str, object]] = []
     ot_localization_start = perf_counter()
@@ -514,35 +637,34 @@ def main() -> None:
             output_path = sweep_root / f"{output_stem}.json"
             summary_path = sweep_root / f"{output_stem}.txt"
             compare_payload = _load_existing_payload(output_path)
+            if compare_payload is not None and str(compare_payload.get("kind")) != "mcqa_plot_layer_transport_only_compare":
+                print(f"[stageA] ignoring legacy non-transport-only payload path={output_path}")
+                compare_payload = None
             if compare_payload is None:
-                compare_payload = run_comparison(
-                    model=model,
-                    tokenizer=tokenizer,
-                    token_positions=token_positions,
-                    banks_by_split=banks_by_split,
-                    data_metadata=data_metadata,
-                    device=device,
-                    config=CompareExperimentConfig(
-                        model_name=base_run.MODEL_NAME,
-                        output_path=output_path,
-                        summary_path=summary_path,
-                        methods=("uot",),
-                        target_vars=target_vars,
-                        batch_size=int(args.batch_size),
-                        ot_epsilon=float(epsilon),
-                        uot_beta_neural=float(beta_neural),
-                        signature_mode=str(args.signature_mode),
-                        ot_top_k_values=DEFAULT_OT_TOP_K_VALUES,
-                        ot_lambdas=DEFAULT_OT_LAMBDAS,
-                        calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                        calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                        ot_top_k_values_by_var={target_var: DEFAULT_OT_TOP_K_VALUES for target_var in target_vars},
-                        ot_lambdas_by_var={target_var: DEFAULT_OT_LAMBDAS for target_var in target_vars},
-                        resolution=None,
-                        layers=resolved_layers,
-                        token_position_ids=(str(args.token_position_id),),
+                print(
+                    f"[stageA] transport-only UOT solve eps={float(epsilon):g} "
+                    f"beta_neural={float(beta_neural):g}"
+                )
+                compare_payload = _build_transport_only_compare_payload(
+                    target_vars=target_vars,
+                    variable_signatures_by_var=variable_signatures_by_var,
+                    site_signatures_by_var=site_signatures_by_var,
+                    epsilon=float(epsilon),
+                    beta_neural=float(beta_neural),
+                    signature_mode=str(args.signature_mode),
+                )
+                write_json(output_path, compare_payload)
+                write_text_report(
+                    summary_path,
+                    "\n".join(
+                        [
+                            "MCQA PLOT Layer Transport-Only UOT",
+                            f"token_position_id: {str(args.token_position_id)}",
+                            f"epsilon: {float(epsilon):g}",
+                            f"uot_beta_neural: {float(beta_neural):g}",
+                            f"layers: {list(int(layer) for layer in resolved_layers)}",
+                        ]
                     ),
-                    prepared_ot_artifacts=prepared_artifacts,
                 )
             else:
                 print(f"[stageA] reusing existing UOT payload path={output_path}")
@@ -550,14 +672,6 @@ def main() -> None:
     _synchronize_if_cuda(device)
     ot_localization_seconds = float(perf_counter() - ot_localization_start)
 
-    support_start = perf_counter()
-    print("[stageA] extracting UOT support diagnostics")
-    support_by_var = extract_ordered_site_support(
-        ot_run_payloads=ot_compare_payloads,
-        sites=sites,
-        score_slack=float(args.support_score_slack),
-    )
-    support_extract_seconds = float(perf_counter() - support_start)
     print(
         "[stageA] selecting PLOT(layer) winner by testing the argmax layer "
         "from each target-variable coupling row"
@@ -572,6 +686,14 @@ def main() -> None:
         batch_size=int(args.batch_size),
         signature_mode=str(args.signature_mode),
     )
+    support_start = perf_counter()
+    print("[stageA] extracting UOT support diagnostics")
+    support_by_var = extract_ordered_site_support(
+        ot_run_payloads=ot_compare_payloads,
+        sites=sites,
+        score_slack=float(args.support_score_slack),
+    )
+    support_extract_seconds = float(perf_counter() - support_start)
     total_seconds = float(perf_counter() - stage_start)
     rankings_by_var = _rank_layers_from_target_row(
         selected_method_by_var=method_by_var,
