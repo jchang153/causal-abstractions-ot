@@ -435,6 +435,8 @@ def main() -> None:
                     signature_mode=signature_mode,
                     selected_layers=[int(layer)],
                     token_position_ids=DEFAULT_TOKEN_POSITION_IDS,
+                    layer_blocks=None,
+                    source_target_vars=tuple(str(target_var) for target_var in target_vars),
                 )
                 cache_path = base_run._signature_cache_path(
                     resolution=resolution,
