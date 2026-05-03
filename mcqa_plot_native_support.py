@@ -209,6 +209,21 @@ def main() -> None:
     token_position_ids = tuple(token_position.id for token_position in token_positions)
     hidden_size = int(model.config.hidden_size)
 
+    print(
+        f"[stageB native] start layers={list(int(layer) for layer in layers)} "
+        f"native_resolutions={list(int(width) for width in native_resolutions)} "
+        f"target_vars={list(target_vars)}"
+    )
+    print(
+        "[stageB native] signature construction is per (layer, native_resolution) family, "
+        "not per abstract variable. For each selected layer+width, one shared neural-site "
+        "signature pass is built and then reused across both target variables and all epsilons."
+    )
+    print(
+        f"[stageB native] total layer-width families={len(layers) * len(native_resolutions)} "
+        f"(layers={len(layers)} x widths={len(native_resolutions)})"
+    )
+
     train_banks = {target_var: banks_by_split["train"][target_var] for target_var in target_vars}
     all_payloads: list[dict[str, object]] = []
     manifest_runs: list[dict[str, object]] = []
@@ -217,6 +232,11 @@ def main() -> None:
         layer_dir = sweep_root / f"layer_{int(layer):02d}"
         layer_dir.mkdir(parents=True, exist_ok=True)
         for native_resolution in native_resolutions:
+            print("")
+            print(
+                f"[stageB native] layer={int(layer)} width={int(native_resolution)} "
+                "begin one shared layer-width family"
+            )
             width_start = perf_counter()
             sites = enumerate_residual_sites(
                 num_layers=int(model.config.num_hidden_layers),
@@ -244,6 +264,11 @@ def main() -> None:
             artifact_prepare_load_seconds = float(perf_counter() - artifact_load_start)
             artifact_prepare_create_seconds = 0.0
             if prepared_artifacts is None:
+                print(
+                    f"[stageB native] signature cache miss layer={int(layer)} width={int(native_resolution)} "
+                    f"sites={len(sites)}; building one shared neural-site signature pass "
+                    f"for target_vars={list(target_vars)} and reusing it across epsilons={list(float(e) for e in ot_epsilons)}"
+                )
                 artifact_prepare_start = perf_counter()
                 prepared_artifacts = prepare_alignment_artifacts(
                     model=model,
@@ -270,10 +295,27 @@ def main() -> None:
                     prepared_artifacts=prepared_artifacts,
                     cache_spec=cache_spec,
                 )
+                print(
+                    f"[stageB native] signature cache saved layer={int(layer)} width={int(native_resolution)} "
+                    f"path={cache_path}"
+                )
+            else:
+                print(
+                    f"[stageB native] signature cache hit layer={int(layer)} width={int(native_resolution)} "
+                    f"path={cache_path} loaded_from_disk={bool(prepared_artifacts.get('loaded_from_disk', False))}"
+                )
+                print(
+                    f"[stageB native] reuse one shared neural-site signature family "
+                    f"across target_vars={list(target_vars)} and epsilons={list(float(e) for e in ot_epsilons)}"
+                )
             _synchronize_if_cuda(device)
 
             ot_compare_payloads: list[dict[str, object]] = []
             ot_localization_start = perf_counter()
+            print(
+                f"[stageB native] sweeping OT over layer={int(layer)} width={int(native_resolution)} "
+                f"epsilons={list(float(e) for e in ot_epsilons)}"
+            )
             for epsilon in ot_epsilons:
                 output_stem = (
                     f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
@@ -310,6 +352,11 @@ def main() -> None:
                             token_position_ids=(DEFAULT_TOKEN_POSITION_ID,),
                         ),
                         prepared_ot_artifacts=prepared_artifacts,
+                    )
+                else:
+                    print(
+                        f"[stageB native] reusing compare payload layer={int(layer)} width={int(native_resolution)} "
+                        f"epsilon={float(epsilon):g}"
                     )
                 ot_compare_payloads.append(compare_payload)
             _synchronize_if_cuda(device)
