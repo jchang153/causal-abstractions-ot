@@ -23,6 +23,22 @@ from .signatures import collect_base_logits, collect_multi_variable_site_signatu
 from .sites import SiteLike
 
 
+NULL_SOURCE_TARGET_VAR = "null"
+NULL_SOURCE_TARGET_ALIASES = {"null", "background", "other", "none"}
+
+
+def canonicalize_source_target_var(target_var: str) -> str:
+    """Canonicalize an OT source row, allowing a synthetic null/background row."""
+    raw = str(target_var).strip()
+    if raw.lower() in NULL_SOURCE_TARGET_ALIASES:
+        return NULL_SOURCE_TARGET_VAR
+    return canonicalize_target_var(raw)
+
+
+def is_null_source_target_var(target_var: str) -> bool:
+    return canonicalize_source_target_var(str(target_var)) == NULL_SOURCE_TARGET_VAR
+
+
 def _synchronize_if_cuda(device: torch.device | str) -> None:
     resolved = torch.device(device)
     if resolved.type == "cuda" and torch.cuda.is_available():
@@ -248,11 +264,11 @@ def load_prepared_alignment_artifacts(
     for target_var, tensor in base_logits_by_var.items():
         if not isinstance(tensor, torch.Tensor):
             return None
-        normalized_base_logits[canonicalize_target_var(str(target_var))] = tensor.detach().cpu()
+        normalized_base_logits[canonicalize_source_target_var(str(target_var))] = tensor.detach().cpu()
     for target_var, tensor in site_signatures_by_var.items():
         if not isinstance(tensor, torch.Tensor):
             return None
-        normalized_site_signatures[canonicalize_target_var(str(target_var))] = tensor.detach().cpu()
+        normalized_site_signatures[canonicalize_source_target_var(str(target_var))] = tensor.detach().cpu()
     return {
         "base_logits_by_var": normalized_base_logits,
         "site_signatures_by_var": normalized_site_signatures,
@@ -303,6 +319,13 @@ def prepare_alignment_artifacts(
     """Build reusable factual logits and neural site signatures for OT/UOT runs."""
     device = torch.device(device)
     start = perf_counter()
+    real_fit_banks_by_var = {
+        canonicalize_source_target_var(target_var): bank
+        for target_var, bank in fit_banks_by_var.items()
+        if not is_null_source_target_var(str(target_var))
+    }
+    if not real_fit_banks_by_var:
+        raise ValueError("prepare_alignment_artifacts requires at least one non-null source variable")
     base_logits_by_var = {
         target_var: collect_base_logits(
             model=model,
@@ -310,11 +333,11 @@ def prepare_alignment_artifacts(
             batch_size=config.batch_size,
             device=device,
         )
-        for target_var, bank in fit_banks_by_var.items()
+        for target_var, bank in real_fit_banks_by_var.items()
     }
     site_signatures_by_var = collect_multi_variable_site_signatures(
         model=model,
-        banks_by_var=fit_banks_by_var,
+        banks_by_var=real_fit_banks_by_var,
         sites=sites,
         base_logits_by_var=base_logits_by_var,
         batch_size=config.batch_size,
@@ -323,6 +346,13 @@ def prepare_alignment_artifacts(
         show_progress=config.selection_verbose,
         pca_bases_by_id=pca_bases_by_id,
     )
+    source_target_vars = tuple(canonicalize_source_target_var(target_var) for target_var in config.source_target_vars)
+    if NULL_SOURCE_TARGET_VAR in source_target_vars:
+        stacked_site_signatures = torch.stack(
+            [tensor.to(torch.float32) for tensor in site_signatures_by_var.values()],
+            dim=0,
+        )
+        site_signatures_by_var[NULL_SOURCE_TARGET_VAR] = stacked_site_signatures.mean(dim=0)
     return {
         "base_logits_by_var": base_logits_by_var,
         "site_signatures_by_var": site_signatures_by_var,
@@ -414,6 +444,7 @@ def _stack_cost_matrix(
 ) -> torch.Tensor:
     rows = []
     for target_var in source_target_vars:
+        target_var = canonicalize_source_target_var(str(target_var))
         variable_signature = variable_signatures_by_var[target_var].reshape(1, -1)
         site_signatures = site_signatures_by_var[target_var].reshape(site_signatures_by_var[target_var].shape[0], -1)
         rows.append(_squared_euclidean_cost(variable_signature, site_signatures))
@@ -926,10 +957,18 @@ def run_alignment_pipeline(
     )
     site_signatures_by_var = prepared_artifacts["site_signatures_by_var"]
     variable_signature_start = perf_counter()
-    variable_signatures_by_var = {
-        target_var: build_variable_signature(fit_banks_by_var[target_var], config.signature_mode)
-        for target_var in config.source_target_vars
-    }
+    source_target_vars = tuple(canonicalize_source_target_var(target_var) for target_var in config.source_target_vars)
+    variable_signatures_by_var = {}
+    for target_var in source_target_vars:
+        if target_var == NULL_SOURCE_TARGET_VAR:
+            continue
+        variable_signatures_by_var[target_var] = build_variable_signature(fit_banks_by_var[target_var], config.signature_mode)
+    if NULL_SOURCE_TARGET_VAR in source_target_vars:
+        if variable_signatures_by_var:
+            template = next(iter(variable_signatures_by_var.values()))
+        else:
+            template = next(iter(site_signatures_by_var.values()))[0]
+        variable_signatures_by_var[NULL_SOURCE_TARGET_VAR] = torch.zeros_like(template)
     _synchronize_if_cuda(device)
     variable_signature_seconds = float(perf_counter() - variable_signature_start)
     transport_start = perf_counter()
@@ -944,7 +983,7 @@ def run_alignment_pipeline(
     normalized_transport = normalize_transport_rows(transport)
     target_transport, target_source_target_vars, target_row_index = _select_transport_row_for_target(
         transport,
-        config.source_target_vars,
+        source_target_vars,
         holdout_bank.target_var,
     )
     target_normalized_transport = normalized_transport[target_row_index : target_row_index + 1]
@@ -1031,7 +1070,7 @@ def run_alignment_pipeline(
         )
     return {
         "target_var": holdout_bank.target_var,
-        "source_target_vars": list(config.source_target_vars),
+        "source_target_vars": list(source_target_vars),
         "target_var_row_index": int(target_row_index),
         "signature_mode": config.signature_mode,
         "calibration_metric": config.calibration_metric,

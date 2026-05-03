@@ -189,6 +189,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--methods", help="Comma-separated, e.g. ot,uot,das")
     parser.add_argument("--target-vars", help="Comma-separated, e.g. answer_pointer,answer_token")
     parser.add_argument(
+        "--ot-source-target-vars",
+        help="Comma-separated OT source rows, optionally including null/background.",
+    )
+    parser.add_argument(
         "--counterfactual-names",
         help="Comma-separated, e.g. answerPosition,randomLetter,answerPosition_randomLetter",
     )
@@ -273,6 +277,9 @@ def _override_base_run(
     target_vars = _parse_csv_strings(args.target_vars)
     if target_vars is not None:
         base_run.TARGET_VARS = target_vars
+    ot_source_target_vars = _parse_csv_strings(args.ot_source_target_vars)
+    if ot_source_target_vars is not None:
+        base_run.OT_SOURCE_TARGET_VARS = ot_source_target_vars
     counterfactual_names = _parse_csv_strings(args.counterfactual_names)
     if counterfactual_names is not None:
         base_run.COUNTERFACTUAL_NAMES = counterfactual_names
@@ -343,6 +350,7 @@ def _override_base_run(
         "test_pool_size": base_run.TEST_POOL_SIZE,
         "methods": list(base_run.METHODS),
         "target_vars": list(base_run.TARGET_VARS),
+        "ot_source_target_vars": None if base_run.OT_SOURCE_TARGET_VARS is None else list(base_run.OT_SOURCE_TARGET_VARS),
         "counterfactual_names": list(base_run.COUNTERFACTUAL_NAMES),
         "layers": base_run.LAYERS,
         "layer_blocks": base_run.LAYER_BLOCKS,

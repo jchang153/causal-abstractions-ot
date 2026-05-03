@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=mcqa-block-a
+#SBATCH --job-name=mcqa-null-a
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -32,10 +32,9 @@ export TOKENIZERS_PARALLELISM=false
 
 export RESULTS_ROOT="${RESULTS_ROOT:-results/delta}"
 export RESULTS_TIMESTAMP="${RESULTS_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-export LAYER_BLOCKS="${LAYER_BLOCKS:-0-4;5-9;10-14;15-19;20-25}"
 export TOKEN_POSITION_IDS="${TOKEN_POSITION_IDS:-last_token}"
 export TARGET_VARS="${TARGET_VARS:-answer_pointer,answer_token}"
-export OT_SOURCE_TARGET_VARS="${OT_SOURCE_TARGET_VARS:-${TARGET_VARS}}"
+export OT_SOURCE_TARGET_VARS="${OT_SOURCE_TARGET_VARS:-answer_pointer,answer_token,null}"
 export SIGNATURE_MODE="${SIGNATURE_MODE:-family_label_delta_norm}"
 export OT_EPSILONS="${OT_EPSILONS:-0.5,1,2,4}"
 export OT_TOP_K_VALUES="${OT_TOP_K_VALUES:-1,2,4}"
@@ -46,10 +45,9 @@ export SPLIT_SEED="${SPLIT_SEED:-0}"
 
 mkdir -p "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}"
 
-echo "[delta-mcqa-block-a] host=$(hostname) timestamp=${RESULTS_TIMESTAMP} split_seed=${SPLIT_SEED}"
-echo "[delta-mcqa-block-a] layer_blocks=${LAYER_BLOCKS}"
-echo "[delta-mcqa-block-a] token_position_ids=${TOKEN_POSITION_IDS} signature_mode=${SIGNATURE_MODE}"
-echo "[delta-mcqa-block-a] target_vars=${TARGET_VARS} ot_source_target_vars=${OT_SOURCE_TARGET_VARS}"
+echo "[delta-mcqa-null-a] host=$(hostname) timestamp=${RESULTS_TIMESTAMP} split_seed=${SPLIT_SEED}"
+echo "[delta-mcqa-null-a] token_position_ids=${TOKEN_POSITION_IDS} signature_mode=${SIGNATURE_MODE}"
+echo "[delta-mcqa-null-a] target_vars=${TARGET_VARS} ot_source_target_vars=${OT_SOURCE_TARGET_VARS}"
 nvidia-smi
 
 ARGS=(
@@ -63,7 +61,6 @@ ARGS=(
   --target-vars "${TARGET_VARS}"
   --ot-source-target-vars "${OT_SOURCE_TARGET_VARS}"
   --layers auto
-  --layer-blocks "${LAYER_BLOCKS}"
   --token-position-ids "${TOKEN_POSITION_IDS}"
   --resolutions full
   --signature-modes "${SIGNATURE_MODE}"

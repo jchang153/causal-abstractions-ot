@@ -14,6 +14,8 @@ import mcqa_experiment.data as mcqa_data
 from mcqa_experiment.data import build_pair_banks, canonicalize_target_var, load_filtered_mcqa_pipeline
 from mcqa_experiment.ot import (
     OTConfig,
+    canonicalize_source_target_var,
+    is_null_source_target_var,
     load_prepared_alignment_artifacts,
     prepare_alignment_artifacts,
     save_prepared_alignment_artifacts,
@@ -48,6 +50,7 @@ TEST_POOL_SIZE = 100
 # Experiment
 METHODS = ["ot"]
 TARGET_VARS = ["answer_pointer", "answer_token"]
+OT_SOURCE_TARGET_VARS: list[str] | None = None
 COUNTERFACTUAL_NAMES = ["answerPosition", "randomLetter", "answerPosition_randomLetter"]
 
 LAYERS = "auto"
@@ -99,6 +102,11 @@ def _layer_blocks_payload(layer_blocks: list[list[int]] | tuple[tuple[int, ...],
     return [[int(layer) for layer in block] for block in layer_blocks]
 
 
+def _resolved_ot_source_target_vars(target_vars: list[str]) -> tuple[str, ...]:
+    source_vars = target_vars if OT_SOURCE_TARGET_VARS is None else list(OT_SOURCE_TARGET_VARS)
+    return tuple(canonicalize_source_target_var(target_var) for target_var in source_vars)
+
+
 def _signature_cache_spec(
     *,
     train_bank,
@@ -108,6 +116,7 @@ def _signature_cache_spec(
     selected_layers: list[int],
     token_position_ids: tuple[str, ...],
     layer_blocks: list[list[int]] | tuple[tuple[int, ...], ...] | None,
+    source_target_vars: tuple[str, ...],
 ) -> dict[str, object]:
     train_rows_digest = hashlib.sha256(
         "\n".join(
@@ -127,7 +136,7 @@ def _signature_cache_spec(
         "signature_mode": str(signature_mode),
         "train_pool_size": int(TRAIN_POOL_SIZE),
         "train_bank": train_bank.metadata(),
-        "source_target_vars": [canonicalize_target_var(target_var) for target_var in TARGET_VARS],
+        "source_target_vars": [canonicalize_source_target_var(target_var) for target_var in source_target_vars],
         "train_rows_digest": train_rows_digest,
         "selected_layers": [int(layer) for layer in selected_layers],
         "layer_blocks": _layer_blocks_payload(layer_blocks),
@@ -243,7 +252,9 @@ def execute_run_context(*, context: dict[str, object]) -> None:
     data_metadata = context["data_metadata"]
     selected_layers = list(range(int(model.config.num_hidden_layers))) if LAYERS == "auto" else list(LAYERS)
     target_vars = [canonicalize_target_var(target_var) for target_var in TARGET_VARS]
+    source_target_vars = _resolved_ot_source_target_vars(target_vars)
     print(f"[run] selected_layers={selected_layers}")
+    print(f"[run] ot_source_target_vars={list(source_target_vars)}")
     if LAYER_BLOCKS:
         print(f"[run] layer_blocks={_layer_blocks_payload(LAYER_BLOCKS)}")
     layer_suffix = ""
@@ -300,15 +311,22 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                         selected_token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
                     )
                 print(f"[run] candidate_ot_sites={len(ot_sites)}")
-                train_banks = {target_var: banks_by_split["train"][target_var] for target_var in target_vars}
+                train_banks = {
+                    source_var: banks_by_split["train"][source_var]
+                    for source_var in source_target_vars
+                    if not is_null_source_target_var(source_var)
+                }
+                if not train_banks:
+                    raise ValueError("At least one non-null OT source target variable is required")
                 cache_spec = _signature_cache_spec(
-                    train_bank=train_banks[target_vars[0]],
+                    train_bank=next(iter(train_banks.values())),
                     resolution=resolution,
                     resolved_resolution=resolved_resolution,
                     signature_mode=signature_mode,
                     selected_layers=selected_layers,
                     token_position_ids=token_position_ids,
                     layer_blocks=LAYER_BLOCKS,
+                    source_target_vars=source_target_vars,
                 )
                 cache_path = _signature_cache_path(
                     resolution=resolution,
@@ -337,7 +355,7 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                             signature_mode=signature_mode,
                             top_k_values=tuple(OT_TOP_K_VALUES),
                             lambda_values=tuple(OT_LAMBDAS),
-                            source_target_vars=tuple(TARGET_VARS),
+                            source_target_vars=tuple(source_target_vars),
                             calibration_metric=CALIBRATION_METRIC,
                             calibration_family_weights=tuple(CALIBRATION_FAMILY_WEIGHTS),
                         ),
@@ -381,6 +399,7 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                                 layers=tuple(selected_layers),
                                 token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
                                 layer_blocks=None if LAYER_BLOCKS is None else tuple(tuple(int(layer) for layer in block) for block in LAYER_BLOCKS),
+                                ot_source_target_vars=tuple(source_target_vars),
                                 calibration_metric=CALIBRATION_METRIC,
                                 calibration_family_weights=tuple(CALIBRATION_FAMILY_WEIGHTS),
                             )
@@ -413,6 +432,7 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                             layers=tuple(selected_layers),
                             token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
                             layer_blocks=None if LAYER_BLOCKS is None else tuple(tuple(int(layer) for layer in block) for block in LAYER_BLOCKS),
+                            ot_source_target_vars=tuple(source_target_vars),
                             calibration_metric=CALIBRATION_METRIC,
                             calibration_family_weights=tuple(CALIBRATION_FAMILY_WEIGHTS),
                         )

@@ -9,7 +9,14 @@ from time import perf_counter
 
 from .das import DASConfig, run_das_pipeline
 from .data import canonicalize_target_var
-from .ot import OTConfig, prepare_alignment_artifacts, run_alignment_pipeline, run_bruteforce_site_pipeline
+from .ot import (
+    OTConfig,
+    canonicalize_source_target_var,
+    is_null_source_target_var,
+    prepare_alignment_artifacts,
+    run_alignment_pipeline,
+    run_bruteforce_site_pipeline,
+)
 from .reporting import format_summary, print_results_table, summarize_method_records, write_text_report
 from .runtime import write_json
 from .sites import enumerate_layer_block_sites, enumerate_residual_sites
@@ -46,6 +53,7 @@ class CompareExperimentConfig:
     layers: tuple[int, ...] | None = None
     token_position_ids: tuple[str, ...] | None = ("correct_symbol", "correct_symbol_period", "last_token")
     layer_blocks: tuple[tuple[int, ...], ...] | None = None
+    ot_source_target_vars: tuple[str, ...] | None = None
 
 
 def run_comparison(
@@ -92,7 +100,10 @@ def run_comparison(
         prepared_artifacts = None
         ot_config = None
         if method in {"ot", "uot"} and target_vars:
-            source_target_vars = target_vars
+            source_target_vars = tuple(
+                canonicalize_source_target_var(target_var)
+                for target_var in (config.ot_source_target_vars or target_vars)
+            )
             ot_config = OTConfig(
                 method=method,
                 batch_size=config.batch_size,
@@ -109,7 +120,11 @@ def run_comparison(
             )
             prepared_artifacts = prepared_ot_artifacts
             if prepared_artifacts is None:
-                fit_banks_by_var = {target_var: banks_by_split["train"][target_var] for target_var in source_target_vars}
+                fit_banks_by_var = {
+                    target_var: banks_by_split["train"][target_var]
+                    for target_var in source_target_vars
+                    if not is_null_source_target_var(target_var)
+                }
                 prepared_artifacts = prepare_alignment_artifacts(
                     model=model,
                     fit_banks_by_var=fit_banks_by_var,
@@ -132,6 +147,10 @@ def run_comparison(
                     signature_mode=config.signature_mode,
                     top_k_values=config.ot_top_k_values,
                     lambda_values=config.ot_lambdas,
+                    source_target_vars=tuple(
+                        canonicalize_source_target_var(target_var)
+                        for target_var in (config.ot_source_target_vars or target_vars)
+                    ),
                     calibration_metric=config.calibration_metric,
                     calibration_family_weights=config.calibration_family_weights,
                     top_k_values_by_var=config.ot_top_k_values_by_var,
@@ -139,7 +158,11 @@ def run_comparison(
                 )
                 payload = run_alignment_pipeline(
                     model=model,
-                    fit_banks_by_var={source_var: banks_by_split["train"][source_var] for source_var in current_ot_config.source_target_vars},
+                    fit_banks_by_var={
+                        source_var: banks_by_split["train"][source_var]
+                        for source_var in current_ot_config.source_target_vars
+                        if not is_null_source_target_var(source_var)
+                    },
                     calibration_bank=calibration_bank,
                     holdout_bank=test_bank,
                     sites=ot_sites,
