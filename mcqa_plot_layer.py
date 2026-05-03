@@ -30,6 +30,7 @@ DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
+DEFAULT_UOT_BETA_NEURALS = (0.1, 0.3, 1.0, 3.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_DISPLAY_TOP_LAYER_COUNT = 3
@@ -64,7 +65,7 @@ def _parse_csv_floats(value: str | None) -> list[float] | None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Joint layer-level PLOT OT localization for MCQA.")
+    parser = argparse.ArgumentParser(description="Joint layer-level PLOT UOT localization for MCQA.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--model-name", default="google/gemma-2-2b")
     parser.add_argument("--dataset-path", default="jchang153/copycolors_mcqa")
@@ -77,7 +78,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layers", help="Comma-separated layer indices. Default: all layers.")
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
-    parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
+    parser.add_argument("--ot-epsilons", help="Comma-separated UOT epsilons. Default: 0.5,1,2,4")
+    parser.add_argument("--uot-beta-neurals", help="Comma-separated UOT beta_neural values. Default: 0.1,0.3,1,3")
     parser.add_argument("--support-score-slack", type=float, default=0.05)
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument("--results-root", default="results")
@@ -149,6 +151,21 @@ def _target_row_ranking(payload: dict[str, object], *, sites) -> list[dict[str, 
     )
 
 
+def _iter_stage_a_transport_payloads(compare_payload: dict[str, object]) -> list[tuple[str, dict[str, object]]]:
+    method_payloads = compare_payload.get("method_payloads", {})
+    if not isinstance(method_payloads, dict):
+        return []
+    payloads: list[tuple[str, dict[str, object]]] = []
+    for method_name in ("uot", "ot"):
+        entries = method_payloads.get(method_name, [])
+        if not isinstance(entries, list):
+            continue
+        for payload in entries:
+            if isinstance(payload, dict):
+                payloads.append((str(method_name), payload))
+    return payloads
+
+
 def _select_layer_method_by_var(
     *,
     model,
@@ -166,7 +183,8 @@ def _select_layer_method_by_var(
         best_record: dict[str, object] | None = None
         for compare_payload in ot_compare_payloads:
             epsilon = float(compare_payload.get("ot_epsilon", 0.0))
-            for payload in compare_payload.get("method_payloads", {}).get("ot", []):
+            compare_beta = compare_payload.get("uot_beta_neural")
+            for method_name, payload in _iter_stage_a_transport_payloads(compare_payload):
                 if str(payload.get("target_var")) != str(target_var):
                     continue
                 row_ranking = _target_row_ranking(payload, sites=sites)
@@ -200,6 +218,7 @@ def _select_layer_method_by_var(
                 result = brute_payload.get("results", [{}])[0]
                 selected_hyperparameters = dict(brute_payload.get("selected_hyperparameters", {}))
                 candidate = {
+                    "method": str(payload.get("method", method_name)),
                     "variable": str(target_var),
                     "exact_acc": float(result.get("exact_acc", 0.0)),
                     "selection_score": float(result.get("selection_score", 0.0)),
@@ -207,6 +226,9 @@ def _select_layer_method_by_var(
                     "layer": int(result.get("layer", candidate_sites[0].layer)),
                     "lambda": float(selected_hyperparameters.get("lambda", result.get("lambda", 0.0))),
                     "epsilon": float(epsilon),
+                    "uot_beta_neural": None
+                    if payload.get("uot_beta_neural", compare_beta) is None
+                    else float(payload.get("uot_beta_neural", compare_beta)),
                     "candidate_site_labels": [site.label for site in candidate_sites],
                     "candidate_layers": [int(site.layer) for site in candidate_sites],
                     "coupling_argmax_site_label": candidate_sites[0].label,
@@ -247,12 +269,14 @@ def _rank_layers_from_target_row(
                 "exact_acc": float(selected.get("exact_acc", 0.0)),
                 "selection_exact_acc": float(selected.get("exact_acc", 0.0)),
                 "method_selection_score": float(selected.get("selection_score", 0.0)),
+                "method": selected.get("method"),
                 "epsilon": float(selected.get("epsilon", 0.0)),
+                "uot_beta_neural": selected.get("uot_beta_neural"),
                 "site_label": entry.get("site_label"),
                 "selected_lambda": float(selected.get("lambda", 0.0)),
                 "selected_site_label": selected.get("site_label"),
                 "runtime_seconds": float(runtime_seconds),
-                "selection_basis": "target_row_mass_from_selected_top3_single_layer_method",
+                "selection_basis": "target_row_mass_from_selected_single_layer_method",
             }
             for entry in row_ranking
         ]
@@ -277,12 +301,18 @@ def _format_summary(
         lines.append(f"[{target_var}]")
         if selected:
             lines.append(
-                f"selected_single_layer exact={float(selected.get('exact_acc', 0.0)):.4f} "
+                f"selected_single_layer method={selected.get('method')} "
+                f"exact={float(selected.get('exact_acc', 0.0)):.4f} "
                 f"cal={float(selected.get('selection_score', 0.0)):.4f} "
                 f"eps={float(selected.get('epsilon', 0.0)):g} "
                 f"site={selected.get('site_label')} "
-                f"lambda={float(selected.get('lambda', 0.0)):g} "
-                f"coupling_argmax={selected.get('coupling_argmax_site_label')}"
+                f"strength={float(selected.get('lambda', 0.0)):g} "
+                + (
+                    f"beta_n={float(selected.get('uot_beta_neural')):g} "
+                    if selected.get("uot_beta_neural") is not None
+                    else ""
+                )
+                + f"coupling_argmax={selected.get('coupling_argmax_site_label')}"
             )
         if selected.get("target_row_ranking"):
             lines.append(
@@ -341,6 +371,7 @@ def main() -> None:
     )
 
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
+    uot_beta_neurals = tuple(_parse_csv_floats(args.uot_beta_neurals) or list(DEFAULT_UOT_BETA_NEURALS))
     train_banks = {target_var: banks_by_split["train"][target_var] for target_var in target_vars}
     cache_spec = base_run._signature_cache_spec(
         train_bank=train_banks[target_vars[0]],
@@ -368,9 +399,10 @@ def main() -> None:
             sites=sites,
             device=device,
             config=OTConfig(
-                method="ot",
+                method="uot",
                 batch_size=int(args.batch_size),
-                epsilon=1.0,
+                epsilon=float(ot_epsilons[0]),
+                uot_beta_neural=float(uot_beta_neurals[0]),
                 signature_mode=str(args.signature_mode),
                 top_k_values=DEFAULT_OT_TOP_K_VALUES,
                 lambda_values=DEFAULT_OT_LAMBDAS,
@@ -397,50 +429,61 @@ def main() -> None:
 
     ot_compare_payloads: list[dict[str, object]] = []
     ot_localization_start = perf_counter()
-    print(f"[stageA] running joint layer OT epsilon_sweep={list(ot_epsilons)}")
+    print(
+        f"[stageA] running joint layer UOT epsilon_sweep={list(ot_epsilons)} "
+        f"beta_neural_sweep={list(uot_beta_neurals)}"
+    )
     for epsilon in ot_epsilons:
-        print(f"[stageA] epsilon={float(epsilon):g} joint layer OT")
-        output_stem = f"mcqa_plot_layer_pos-{str(args.token_position_id)}_sig-{str(args.signature_mode)}_eps-{float(epsilon):g}_ot"
-        output_path = sweep_root / f"{output_stem}.json"
-        summary_path = sweep_root / f"{output_stem}.txt"
-        compare_payload = _load_existing_payload(output_path)
-        if compare_payload is None:
-            compare_payload = run_comparison(
-                model=model,
-                tokenizer=tokenizer,
-                token_positions=token_positions,
-                banks_by_split=banks_by_split,
-                data_metadata=data_metadata,
-                device=device,
-                config=CompareExperimentConfig(
-                    model_name=base_run.MODEL_NAME,
-                    output_path=output_path,
-                    summary_path=summary_path,
-                    methods=("ot",),
-                    target_vars=target_vars,
-                    batch_size=int(args.batch_size),
-                    ot_epsilon=float(epsilon),
-                    signature_mode=str(args.signature_mode),
-                    ot_top_k_values=DEFAULT_OT_TOP_K_VALUES,
-                    ot_lambdas=DEFAULT_OT_LAMBDAS,
-                    calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                    calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                    ot_top_k_values_by_var={target_var: DEFAULT_OT_TOP_K_VALUES for target_var in target_vars},
-                    ot_lambdas_by_var={target_var: DEFAULT_OT_LAMBDAS for target_var in target_vars},
-                    resolution=None,
-                    layers=resolved_layers,
-                    token_position_ids=(str(args.token_position_id),),
-                ),
-                prepared_ot_artifacts=prepared_artifacts,
+        for beta_neural in uot_beta_neurals:
+            print(
+                f"[stageA] epsilon={float(epsilon):g} beta_neural={float(beta_neural):g} "
+                "joint layer UOT"
             )
-        else:
-            print(f"[stageA] reusing existing epsilon payload path={output_path}")
-        ot_compare_payloads.append(compare_payload)
+            output_stem = (
+                f"mcqa_plot_layer_pos-{str(args.token_position_id)}_sig-{str(args.signature_mode)}"
+                f"_eps-{float(epsilon):g}_betan-{float(beta_neural):g}_uot"
+            )
+            output_path = sweep_root / f"{output_stem}.json"
+            summary_path = sweep_root / f"{output_stem}.txt"
+            compare_payload = _load_existing_payload(output_path)
+            if compare_payload is None:
+                compare_payload = run_comparison(
+                    model=model,
+                    tokenizer=tokenizer,
+                    token_positions=token_positions,
+                    banks_by_split=banks_by_split,
+                    data_metadata=data_metadata,
+                    device=device,
+                    config=CompareExperimentConfig(
+                        model_name=base_run.MODEL_NAME,
+                        output_path=output_path,
+                        summary_path=summary_path,
+                        methods=("uot",),
+                        target_vars=target_vars,
+                        batch_size=int(args.batch_size),
+                        ot_epsilon=float(epsilon),
+                        uot_beta_neural=float(beta_neural),
+                        signature_mode=str(args.signature_mode),
+                        ot_top_k_values=DEFAULT_OT_TOP_K_VALUES,
+                        ot_lambdas=DEFAULT_OT_LAMBDAS,
+                        calibration_metric=DEFAULT_CALIBRATION_METRIC,
+                        calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
+                        ot_top_k_values_by_var={target_var: DEFAULT_OT_TOP_K_VALUES for target_var in target_vars},
+                        ot_lambdas_by_var={target_var: DEFAULT_OT_LAMBDAS for target_var in target_vars},
+                        resolution=None,
+                        layers=resolved_layers,
+                        token_position_ids=(str(args.token_position_id),),
+                    ),
+                    prepared_ot_artifacts=prepared_artifacts,
+                )
+            else:
+                print(f"[stageA] reusing existing UOT payload path={output_path}")
+            ot_compare_payloads.append(compare_payload)
     _synchronize_if_cuda(device)
     ot_localization_seconds = float(perf_counter() - ot_localization_start)
 
     support_start = perf_counter()
-    print("[stageA] extracting OT support diagnostics")
+    print("[stageA] extracting UOT support diagnostics")
     support_by_var = extract_ordered_site_support(
         ot_run_payloads=ot_compare_payloads,
         sites=sites,
@@ -488,6 +531,7 @@ def main() -> None:
             "layers": [int(layer) for layer in resolved_layers],
             "signature_mode": str(args.signature_mode),
             "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
+            "uot_beta_neurals": [float(beta_neural) for beta_neural in uot_beta_neurals],
             "support_score_slack": float(args.support_score_slack),
             "site_labels": [site.label for site in sites],
             "support_path": str(support_path),
@@ -495,9 +539,17 @@ def main() -> None:
             "rankings_by_var": rankings_by_var,
             "display_method_by_var": method_by_var,
             "method_by_var": method_by_var,
+            "stage_a_transport_method": "uot",
             "ot_output_paths": [
-                str(sweep_root / f"mcqa_plot_layer_pos-{str(args.token_position_id)}_sig-{str(args.signature_mode)}_eps-{float(epsilon):g}_ot.json")
+                str(
+                    sweep_root
+                    / (
+                        f"mcqa_plot_layer_pos-{str(args.token_position_id)}_sig-{str(args.signature_mode)}"
+                        f"_eps-{float(epsilon):g}_betan-{float(beta_neural):g}_uot.json"
+                    )
+                )
                 for epsilon in ot_epsilons
+                for beta_neural in uot_beta_neurals
             ],
             "summary_path": str(summary_path),
             "context_timing_seconds": context_timing_seconds,

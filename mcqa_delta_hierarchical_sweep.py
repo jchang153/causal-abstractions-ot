@@ -20,6 +20,7 @@ DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
+DEFAULT_STAGE_A_UOT_BETA_NEURALS = (0.1, 0.3, 1.0, 3.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_PCA_SITE_MENUS = ("partition", "mixed")
@@ -247,6 +248,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-a-layer-indices", default=None, help="Comma-separated layer indices. Default: all layers.")
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
     parser.add_argument("--ot-epsilons", default="0.5,1,2,4")
+    parser.add_argument("--stage-a-uot-beta-neurals", default="0.1,0.3,1,3")
     parser.add_argument("--ot-top-k-values", default="1,2,4")
     parser.add_argument("--ot-lambdas", default="0.5,1,2,4")
     parser.add_argument("--calibration-metric", default=DEFAULT_CALIBRATION_METRIC)
@@ -301,6 +303,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         _parse_csv_ints(args.native_resolutions) or DEFAULT_NATIVE_RESOLUTIONS
     )
     ot_epsilons = _parse_csv_floats(args.ot_epsilons) or DEFAULT_OT_EPSILONS
+    stage_a_uot_beta_neurals = _parse_csv_floats(args.stage_a_uot_beta_neurals) or DEFAULT_STAGE_A_UOT_BETA_NEURALS
     ot_top_k_values = _parse_csv_ints(args.ot_top_k_values) or DEFAULT_OT_TOP_K_VALUES
     ot_lambdas = _parse_csv_floats(args.ot_lambdas) or DEFAULT_OT_LAMBDAS
     calibration_family_weights = _parse_csv_floats(args.calibration_family_weights) or DEFAULT_CALIBRATION_FAMILY_WEIGHTS
@@ -325,6 +328,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "pca_top_prefix_sizes": tuple(int(size) for size in pca_top_prefix_sizes),
         "native_resolutions": tuple(int(resolution) for resolution in native_resolutions),
         "ot_epsilons": tuple(float(epsilon) for epsilon in ot_epsilons),
+        "stage_a_uot_beta_neurals": tuple(float(beta) for beta in stage_a_uot_beta_neurals),
         "ot_top_k_values": tuple(int(value) for value in ot_top_k_values),
         "ot_lambdas": tuple(float(value) for value in ot_lambdas),
         "calibration_family_weights": tuple(float(weight) for weight in calibration_family_weights),
@@ -370,6 +374,11 @@ def _build_stage_a_command(
         str(token_position_id),
         "--ot-epsilons",
         ",".join(str(epsilon).rstrip("0").rstrip(".") if "." in str(epsilon) else str(epsilon) for epsilon in normalized["ot_epsilons"]),
+        "--uot-beta-neurals",
+        ",".join(
+            str(beta).rstrip("0").rstrip(".") if "." in str(beta) else str(beta)
+            for beta in normalized["stage_a_uot_beta_neurals"]
+        ),
         "--signature-mode",
         str(args.signature_mode),
         "--results-root",
@@ -831,19 +840,19 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
         lines.append(f"[{target_var}]")
         display_entry = display_method_by_var.get(target_var) if isinstance(display_method_by_var, dict) else None
         if isinstance(display_entry, dict):
-            lines.append(
-                "  method "
-                + " ".join(
-                    [
-                        f"layer={int(display_entry.get('layer', -1))}",
-                        f"exact={float(display_entry.get('exact_acc', -1.0)):.4f}",
-                        f"cal={float(display_entry.get('selection_score', -1.0)):.4f}",
-                        f"site={display_entry.get('site_label')}",
-                        f"lambda={float(display_entry.get('lambda', 0.0)):g}",
-                        f"candidates={display_entry.get('candidate_site_labels', [])}",
-                    ]
-                )
-            )
+            parts = [
+                f"method={display_entry.get('method')}",
+                f"layer={int(display_entry.get('layer', -1))}",
+                f"exact={float(display_entry.get('exact_acc', -1.0)):.4f}",
+                f"cal={float(display_entry.get('selection_score', -1.0)):.4f}",
+                f"eps={float(display_entry.get('epsilon', 0.0)):g}",
+                f"site={display_entry.get('site_label')}",
+                f"lambda={float(display_entry.get('lambda', 0.0)):g}",
+                f"candidates={display_entry.get('candidate_site_labels', [])}",
+            ]
+            if display_entry.get("uot_beta_neural") is not None:
+                parts.append(f"beta_n={float(display_entry.get('uot_beta_neural')):g}")
+            lines.append("  method " + " ".join(parts))
         for entry in rankings.get(target_var, []):
             parts = [
                 f"layer={int(entry['layer'])}",
@@ -1232,6 +1241,7 @@ def _write_status(
             "target_vars": list(normalized["target_vars"]),
             "stage_a_token_position_ids": list(normalized["stage_a_token_position_ids"]),
             "stage_a_layer_indices": list(normalized["stage_a_layer_indices"]),
+            "stage_a_uot_beta_neurals": list(normalized["stage_a_uot_beta_neurals"]),
             "stage_b_top_layers_per_var": int(args.stage_b_top_layers_per_var),
             "stage_b_neighbor_radius": int(args.stage_b_neighbor_radius),
             "stage_b_max_layers_per_var": int(args.stage_b_max_layers_per_var),

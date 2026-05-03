@@ -40,7 +40,7 @@ DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_UOT_BETA_NEURALS = (0.1, 0.3, 1.0, 3.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
-DEFAULT_SINGLE_LAYER_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
+DEFAULT_SINGLE_LAYER_LAMBDAS = (1.0,)
 DEFAULT_COMPARE_TOP_K = 3
 
 
@@ -92,7 +92,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--uot-beta-neurals", help="Comma-separated neural-side UOT penalties. Default: 0.1,0.3,1,3")
     parser.add_argument("--ot-top-k-values", help="Comma-separated OT/UOT top-k calibration grid.")
     parser.add_argument("--ot-lambdas", help="Comma-separated OT/UOT lambda calibration grid.")
-    parser.add_argument("--single-layer-lambdas", help="Comma-separated lambdas for per-layer single-site evaluation.")
+    parser.add_argument(
+        "--single-layer-lambdas",
+        help="Single fixed intervention strength for per-layer single-site evaluation. Default: 1.0",
+    )
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument("--results-root", default="results")
     parser.add_argument("--results-timestamp")
@@ -258,7 +261,7 @@ def _evaluate_all_layers(
             )
         print(
             f"[single-layer] target={target_var} evaluating {len(sites)} whole-layer sites "
-            f"with lambda grid={list(lambda_values)}"
+            f"with fixed intervention strength={float(lambda_values[0]):g}"
         )
         for site in site_iterator:
             output_path = output_root / target_var / f"layer_{int(site.layer):02d}.json"
@@ -537,7 +540,7 @@ def _format_single_layer_summary(single_layer_by_var: dict[str, list[dict[str, o
                             f"layer={int(entry['layer'])}",
                             f"cal={float(entry.get('calibration_exact_acc', 0.0)):.4f}",
                             f"test={float(entry.get('test_exact_acc', 0.0)):.4f}",
-                            f"lambda={float(entry.get('selected_lambda', 0.0)):g}",
+                            f"strength={float(entry.get('selected_lambda', 0.0)):g}",
                             f"site={entry.get('site_label')}",
                         ]
                     )
@@ -568,7 +571,7 @@ def _format_transport_summary(transport_summaries: list[dict[str, object]]) -> l
                 f"    coupling_top5={[item.get('layer') for item in top_layers[:5]]} "
                 f"matched_mass={float(entry.get('matched_mass', 1.0)):.4f} "
                 f"selected_layer={entry.get('selected_coupling_layer')} "
-                f"lambda={float(entry.get('selected_coupling_layer_lambda', 0.0)):g} "
+                f"strength={float(entry.get('selected_coupling_layer_lambda', 0.0)):g} "
                 f"cal={float(entry.get('selected_coupling_layer_calibration_exact_acc', 0.0)):.4f} "
                 f"test={float(entry.get('selected_coupling_layer_test_exact_acc', 0.0)):.4f}"
             )
@@ -610,7 +613,7 @@ def _format_summary(
         f"layers: {list(int(layer) for layer in layers)}",
         "",
         "This analysis compares joint 26-layer coupling rankings against per-layer single-site intervention accuracies.",
-        "Reported method accuracy uses the argmax layer from each target-variable coupling row, evaluated as a single-site intervention with a lambda sweep.",
+        "Reported method accuracy uses the argmax layer from each target-variable coupling row, evaluated as a fixed-strength single-site intervention.",
         "",
     ]
     lines.extend(_format_single_layer_summary(single_layer_by_var))
@@ -659,6 +662,11 @@ def main() -> None:
     ot_top_k_values = tuple(_parse_csv_ints(args.ot_top_k_values) or list(DEFAULT_OT_TOP_K_VALUES))
     ot_lambdas = tuple(_parse_csv_floats(args.ot_lambdas) or list(DEFAULT_OT_LAMBDAS))
     single_layer_lambdas = tuple(_parse_csv_floats(args.single_layer_lambdas) or list(DEFAULT_SINGLE_LAYER_LAMBDAS))
+    if len(single_layer_lambdas) != 1:
+        raise ValueError(
+            "Single-layer brute-force evaluation now uses one fixed intervention strength. "
+            f"Received {list(single_layer_lambdas)}"
+        )
 
     print(
         f"[layerwise] start token_position={str(args.token_position_id)} "

@@ -83,6 +83,43 @@ def _stage_a_runtime(sweep_root: Path) -> float:
     return 0.0
 
 
+def _stage_a_payload_path(sweep_root: Path) -> Path | None:
+    for filename in ("parallel_manifest.json", "hierarchical_sweep_manifest.json"):
+        path = sweep_root / filename
+        if not path.exists():
+            continue
+        payload = _load_json(path)
+        if not isinstance(payload, dict):
+            continue
+        statuses = payload.get("stage_statuses")
+        if not isinstance(statuses, dict):
+            continue
+
+        def _status_payload_path(status: object) -> Path | None:
+            if not isinstance(status, dict):
+                return None
+            expected_outputs = status.get("expected_outputs")
+            if not isinstance(expected_outputs, list):
+                return None
+            for output_path in expected_outputs:
+                output = Path(str(output_path))
+                if output.name.startswith("mcqa_plot_layer_pos-") and output.suffix == ".json":
+                    return output
+            return None
+
+        for key in ("stage_a_last_token", "stage_a"):
+            output = _status_payload_path(statuses.get(key))
+            if output is not None:
+                return output
+        for key, status in statuses.items():
+            if not str(key).startswith("stage_a"):
+                continue
+            output = _status_payload_path(status)
+            if output is not None:
+                return output
+    return None
+
+
 def _runtime_by_layer_from_rankings(rankings: dict[str, object]) -> dict[int, float]:
     runtime_by_layer: dict[int, float] = {}
     for target_var in TARGET_VARS:
@@ -147,6 +184,252 @@ def _unique_layer_runtime(
         layer_seconds[layer] = _as_float(runtime_by_layer.get(layer))
     values = list(layer_seconds.values())
     return layer_seconds, float(sum(values)), float(max(values) if values else 0.0)
+
+
+def _float_matches(lhs: object, rhs: object, *, tol: float = 1e-9) -> bool:
+    return abs(_as_float(lhs) - _as_float(rhs)) <= float(tol)
+
+
+def _native_selected_width_epsilon_runtime(
+    *,
+    rankings: dict[str, object],
+    entries_by_var: dict[str, dict[str, object] | None],
+) -> tuple[dict[str, float], dict[str, float], dict[str, dict[int, float]]]:
+    runtime_grid: dict[tuple[str, int, int, float], float] = {}
+    payload_paths: set[Path] = set()
+    for target_var in TARGET_VARS:
+        entries = rankings.get(target_var)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            payload_path = entry.get("payload_path")
+            if payload_path:
+                payload_paths.add(Path(str(payload_path)))
+
+    for payload_path in payload_paths:
+        payload = _load_json(payload_path)
+        if not isinstance(payload, dict):
+            continue
+        layer = int(payload.get("layer", -1))
+        native_resolution = int(payload.get("native_resolution", payload.get("atomic_width", -1)))
+        for ot_path_str in payload.get("ot_output_paths", []):
+            compare_payload = _load_json(Path(str(ot_path_str)))
+            if not isinstance(compare_payload, dict):
+                continue
+            epsilon = _as_float(compare_payload.get("ot_epsilon"))
+            method_payloads = compare_payload.get("method_payloads", {})
+            if not isinstance(method_payloads, dict):
+                continue
+            for method_payload in method_payloads.get("ot", []):
+                if not isinstance(method_payload, dict):
+                    continue
+                target_var = str(method_payload.get("target_var"))
+                if target_var not in TARGET_VARS:
+                    continue
+                runtime_grid[(target_var, layer, native_resolution, epsilon)] = _as_float(
+                    method_payload.get("runtime_seconds", method_payload.get("wall_runtime_seconds"))
+                )
+
+    downstream_by_var: dict[str, float] = {}
+    parallel_by_var: dict[str, float] = {}
+    runtime_by_layer_by_var: dict[str, dict[int, float]] = {}
+    for target_var, entry in entries_by_var.items():
+        if not entry:
+            downstream_by_var[target_var] = 0.0
+            parallel_by_var[target_var] = 0.0
+            runtime_by_layer_by_var[target_var] = {}
+            continue
+        selected_width = int(entry.get("native_resolution", entry.get("atomic_width", -1)))
+        selected_epsilon = _as_float(entry.get("epsilon"))
+        layer_runtimes: dict[int, float] = {}
+        for (row_var, layer, native_resolution, epsilon), runtime_seconds in runtime_grid.items():
+            if str(row_var) != str(target_var):
+                continue
+            if int(native_resolution) != int(selected_width):
+                continue
+            if not _float_matches(epsilon, selected_epsilon):
+                continue
+            layer_runtimes[int(layer)] = float(runtime_seconds)
+        runtime_by_layer_by_var[str(target_var)] = layer_runtimes
+        values = list(layer_runtimes.values())
+        downstream_by_var[str(target_var)] = float(sum(values))
+        parallel_by_var[str(target_var)] = float(max(values) if values else 0.0)
+    return downstream_by_var, parallel_by_var, runtime_by_layer_by_var
+
+
+def _pca_selected_config_epsilon_runtime(
+    *,
+    rankings: dict[str, object],
+    entries_by_var: dict[str, dict[str, object] | None],
+) -> tuple[dict[str, float], dict[str, float], dict[str, dict[int, float]]]:
+    runtime_grid: dict[tuple[str, int, str, str, int, float], float] = {}
+    payload_paths: set[Path] = set()
+    for target_var in TARGET_VARS:
+        entries = rankings.get(target_var)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            payload_path = entry.get("layer_payload_path") or entry.get("payload_path")
+            if payload_path:
+                payload_paths.add(Path(str(payload_path)))
+
+    for payload_path in payload_paths:
+        payload = _load_json(payload_path)
+        if not isinstance(payload, dict):
+            continue
+        layer = int(payload.get("layer", -1))
+        basis_source_mode = str(payload.get("basis_source_mode"))
+        site_menu = str(payload.get("site_menu"))
+        num_bands = int(payload.get("num_bands", -1))
+        for ot_path_str in payload.get("ot_output_paths", []):
+            compare_payload = _load_json(Path(str(ot_path_str)))
+            if not isinstance(compare_payload, dict):
+                continue
+            epsilon = _as_float(compare_payload.get("ot_epsilon"))
+            method_payloads = compare_payload.get("method_payloads", {})
+            if not isinstance(method_payloads, dict):
+                continue
+            for method_payload in method_payloads.get("ot", []):
+                if not isinstance(method_payload, dict):
+                    continue
+                target_var = str(method_payload.get("target_var"))
+                if target_var not in TARGET_VARS:
+                    continue
+                runtime_grid[(target_var, layer, basis_source_mode, site_menu, num_bands, epsilon)] = _as_float(
+                    method_payload.get("runtime_seconds", method_payload.get("wall_runtime_seconds"))
+                )
+
+    downstream_by_var: dict[str, float] = {}
+    parallel_by_var: dict[str, float] = {}
+    runtime_by_layer_by_var: dict[str, dict[int, float]] = {}
+    for target_var, entry in entries_by_var.items():
+        if not entry:
+            downstream_by_var[target_var] = 0.0
+            parallel_by_var[target_var] = 0.0
+            runtime_by_layer_by_var[target_var] = {}
+            continue
+        selected_basis = str(entry.get("basis_source_mode"))
+        selected_menu = str(entry.get("site_menu"))
+        selected_bands = int(entry.get("num_bands", -1))
+        selected_epsilon = _as_float(entry.get("epsilon"))
+        layer_runtimes: dict[int, float] = {}
+        for (row_var, layer, basis_source_mode, site_menu, num_bands, epsilon), runtime_seconds in runtime_grid.items():
+            if str(row_var) != str(target_var):
+                continue
+            if str(basis_source_mode) != selected_basis:
+                continue
+            if str(site_menu) != selected_menu:
+                continue
+            if int(num_bands) != selected_bands:
+                continue
+            if not _float_matches(epsilon, selected_epsilon):
+                continue
+            layer_runtimes[int(layer)] = float(runtime_seconds)
+        runtime_by_layer_by_var[str(target_var)] = layer_runtimes
+        values = list(layer_runtimes.values())
+        downstream_by_var[str(target_var)] = float(sum(values))
+        parallel_by_var[str(target_var)] = float(max(values) if values else 0.0)
+    return downstream_by_var, parallel_by_var, runtime_by_layer_by_var
+
+
+def _stage_a_selected_plan_runtime(
+    *,
+    sweep_root: Path,
+    rankings: dict[str, object],
+    entries_by_var: dict[str, dict[str, object] | None],
+) -> tuple[dict[str, float], dict[str, dict[str, object]]]:
+    stage_a_payload_path = _stage_a_payload_path(sweep_root)
+    if stage_a_payload_path is None or not stage_a_payload_path.exists():
+        return ({var: 0.0 for var in TARGET_VARS}, {})
+
+    stage_a_payload = _load_json(stage_a_payload_path)
+    if not isinstance(stage_a_payload, dict):
+        return ({var: 0.0 for var in TARGET_VARS}, {})
+
+    runtime_records: list[dict[str, object]] = []
+    for compare_path_str in stage_a_payload.get("ot_output_paths", []):
+        compare_payload = _load_json(Path(str(compare_path_str)))
+        if not isinstance(compare_payload, dict):
+            continue
+        compare_epsilon = _as_float(compare_payload.get("ot_epsilon"))
+        compare_beta = compare_payload.get("uot_beta_neural")
+        method_payloads = compare_payload.get("method_payloads", {})
+        if not isinstance(method_payloads, dict):
+            continue
+        for method_name, payloads in method_payloads.items():
+            if not isinstance(payloads, list):
+                continue
+            for method_payload in payloads:
+                if not isinstance(method_payload, dict):
+                    continue
+                target_var = str(method_payload.get("target_var"))
+                if target_var not in TARGET_VARS:
+                    continue
+                results = method_payload.get("results", [])
+                result0 = results[0] if isinstance(results, list) and results else {}
+                method = str(
+                    method_payload.get(
+                        "method",
+                        result0.get("method", method_name),
+                    )
+                )
+                runtime_records.append(
+                    {
+                        "target_var": target_var,
+                        "method": method,
+                        "epsilon": compare_epsilon,
+                        "uot_beta_neural": None
+                        if method_payload.get("uot_beta_neural", compare_beta) is None
+                        else _as_float(method_payload.get("uot_beta_neural", compare_beta)),
+                        "runtime_seconds": _as_float(
+                            method_payload.get("runtime_seconds", method_payload.get("wall_runtime_seconds"))
+                        ),
+                        "payload_path": str(compare_path_str),
+                    }
+                )
+
+    downstream_by_var: dict[str, float] = {}
+    selected_records: dict[str, dict[str, object]] = {}
+    for target_var, entry in entries_by_var.items():
+        if not entry:
+            downstream_by_var[target_var] = 0.0
+            continue
+        epsilon = _as_float(entry.get("epsilon"))
+        selected_beta = entry.get("uot_beta_neural")
+        selected_method = entry.get("method")
+        matches = [
+            record
+            for record in runtime_records
+            if str(record.get("target_var")) == str(target_var)
+            and _float_matches(record.get("epsilon"), epsilon)
+        ]
+        if selected_beta is not None:
+            matches = [
+                record
+                for record in matches
+                if record.get("uot_beta_neural") is not None
+                and _float_matches(record.get("uot_beta_neural"), selected_beta)
+            ]
+        if selected_method is not None:
+            matches = [record for record in matches if str(record.get("method")) == str(selected_method)]
+        elif selected_beta is not None:
+            uot_matches = [record for record in matches if str(record.get("method")) == "uot"]
+            if uot_matches:
+                matches = uot_matches
+        elif len(matches) > 1:
+            ot_matches = [record for record in matches if str(record.get("method")) == "ot"]
+            if ot_matches:
+                matches = ot_matches
+
+        selected = matches[0] if matches else None
+        downstream_by_var[target_var] = _as_float(selected.get("runtime_seconds")) if selected else 0.0
+        if selected is not None:
+            selected_records[target_var] = dict(selected)
+    return downstream_by_var, selected_records
 
 
 def _iter_run_payloads(path: Path) -> list[dict[str, object]]:
@@ -224,26 +507,36 @@ def build_paper_runtime_summary(
     native_stage_b_by_layer = _runtime_by_layer_from_rankings(native_rankings)
     pca_stage_b_by_layer = _runtime_by_layer_from_rankings(pca_rankings)
 
+    stage_a_entries = {var: _stage_a_display_entry(stage_a_rankings, var) for var in TARGET_VARS}
+    stage_a_selected_runtime_by_var, stage_a_selected_runtime_records = _stage_a_selected_plan_runtime(
+        sweep_root=sweep_root,
+        rankings=stage_a_rankings,
+        entries_by_var=stage_a_entries,
+    )
     records: list[dict[str, object]] = []
     records.append(
         _method_record(
             method="PLOT (layer)",
-            stage_a_seconds=stage_a_seconds,
-            downstream_by_var={var: 0.0 for var in TARGET_VARS},
-            entries_by_var={var: _stage_a_display_entry(stage_a_rankings, var) for var in TARGET_VARS},
-            notes="Stage A layer localization with method accuracy chosen from the top coupling-ranked single-layer candidates.",
+            stage_a_seconds=0.0,
+            downstream_by_var=stage_a_selected_runtime_by_var,
+            entries_by_var=stage_a_entries,
+            notes="Reported runtime charges only the selected Stage A coupling plan per variable (one epsilon/beta configuration), not the full Stage A sweep over coupling hyperparameters.",
         )
     )
+    if stage_a_selected_runtime_records:
+        records[-1]["selected_stage_a_plan_runtime_records_by_var"] = stage_a_selected_runtime_records
 
     native_entries = {var: _first_entry(native_rankings, var) for var in TARGET_VARS}
-    native_downstream = {
-        var: native_stage_b_by_layer.get(int(entry["layer"]), 0.0) if entry else 0.0
-        for var, entry in native_entries.items()
-    }
-    native_shared_by_layer, native_serial, native_parallel = _unique_layer_runtime(
-        native_entries,
-        native_stage_b_by_layer,
+    native_downstream, native_parallel_by_var, native_runtime_by_layer_by_var = _native_selected_width_epsilon_runtime(
+        rankings=native_rankings,
+        entries_by_var=native_entries,
     )
+    native_shared_by_layer = {
+        layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in native_runtime_by_layer_by_var.values())
+        for layer in sorted({layer for layer_runtimes in native_runtime_by_layer_by_var.values() for layer in layer_runtimes})
+    }
+    native_serial = float(sum(_as_float(native_downstream.get(var)) for var in TARGET_VARS))
+    native_parallel = float(max((_as_float(native_parallel_by_var.get(var)) for var in TARGET_VARS), default=0.0))
     records.append(
         _method_record(
             method="PLOT (native support)",
@@ -253,19 +546,21 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=native_serial,
             parallel_downstream_seconds=native_parallel,
             shared_runtime_seconds_by_layer=native_shared_by_layer,
-            notes="Stage A plus native-support localization over one canonical atomic partition per selected layer.",
+            notes="Stage A plus the selected native-support width+epsilon slice, summed across all Stage B-executed layers for each variable; width/epsilon search overhead is excluded.",
         )
     )
 
     pca_entries = {var: _first_entry(pca_rankings, var) for var in TARGET_VARS}
-    pca_downstream = {
-        var: pca_stage_b_by_layer.get(int(entry["layer"]), 0.0) if entry else 0.0
-        for var, entry in pca_entries.items()
-    }
-    pca_shared_by_layer, pca_serial, pca_parallel = _unique_layer_runtime(
-        pca_entries,
-        pca_stage_b_by_layer,
+    pca_downstream, pca_parallel_by_var, pca_runtime_by_layer_by_var = _pca_selected_config_epsilon_runtime(
+        rankings=pca_rankings,
+        entries_by_var=pca_entries,
     )
+    pca_shared_by_layer = {
+        layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in pca_runtime_by_layer_by_var.values())
+        for layer in sorted({layer for layer_runtimes in pca_runtime_by_layer_by_var.values() for layer in layer_runtimes})
+    }
+    pca_serial = float(sum(_as_float(pca_downstream.get(var)) for var in TARGET_VARS))
+    pca_parallel = float(max((_as_float(pca_parallel_by_var.get(var)) for var in TARGET_VARS), default=0.0))
     records.append(
         _method_record(
             method="PLOT (PCA support)",
@@ -275,7 +570,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=pca_serial,
             parallel_downstream_seconds=pca_parallel,
             shared_runtime_seconds_by_layer=pca_shared_by_layer,
-            notes="Stage A plus PCA-support localization over the selected layer.",
+            notes="Stage A plus the selected PCA-support config+epsilon slice, summed across all Stage B-executed layers for each variable; PCA config and epsilon search overhead is excluded.",
         )
     )
 

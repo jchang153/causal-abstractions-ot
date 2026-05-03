@@ -17,6 +17,21 @@ from .sites import (
 )
 
 
+def _iter_transport_method_payloads(compare_payload: dict[str, object]) -> list[dict[str, object]]:
+    method_payloads = compare_payload.get("method_payloads", {})
+    if not isinstance(method_payloads, dict):
+        return []
+    payloads: list[dict[str, object]] = []
+    for method_name in ("ot", "uot"):
+        method_entries = method_payloads.get(method_name, [])
+        if not isinstance(method_entries, list):
+            continue
+        for payload in method_entries:
+            if isinstance(payload, dict):
+                payloads.append(payload)
+    return payloads
+
+
 def _position_mass_by_var(
     transport: np.ndarray,
     sites: list[ResidualSite],
@@ -168,8 +183,7 @@ def extract_ordered_site_support(
     """Pool near-best OT runs into row-dominant support over an ordered site catalog."""
     grouped_payloads: dict[str, list[dict[str, object]]] = {}
     for compare_payload in ot_run_payloads:
-        method_payloads = compare_payload.get("method_payloads", {})
-        for payload in method_payloads.get("ot", []):
+        for payload in _iter_transport_method_payloads(compare_payload):
             grouped_payloads.setdefault(str(payload.get("target_var")), []).append(payload)
 
     support_by_var: dict[str, dict[str, object]] = {}
@@ -280,8 +294,7 @@ def extract_layer_position_support(
     """Pool near-best OT full-vector runs into row-dominant layer-position support."""
     grouped_payloads: dict[str, list[dict[str, object]]] = {}
     for compare_payload in ot_run_payloads:
-        method_payloads = compare_payload.get("method_payloads", {})
-        for payload in method_payloads.get("ot", []):
+        for payload in _iter_transport_method_payloads(compare_payload):
             grouped_payloads.setdefault(str(payload.get("target_var")), []).append(payload)
 
     support_by_var: dict[str, dict[str, object]] = {}
@@ -377,8 +390,7 @@ def extract_block_mask_support(
     """Pool near-best OT block runs into row-dominant within-layer block masks."""
     grouped_payloads: dict[str, list[dict[str, object]]] = {}
     for compare_payload in ot_run_payloads:
-        method_payloads = compare_payload.get("method_payloads", {})
-        for payload in method_payloads.get("ot", []):
+        for payload in _iter_transport_method_payloads(compare_payload):
             grouped_payloads.setdefault(str(payload.get("target_var")), []).append(payload)
 
     support_by_var: dict[str, dict[str, object]] = {}
