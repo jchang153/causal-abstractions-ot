@@ -88,6 +88,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layers", help="Comma-separated layer indices. Default: all layers.")
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
     parser.add_argument("--methods", default="ot,uot")
+    parser.add_argument(
+        "--skip-transport",
+        action="store_true",
+        help="Only run the full-strength single-layer brute-force sweep; skip OT/UOT transport analysis.",
+    )
     parser.add_argument("--ot-epsilons", help="Comma-separated OT/UOT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--uot-beta-neurals", help="Comma-separated neural-side UOT penalties. Default: 0.1,0.3,1,3")
     parser.add_argument("--ot-top-k-values", help="Comma-separated OT/UOT top-k calibration grid.")
@@ -134,6 +139,11 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _format_strength_tag(value: float) -> str:
+    text = f"{float(value):g}"
+    return text.replace(".", "p").replace("-", "m")
 
 
 def _target_row_ranking(payload: dict[str, object], *, sites) -> list[dict[str, object]]:
@@ -250,6 +260,8 @@ def _evaluate_all_layers(
 ) -> dict[str, list[dict[str, object]]]:
     results_by_var: dict[str, list[dict[str, object]]] = {}
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
+    fixed_strength = float(lambda_values[0])
+    strength_tag = _format_strength_tag(fixed_strength)
     for target_var in target_vars:
         entries: list[dict[str, object]] = []
         site_iterator = sites
@@ -261,10 +273,15 @@ def _evaluate_all_layers(
             )
         print(
             f"[single-layer] target={target_var} evaluating {len(sites)} whole-layer sites "
-            f"with fixed intervention strength={float(lambda_values[0]):g}"
+            f"with fixed intervention strength={fixed_strength:g}"
         )
         for site in site_iterator:
-            output_path = output_root / target_var / f"layer_{int(site.layer):02d}.json"
+            output_path = (
+                output_root
+                / target_var
+                / f"strength_{strength_tag}"
+                / f"layer_{int(site.layer):02d}.json"
+            )
             payload = _load_existing_payload(output_path)
             if payload is None:
                 payload = run_bruteforce_site_pipeline(
@@ -304,12 +321,59 @@ def _evaluate_all_layers(
                         result.get("selection_score", calibration_result.get("exact_acc", 0.0))
                     ),
                     "test_exact_acc": float(result.get("exact_acc", 0.0)),
-                    "selected_lambda": float(selected_hyperparameters.get("lambda", result.get("lambda", 0.0))),
+                    "selected_lambda": fixed_strength,
+                    "intervention_strength": fixed_strength,
                     "output_path": str(output_path),
                 }
             )
         results_by_var[str(target_var)] = sorted(entries, key=lambda entry: int(entry["layer"]))
     return results_by_var
+
+
+def _rank_single_layer_entries(
+    entries: list[dict[str, object]],
+    *,
+    metric_key: str,
+    secondary_metric_key: str,
+) -> list[dict[str, object]]:
+    ranked = sorted(
+        entries,
+        key=lambda entry: (
+            float(entry.get(metric_key, 0.0)),
+            float(entry.get(secondary_metric_key, 0.0)),
+            -int(entry["layer"]),
+        ),
+        reverse=True,
+    )
+    return [
+        {
+            **dict(entry),
+            "rank": int(rank + 1),
+            "ranking_metric": str(metric_key),
+        }
+        for rank, entry in enumerate(ranked)
+    ]
+
+
+def _build_single_layer_rankings(
+    single_layer_by_var: dict[str, list[dict[str, object]]],
+) -> dict[str, dict[str, list[dict[str, object]]]]:
+    rankings: dict[str, dict[str, list[dict[str, object]]]] = {}
+    for target_var in DEFAULT_TARGET_VARS:
+        entries = [dict(entry) for entry in single_layer_by_var.get(str(target_var), [])]
+        rankings[str(target_var)] = {
+            "by_test": _rank_single_layer_entries(
+                entries,
+                metric_key="test_exact_acc",
+                secondary_metric_key="calibration_exact_acc",
+            ),
+            "by_calibration": _rank_single_layer_entries(
+                entries,
+                metric_key="calibration_exact_acc",
+                secondary_metric_key="test_exact_acc",
+            ),
+        }
+    return rankings
 
 
 def _transport_configs(
@@ -507,44 +571,74 @@ def _summarize_transport_runs(
     return summaries
 
 
-def _format_single_layer_summary(single_layer_by_var: dict[str, list[dict[str, object]]]) -> list[str]:
+def _format_single_layer_summary(
+    single_layer_by_var: dict[str, list[dict[str, object]]],
+    single_layer_rankings_by_var: dict[str, dict[str, list[dict[str, object]]]],
+) -> list[str]:
     lines: list[str] = []
     for target_var in DEFAULT_TARGET_VARS:
         entries = single_layer_by_var.get(str(target_var), [])
         lines.append(f"[single-layer {target_var}]")
-        by_calibration = sorted(
-            entries,
-            key=lambda entry: (
-                float(entry.get("calibration_exact_acc", 0.0)),
-                float(entry.get("test_exact_acc", 0.0)),
-                -int(entry["layer"]),
-            ),
-            reverse=True,
-        )
-        by_test = sorted(
-            entries,
-            key=lambda entry: (
-                float(entry.get("test_exact_acc", 0.0)),
-                float(entry.get("calibration_exact_acc", 0.0)),
-                -int(entry["layer"]),
-            ),
-            reverse=True,
-        )
-        for label, ranked in (("best_by_calibration", by_calibration[:5]), ("best_by_test", by_test[:5])):
-            lines.append(f"  {label}:")
-            for entry in ranked:
-                lines.append(
-                    "    "
-                    + " ".join(
-                        [
-                            f"layer={int(entry['layer'])}",
-                            f"cal={float(entry.get('calibration_exact_acc', 0.0)):.4f}",
-                            f"test={float(entry.get('test_exact_acc', 0.0)):.4f}",
-                            f"strength={float(entry.get('selected_lambda', 0.0)):g}",
-                            f"site={entry.get('site_label')}",
-                        ]
-                    )
+        by_test = single_layer_rankings_by_var.get(str(target_var), {}).get("by_test", [])
+        by_calibration = single_layer_rankings_by_var.get(str(target_var), {}).get("by_calibration", [])
+        if entries and by_test:
+            best_test = by_test[0]
+            lines.append(
+                "  best_by_test: "
+                + " ".join(
+                    [
+                        f"layer={int(best_test['layer'])}",
+                        f"cal={float(best_test.get('calibration_exact_acc', 0.0)):.4f}",
+                        f"test={float(best_test.get('test_exact_acc', 0.0)):.4f}",
+                        f"strength={float(best_test.get('intervention_strength', 0.0)):g}",
+                        f"site={best_test.get('site_label')}",
+                    ]
                 )
+            )
+        if entries and by_calibration:
+            best_calibration = by_calibration[0]
+            lines.append(
+                "  best_by_calibration: "
+                + " ".join(
+                    [
+                        f"layer={int(best_calibration['layer'])}",
+                        f"cal={float(best_calibration.get('calibration_exact_acc', 0.0)):.4f}",
+                        f"test={float(best_calibration.get('test_exact_acc', 0.0)):.4f}",
+                        f"strength={float(best_calibration.get('intervention_strength', 0.0)):g}",
+                        f"site={best_calibration.get('site_label')}",
+                    ]
+                )
+            )
+        lines.append("  full_test_ranking:")
+        for entry in by_test:
+            lines.append(
+                "    "
+                + " ".join(
+                    [
+                        f"rank={int(entry['rank'])}",
+                        f"layer={int(entry['layer'])}",
+                        f"test={float(entry.get('test_exact_acc', 0.0)):.4f}",
+                        f"cal={float(entry.get('calibration_exact_acc', 0.0)):.4f}",
+                        f"strength={float(entry.get('intervention_strength', 0.0)):g}",
+                        f"site={entry.get('site_label')}",
+                    ]
+                )
+            )
+        lines.append("  full_calibration_ranking:")
+        for entry in by_calibration:
+            lines.append(
+                "    "
+                + " ".join(
+                    [
+                        f"rank={int(entry['rank'])}",
+                        f"layer={int(entry['layer'])}",
+                        f"cal={float(entry.get('calibration_exact_acc', 0.0)):.4f}",
+                        f"test={float(entry.get('test_exact_acc', 0.0)):.4f}",
+                        f"strength={float(entry.get('intervention_strength', 0.0)):g}",
+                        f"site={entry.get('site_label')}",
+                    ]
+                )
+            )
         lines.append("")
     return lines
 
@@ -605,6 +699,7 @@ def _format_summary(
     token_position_id: str,
     layers: tuple[int, ...],
     single_layer_by_var: dict[str, list[dict[str, object]]],
+    single_layer_rankings_by_var: dict[str, dict[str, list[dict[str, object]]]],
     transport_summaries: list[dict[str, object]],
 ) -> str:
     lines = [
@@ -616,7 +711,7 @@ def _format_summary(
         "Reported method accuracy uses the argmax layer from each target-variable coupling row, evaluated as a fixed-strength single-site intervention.",
         "",
     ]
-    lines.extend(_format_single_layer_summary(single_layer_by_var))
+    lines.extend(_format_single_layer_summary(single_layer_by_var, single_layer_rankings_by_var))
     lines.extend(_format_transport_summary(transport_summaries))
     return "\n".join(lines)
 
@@ -657,6 +752,8 @@ def main() -> None:
         selected_token_position_ids=(str(args.token_position_id),),
     )
     methods = tuple(_parse_csv_strings(args.methods) or list(DEFAULT_METHODS))
+    if bool(args.skip_transport):
+        methods = ()
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
     uot_beta_neurals = tuple(_parse_csv_floats(args.uot_beta_neurals) or list(DEFAULT_UOT_BETA_NEURALS))
     ot_top_k_values = tuple(_parse_csv_ints(args.ot_top_k_values) or list(DEFAULT_OT_TOP_K_VALUES))
@@ -741,32 +838,37 @@ def main() -> None:
         lambda_values=single_layer_lambdas,
         output_root=single_layer_root,
     )
-    transport_runs = _run_transport_sweeps(
-        model=model,
-        tokenizer=tokenizer,
-        banks_by_split=banks_by_split,
-        sites=sites,
-        device=device,
-        batch_size=int(args.batch_size),
-        signature_mode=str(args.signature_mode),
-        top_k_values=ot_top_k_values,
-        lambda_values=ot_lambdas,
-        prepared_artifacts=prepared_artifacts,
-        output_root=transport_root,
-        methods=methods,
-        ot_epsilons=ot_epsilons,
-        uot_beta_neurals=uot_beta_neurals,
-    )
-    transport_summaries = _summarize_transport_runs(
-        transport_runs=transport_runs,
-        single_layer_by_var=single_layer_by_var,
-        sites=sites,
-    )
+    single_layer_rankings_by_var = _build_single_layer_rankings(single_layer_by_var)
+    transport_runs: list[dict[str, object]] = []
+    transport_summaries: list[dict[str, object]] = []
+    if methods:
+        transport_runs = _run_transport_sweeps(
+            model=model,
+            tokenizer=tokenizer,
+            banks_by_split=banks_by_split,
+            sites=sites,
+            device=device,
+            batch_size=int(args.batch_size),
+            signature_mode=str(args.signature_mode),
+            top_k_values=ot_top_k_values,
+            lambda_values=ot_lambdas,
+            prepared_artifacts=prepared_artifacts,
+            output_root=transport_root,
+            methods=methods,
+            ot_epsilons=ot_epsilons,
+            uot_beta_neurals=uot_beta_neurals,
+        )
+        transport_summaries = _summarize_transport_runs(
+            transport_runs=transport_runs,
+            single_layer_by_var=single_layer_by_var,
+            sites=sites,
+        )
 
     summary_text = _format_summary(
         token_position_id=str(args.token_position_id),
         layers=resolved_layers,
         single_layer_by_var=single_layer_by_var,
+        single_layer_rankings_by_var=single_layer_rankings_by_var,
         transport_summaries=transport_summaries,
     )
     summary_path = sweep_root / "layerwise_ot_summary.txt"
@@ -800,6 +902,7 @@ def main() -> None:
             },
             "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)),
             "single_layer_by_var": single_layer_by_var,
+            "single_layer_rankings_by_var": single_layer_rankings_by_var,
             "transport_runs": transport_runs,
             "transport_summaries": transport_summaries,
             "data": data_metadata,
