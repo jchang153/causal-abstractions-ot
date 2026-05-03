@@ -415,9 +415,10 @@ def _selection_transport_for_target(
 ) -> tuple[np.ndarray, bool]:
     """Return the transport used for calibration/intervention and whether to renormalize after truncation."""
     if method == "uot":
-        # Preserve unmatched-mass behavior: if neural mass backs off under UOT,
-        # the intervention should see that reduced mass rather than a renormalized proxy.
-        return target_transport, False
+        # Use the relaxed row for support ranking, but apply calibrated interventions
+        # on the selected support at unit mass. The raw captured UOT mass is still
+        # reported separately as a localization confidence.
+        return target_transport, True
     return target_normalized_transport, True
 
 
