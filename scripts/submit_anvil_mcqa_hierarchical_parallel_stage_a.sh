@@ -15,6 +15,8 @@ echo "[submit-anvil-hpar-a] ANVIL_ACCOUNT=${ANVIL_ACCOUNT}"
 echo "[submit-anvil-hpar-a] ANVIL_PARTITION=${ANVIL_PARTITION}"
 echo "[submit-anvil-hpar-a] stage_a_time=${STAGE_A_TIME}"
 echo "[submit-anvil-hpar-a] stage_a_token_position_ids=${STAGE_A_TOKEN_POSITION_IDS:-last_token}"
+echo "[submit-anvil-hpar-a] stage_a_method=${STAGE_A_METHOD:-ot}"
+echo "[submit-anvil-hpar-a] uot_beta_neurals=${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
 echo "[submit-anvil-hpar-a] split_seed=${SPLIT_SEED}"
 
 RESULTS_TIMESTAMP="${TIMESTAMP}" \

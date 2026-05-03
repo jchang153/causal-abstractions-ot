@@ -22,6 +22,8 @@ DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.5, 2.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
+DEFAULT_STAGE_A_METHOD = "ot"
+DEFAULT_UOT_BETA_NEURALS = (0.03, 0.1, 0.3, 1.0, 3.0)
 DEFAULT_PCA_SITE_MENUS = ("partition", "mixed")
 DEFAULT_PCA_BASIS_SOURCE_MODES = ("pair_bank", "all_variants")
 DEFAULT_PCA_NUM_BANDS_VALUES = (8, 16)
@@ -229,7 +231,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-a-token-position-ids", default="last_token")
     parser.add_argument("--stage-a-layer-indices", default=None, help="Comma-separated layer indices. Default: all layers.")
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
+    parser.add_argument("--stage-a-method", default=DEFAULT_STAGE_A_METHOD, choices=("ot", "uot"))
     parser.add_argument("--ot-epsilons", default="0.5,1,2,4")
+    parser.add_argument(
+        "--uot-beta-neurals",
+        default="0.03,0.1,0.3,1,3",
+        help="Comma-separated neural-side KL penalties for one-sided UOT Stage A.",
+    )
     parser.add_argument("--ot-top-k-values", default="1,2,4")
     parser.add_argument("--ot-lambdas", default="0.5,1,2,4")
     parser.add_argument("--calibration-metric", default=DEFAULT_CALIBRATION_METRIC)
@@ -274,6 +282,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     pca_top_prefix_sizes = _parse_csv_ints(args.pca_top_prefix_sizes) or DEFAULT_PCA_TOP_PREFIX_SIZES
     native_block_resolutions = _parse_csv_ints(args.native_block_resolutions) or DEFAULT_NATIVE_BLOCK_RESOLUTIONS
     ot_epsilons = _parse_csv_floats(args.ot_epsilons) or DEFAULT_OT_EPSILONS
+    uot_beta_neurals = _parse_csv_floats(args.uot_beta_neurals) or DEFAULT_UOT_BETA_NEURALS
     ot_top_k_values = _parse_csv_ints(args.ot_top_k_values) or DEFAULT_OT_TOP_K_VALUES
     ot_lambdas = _parse_csv_floats(args.ot_lambdas) or DEFAULT_OT_LAMBDAS
     calibration_family_weights = _parse_csv_floats(args.calibration_family_weights) or DEFAULT_CALIBRATION_FAMILY_WEIGHTS
@@ -292,12 +301,14 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "target_vars": tuple(str(target_var) for target_var in target_vars),
         "stage_a_token_position_ids": tuple(str(token_position_id) for token_position_id in stage_a_token_position_ids),
         "stage_a_layer_indices": tuple(int(layer) for layer in stage_a_layer_indices),
+        "stage_a_method": str(args.stage_a_method),
         "pca_site_menus": tuple(str(site_menu) for site_menu in pca_site_menus),
         "pca_basis_source_modes": tuple(str(mode) for mode in pca_basis_source_modes),
         "pca_num_bands_values": tuple(int(value) for value in pca_num_bands_values),
         "pca_top_prefix_sizes": tuple(int(size) for size in pca_top_prefix_sizes),
         "native_block_resolutions": tuple(int(resolution) for resolution in native_block_resolutions),
         "ot_epsilons": tuple(float(epsilon) for epsilon in ot_epsilons),
+        "uot_beta_neurals": tuple(float(beta) for beta in uot_beta_neurals),
         "ot_top_k_values": tuple(int(value) for value in ot_top_k_values),
         "ot_lambdas": tuple(float(value) for value in ot_lambdas),
         "calibration_family_weights": tuple(float(weight) for weight in calibration_family_weights),
@@ -340,7 +351,7 @@ def _build_stage_a_command(
         "--batch-size",
         str(int(args.batch_size)),
         "--methods",
-        "ot",
+        str(normalized["stage_a_method"]),
         "--target-vars",
         ",".join(str(target_var) for target_var in normalized["target_vars"]),
         "--layers",
@@ -351,6 +362,8 @@ def _build_stage_a_command(
         "full",
         "--ot-epsilons",
         ",".join(str(epsilon).rstrip("0").rstrip(".") if "." in str(epsilon) else str(epsilon) for epsilon in normalized["ot_epsilons"]),
+        "--uot-beta-neural",
+        ",".join(str(beta).rstrip("0").rstrip(".") if "." in str(beta) else str(beta) for beta in normalized["uot_beta_neurals"]),
         "--ot-top-k-values",
         ",".join(str(value) for value in normalized["ot_top_k_values"]),
         "--ot-lambdas",
@@ -523,7 +536,7 @@ def _run_stage_command(*, stage: SweepStage, repo_root: Path) -> float:
     return float(perf_counter() - start)
 
 
-def _iter_ot_payloads_from_run_payload(run_payload: dict[str, object]) -> Iterable[dict[str, object]]:
+def _iter_transport_payloads_from_run_payload(run_payload: dict[str, object]) -> Iterable[dict[str, object]]:
     compare_runs = run_payload.get("runs", [])
     if not isinstance(compare_runs, list):
         return
@@ -533,13 +546,16 @@ def _iter_ot_payloads_from_run_payload(run_payload: dict[str, object]) -> Iterab
         method_payloads = compare_payload.get("method_payloads", {})
         if not isinstance(method_payloads, dict):
             continue
-        for payload in method_payloads.get("ot", []):
-            if not isinstance(payload, dict):
-                continue
-            enriched = dict(payload)
-            enriched["_candidate_sites"] = compare_payload.get("candidate_sites", [])
-            enriched["_ot_epsilon"] = float(compare_payload.get("ot_epsilon", -1.0))
-            yield enriched
+        for method in ("ot", "uot"):
+            for payload in method_payloads.get(method, []):
+                if not isinstance(payload, dict):
+                    continue
+                enriched = dict(payload)
+                enriched["_method"] = str(method)
+                enriched["_candidate_sites"] = compare_payload.get("candidate_sites", [])
+                enriched["_ot_epsilon"] = float(compare_payload.get("ot_epsilon", -1.0))
+                enriched["_uot_beta_neural"] = float(compare_payload.get("uot_beta_neural", -1.0))
+                yield enriched
 
 
 def _stage_a_rankings_from_layer_sweep(*, manifest_path: Path, manifest_payload: dict[str, object]) -> dict[str, list[dict[str, object]]]:
@@ -571,7 +587,7 @@ def _stage_a_rankings_from_layer_sweep(*, manifest_path: Path, manifest_payload:
         if not isinstance(run_payload, dict):
             continue
         grouped_payloads: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
-        for payload in _iter_ot_payloads_from_run_payload(run_payload):
+        for payload in _iter_transport_payloads_from_run_payload(run_payload):
             target_var = str(payload.get("target_var"))
             grouped_payloads.setdefault(target_var, []).append(payload)
         for target_var, payloads in grouped_payloads.items():
@@ -599,10 +615,10 @@ def _stage_a_rankings_from_layer_sweep(*, manifest_path: Path, manifest_payload:
 
 
 def _stage_a_rankings_from_joint_run(*, aggregate_path: Path, aggregate_payload: dict[str, object]) -> dict[str, list[dict[str, object]]]:
-    # True Stage A: one OT coupling whose neural sites are full residual-stream layers.
+    # True Stage A: one transport coupling whose neural sites are full residual-stream layers.
     # Layers are ranked by the target variable's normalized transport mass.
     grouped_payloads: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
-    for payload in _iter_ot_payloads_from_run_payload(aggregate_payload):
+    for payload in _iter_transport_payloads_from_run_payload(aggregate_payload):
         target_var = str(payload.get("target_var"))
         grouped_payloads.setdefault(target_var, []).append(payload)
 
@@ -664,13 +680,15 @@ def _stage_a_rankings_from_joint_run(*, aggregate_path: Path, aggregate_payload:
                     "handle_calibration_score": float(best["selection_score"]),
                     "exact_acc": float(best["exact_acc"]),
                     "epsilon": float(best["epsilon"]),
+                    "method": str(best_payload.get("_method", "ot")),
+                    "uot_beta_neural": float(best_payload.get("_uot_beta_neural", -1.0)),
                     "site_label": best.get("site_label"),
                     "runtime_seconds": best.get("runtime_seconds"),
                     "wall_runtime_seconds": best.get("wall_runtime_seconds"),
                     "signature_prepare_runtime_seconds": best.get("signature_prepare_runtime_seconds"),
                     "target_mass": float(target_mass_by_layer.get(int(layer), 0.0)),
                     "selected_mass": float(selected_mass_by_layer.get(int(layer), 0.0)),
-                    "selection_basis": "joint_ot_target_mass",
+                    "selection_basis": f"joint_{str(best_payload.get('_method', 'ot'))}_target_mass",
                     "source_path": str(aggregate_path),
                 }
             )
@@ -706,6 +724,10 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
                 parts.append(f"cal={float(entry.get('handle_calibration_score', -1.0)):.4f}")
             if "epsilon" in entry:
                 parts.append(f"eps={float(entry.get('epsilon', -1.0)):g}")
+            if entry.get("method") is not None:
+                parts.append(f"method={entry.get('method')}")
+            if float(entry.get("uot_beta_neural", -1.0)) >= 0.0:
+                parts.append(f"beta={float(entry.get('uot_beta_neural', -1.0)):g}")
             if entry.get("site_label") is not None:
                 parts.append(f"site={entry.get('site_label')}")
             if entry.get("runtime_seconds") is not None:

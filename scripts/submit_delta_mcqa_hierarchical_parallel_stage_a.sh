@@ -13,6 +13,8 @@ echo "[submit-delta-hpar-a] timestamp=${TIMESTAMP}"
 echo "[submit-delta-hpar-a] delta_account=${DELTA_ACCOUNT}"
 echo "[submit-delta-hpar-a] delta_partition=${DELTA_PARTITION}"
 echo "[submit-delta-hpar-a] stage_a_token_position_ids=${STAGE_A_TOKEN_POSITION_IDS:-last_token}"
+echo "[submit-delta-hpar-a] stage_a_method=${STAGE_A_METHOD:-ot}"
+echo "[submit-delta-hpar-a] uot_beta_neurals=${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
 echo "[submit-delta-hpar-a] split_seed=${SPLIT_SEED}"
 
 RESULTS_TIMESTAMP="${TIMESTAMP}" \

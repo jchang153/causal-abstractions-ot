@@ -35,8 +35,10 @@ export RESULTS_TIMESTAMP="${RESULTS_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 export STAGE_A_TOKEN_POSITION_IDS="${STAGE_A_TOKEN_POSITION_IDS:-last_token}"
 export STAGE_A_LAYER_INDICES="${STAGE_A_LAYER_INDICES:-}"
 export TARGET_VARS="${TARGET_VARS:-answer_pointer,answer_token}"
+export STAGE_A_METHOD="${STAGE_A_METHOD:-ot}"
 export SIGNATURE_MODE="${SIGNATURE_MODE:-family_label_delta_norm}"
 export OT_EPSILONS="${OT_EPSILONS:-0.5,1,2,4}"
+export UOT_BETA_NEURALS="${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
 export OT_TOP_K_VALUES="${OT_TOP_K_VALUES:-1,2,4}"
 export OT_LAMBDAS="${OT_LAMBDAS:-0.5,1,2,4}"
 export CALIBRATION_METRIC="${CALIBRATION_METRIC:-family_weighted_macro_exact_acc}"
@@ -46,6 +48,7 @@ export SPLIT_SEED="${SPLIT_SEED:-0}"
 mkdir -p "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}"
 
 echo "[delta-mcqa-hpar-stage-a] host=$(hostname) token_positions=${STAGE_A_TOKEN_POSITION_IDS} timestamp=${RESULTS_TIMESTAMP} split_seed=${SPLIT_SEED}"
+echo "[delta-mcqa-hpar-stage-a] stage_a_method=${STAGE_A_METHOD} uot_beta_neurals=${UOT_BETA_NEURALS}"
 nvidia-smi
 
 ARGS=(
@@ -56,8 +59,10 @@ ARGS=(
   --signatures-dir signatures
   --stage-a-token-position-ids "${STAGE_A_TOKEN_POSITION_IDS}"
   --target-vars "${TARGET_VARS}"
+  --stage-a-method "${STAGE_A_METHOD}"
   --signature-mode "${SIGNATURE_MODE}"
   --ot-epsilons "${OT_EPSILONS}"
+  --uot-beta-neurals "${UOT_BETA_NEURALS}"
   --ot-top-k-values "${OT_TOP_K_VALUES}"
   --ot-lambdas "${OT_LAMBDAS}"
   --calibration-metric "${CALIBRATION_METRIC}"
