@@ -26,11 +26,33 @@ from experiments.binary_addition_rnn.pca_basis import fit_pca_rotations
 
 
 ROW_KEYS = ("C1", "C2", "C3")
-METHODS = (
+METHOD_SETS = {
+    "default": (
+        ("stage_a", "PLOT\nlayers", "PC index"),
+        ("plot_pca", "PLOT-PCA", "PC index"),
+        ("das_full_timestep", "PLOT-DAS", "PC index"),
+        ("das_pca", "PLOT-PCA-DAS", "PC index"),
+        ("full_das", "Full DAS", "PC index"),
+    ),
+    "paper": (
+        ("stage_a", "PLOT\nlayers", "PC index"),
+        ("plot_canonical", "PLOT", "neuron"),
+        ("plot_pca", "PLOT-PCA", "PC index"),
+        ("das_full_timestep", "PLOT-DAS", "PC index"),
+        ("full_das", "Full DAS", "PC index"),
+    ),
+}
+
+METHODS = METHOD_SETS["default"]
+
+MethodSpec = tuple[str, str, str]
+
+METHOD_LOOKUP = (
     ("stage_a", "PLOT\nlayers", "PC index"),
+    ("plot_canonical", "PLOT", "neuron"),
     ("plot_pca", "PLOT-PCA", "PC index"),
-    ("das_full_timestep", "PLOT-guided DAS\nfull timestep", "PC index"),
-    ("das_pca", "PLOT-PCA-guided\nDAS", "PC index"),
+    ("das_full_timestep", "PLOT-DAS", "PC index"),
+    ("das_pca", "PLOT-PCA-DAS", "PC index"),
     ("full_das", "Full DAS", "PC index"),
 )
 
@@ -49,10 +71,33 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--formats", type=str, default="png,pdf")
     ap.add_argument("--dpi", type=int, default=220)
     ap.add_argument("--layout", type=str, default="standard", choices=["standard", "square"])
+    ap.add_argument("--method-set", type=str, default="default", choices=sorted(METHOD_SETS))
+    ap.add_argument(
+        "--stage-a-source-seed",
+        type=str,
+        default="",
+        help="Optional seed to use only for the leftmost Stage-A PLOT layers panel.",
+    )
     ap.add_argument("--cell-mm", type=float, default=3.0, help="Cell size for --layout square.")
     ap.add_argument("--row-gap-mm", type=float, default=1.5, help="Row gap for --layout square.")
     ap.add_argument("--col-gap-mm", type=float, default=2.0, help="Column gap for --layout square.")
     ap.add_argument("--no-title", action="store_true")
+    ap.add_argument(
+        "--plot-canonical-run-dir",
+        type=str,
+        default="",
+        help=(
+            "Optional run directory from run_progressive_plot_stage_b_resolution_sweep.py. "
+            "When set, the PLOT column shows those post-calibration handles instead of "
+            "the canonical handles stored in the base progressive summary."
+        ),
+    )
+    ap.add_argument(
+        "--plot-canonical-resolutions",
+        type=str,
+        default="",
+        help="Optional comma-separated resolution subset to use from --plot-canonical-run-dir, e.g. 1,2.",
+    )
     ap.add_argument(
         "--das-display-basis",
         type=str,
@@ -104,6 +149,20 @@ def _plot_pca_matrix(summary: dict[str, object], row_key: str, hidden_size: int)
     stage = summary["stages"]["stage_b_pca_ot"]
     row = stage["best_trial"]["test"]["per_row"][row_key]
     mat = np.zeros((4, hidden_size), dtype=float)
+    selected_sites = list(row.get("selected_sites", []))
+    if selected_sites:
+        for site_record in selected_sites:
+            site_key = str(site_record["site_key"])
+            timestep = _timestep_from_site(site_key)
+            if timestep is None:
+                continue
+            indices = _indices_from_site(site_key, hidden_size, pca=True)
+            if not indices:
+                continue
+            for idx in indices:
+                mat[int(timestep), int(idx)] += float(site_record["weight"])
+        return mat
+
     for site_key, mass in zip(stage["sites"], row["row_mass"]):
         timestep = _timestep_from_site(str(site_key))
         if timestep is None:
@@ -115,6 +174,131 @@ def _plot_pca_matrix(summary: dict[str, object], row_key: str, hidden_size: int)
         for idx in indices:
             mat[int(timestep), int(idx)] += share
     return mat
+
+
+def _plot_canonical_matrix(summary: dict[str, object], row_key: str, hidden_size: int) -> np.ndarray:
+    stage = summary["stages"]["stage_b_canonical_ot"]
+    row = stage["best_trial"]["test"]["per_row"][row_key]
+    mat = np.zeros((4, hidden_size), dtype=float)
+    selected_sites = list(row.get("selected_sites", []))
+    if selected_sites:
+        for site_record in selected_sites:
+            site_key = str(site_record["site_key"])
+            timestep = _timestep_from_site(site_key)
+            if timestep is None:
+                continue
+            indices = _indices_from_site(site_key, hidden_size, pca=False)
+            if not indices:
+                continue
+            for idx in indices:
+                mat[int(timestep), int(idx)] += float(site_record["weight"])
+        return mat
+
+    for site_key, mass in zip(stage["sites"], row["row_mass"]):
+        timestep = _timestep_from_site(str(site_key))
+        if timestep is None:
+            continue
+        indices = _indices_from_site(str(site_key), hidden_size, pca=False)
+        if not indices:
+            continue
+        share = float(mass) / float(len(indices))
+        for idx in indices:
+            mat[int(timestep), int(idx)] += share
+    return mat
+
+
+def _parse_resolution_subset(text: str) -> tuple[str, ...] | None:
+    if not str(text).strip():
+        return None
+    return tuple(str(int(chunk.strip())) for chunk in str(text).split(",") if chunk.strip())
+
+
+def _resolution_sweep_summary_path(run_dir: Path, hidden_size: int, seed: int) -> Path:
+    candidates = (
+        run_dir / f"h{hidden_size}" / f"seed_{seed}" / "resolution_separate_topk_seed_summary.json",
+        run_dir / f"seed_{seed}" / "resolution_separate_topk_seed_summary.json",
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(candidates[0])
+
+
+def _best_calibrated_resolution_row(
+    summary: dict[str, object],
+    row_key: str,
+    *,
+    resolutions: tuple[str, ...] | None,
+) -> dict[str, object]:
+    allowed = set(resolutions) if resolutions is not None else None
+    best_row = None
+    best_key = None
+    for resolution, stage in summary["resolution_results"].items():
+        if allowed is not None and str(resolution) not in allowed:
+            continue
+        for trial in stage["trials"]:
+            row = trial["test"]["per_row"][row_key]
+            calibration = row["calibration"]
+            key = (
+                float(calibration["combined"]),
+                float(calibration["sensitivity"]),
+                float(calibration["invariance"]),
+            )
+            if best_key is None or key > best_key:
+                best_key = key
+                best_row = row
+    if best_row is None:
+        raise RuntimeError(f"no calibrated row found for {row_key} with resolutions={resolutions}")
+    return best_row
+
+
+def _plot_canonical_matrix_from_resolution_sweep(
+    summary: dict[str, object],
+    row_key: str,
+    hidden_size: int,
+    *,
+    resolutions: tuple[str, ...] | None,
+) -> np.ndarray:
+    row = _best_calibrated_resolution_row(summary, row_key, resolutions=resolutions)
+    mat = np.zeros((4, hidden_size), dtype=float)
+    for site_record in row.get("selected_sites", []):
+        site_key = str(site_record["site_key"])
+        timestep = _timestep_from_site(site_key)
+        if timestep is None:
+            continue
+        indices = _indices_from_site(site_key, hidden_size, pca=False)
+        if not indices:
+            continue
+        for idx in indices:
+            mat[int(timestep), int(idx)] += float(site_record["weight"])
+    return mat
+
+
+def _canonical_resolution_sweep_matrices(
+    run_dir: Path,
+    seeds: Sequence[int],
+    hidden_size: int,
+    *,
+    resolutions: tuple[str, ...] | None,
+) -> list[np.ndarray]:
+    per_seed = []
+    for seed in seeds:
+        path = _resolution_sweep_summary_path(run_dir, hidden_size, int(seed))
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        per_seed.append(
+            [
+                _plot_canonical_matrix_from_resolution_sweep(
+                    summary,
+                    row_key,
+                    hidden_size,
+                    resolutions=resolutions,
+                )
+                for row_key in ROW_KEYS
+            ]
+        )
+    if len(per_seed) == 1:
+        return per_seed[0]
+    return [np.mean(np.stack([item[row_idx] for item in per_seed], axis=0), axis=0) for row_idx in range(len(ROW_KEYS))]
 
 
 def _best_das_trial(stage: dict[str, object], row_info: dict[str, object]) -> dict[str, object]:
@@ -258,6 +442,7 @@ def _matrices_for_summary(
     pca_rotations = _pca_rotations_for_summary(summary) if str(display_basis) == "pca" else None
     return {
         "stage_a": [_stage_a_matrix(summary, row_key, hidden_size) for row_key in ROW_KEYS],
+        "plot_canonical": [_plot_canonical_matrix(summary, row_key, hidden_size) for row_key in ROW_KEYS],
         "plot_pca": [_plot_pca_matrix(summary, row_key, hidden_size) for row_key in ROW_KEYS],
         "das_full_timestep": [
             _das_matrix(
@@ -295,9 +480,13 @@ def _matrices_for_summary(
     }
 
 
-def _average_matrices(items: Sequence[dict[str, list[np.ndarray]]]) -> dict[str, list[np.ndarray]]:
+def _average_matrices(
+    items: Sequence[dict[str, list[np.ndarray]]],
+    *,
+    methods: Sequence[MethodSpec],
+) -> dict[str, list[np.ndarray]]:
     out: dict[str, list[np.ndarray]] = {}
-    for method, _, _ in METHODS:
+    for method, _, _ in methods:
         out[method] = []
         for row_idx in range(len(ROW_KEYS)):
             stack = np.stack([item[method][row_idx] for item in items], axis=0)
@@ -308,6 +497,7 @@ def _average_matrices(items: Sequence[dict[str, list[np.ndarray]]]) -> dict[str,
 def _plot_grid(
     matrices: dict[str, list[np.ndarray]],
     *,
+    methods: Sequence[MethodSpec],
     hidden_size: int,
     das_display_basis: str,
     title: str,
@@ -317,7 +507,7 @@ def _plot_grid(
 ) -> None:
     fig, axes = plt.subplots(
         nrows=len(ROW_KEYS),
-        ncols=len(METHODS),
+        ncols=len(methods),
         figsize=(18.5 if hidden_size == 8 else 22.5, 7.2),
         sharey=True,
         constrained_layout=False,
@@ -326,14 +516,14 @@ def _plot_grid(
     plt.subplots_adjust(left=0.055, right=0.955, top=0.90, bottom=0.09, wspace=0.36, hspace=0.34)
 
     col_vmax = {}
-    for method, _, _ in METHODS:
+    for method, _, _ in methods:
         vmax = max(float(np.max(mat)) for mat in matrices[method])
         col_vmax[method] = vmax if vmax > 0 else 1.0
 
     ims = []
     xticks = list(range(hidden_size)) if hidden_size <= 8 else list(range(0, hidden_size, 2)) + [hidden_size - 1]
     xticks = sorted(set(xticks))
-    for col, (method, label, xlabel) in enumerate(METHODS):
+    for col, (method, label, xlabel) in enumerate(methods):
         if method.startswith("das") or method == "full_das":
             xlabel = "rotated index" if str(das_display_basis) == "das_rotated" else xlabel
         ims.append(None)
@@ -385,6 +575,7 @@ def _plot_grid(
 def _plot_square_grid(
     matrices: dict[str, list[np.ndarray]],
     *,
+    methods: Sequence[MethodSpec],
     hidden_size: int,
     das_display_basis: str,
     title: str,
@@ -397,7 +588,7 @@ def _plot_square_grid(
 ) -> None:
     mm = 1.0 / 25.4
     n_rows = len(ROW_KEYS)
-    n_cols = len(METHODS)
+    n_cols = len(methods)
     matrix_rows = 4
 
     cell_w = float(cell_mm) * mm
@@ -422,14 +613,14 @@ def _plot_square_grid(
         fig.suptitle(title, y=0.99, fontsize=13)
 
     col_vmax = {}
-    for method, _, _ in METHODS:
+    for method, _, _ in methods:
         vmax = max(float(np.max(mat)) for mat in matrices[method])
         col_vmax[method] = vmax if vmax > 0 else 1.0
 
     xticks = list(range(hidden_size)) if hidden_size <= 8 else list(range(0, hidden_size, 2)) + [hidden_size - 1]
     xticks = sorted(set(xticks))
     last_im = None
-    for col, (method, label, xlabel) in enumerate(METHODS):
+    for col, (method, label, xlabel) in enumerate(methods):
         if method.startswith("das") or method == "full_das":
             xlabel = "rotated index" if str(das_display_basis) == "das_rotated" else xlabel
         x0 = left + col * (group_w + col_gap)
@@ -503,21 +694,49 @@ def main() -> None:
             raise FileNotFoundError(path)
         summaries.append(json.loads(path.read_text(encoding="utf-8")))
 
+    methods = METHOD_SETS[str(args.method_set)]
     all_matrices = [
         _matrices_for_summary(summary, int(args.hidden_size), display_basis=str(args.das_display_basis))
         for summary in summaries
     ]
-    matrices = all_matrices[0] if len(all_matrices) == 1 else _average_matrices(all_matrices)
+    matrices = all_matrices[0] if len(all_matrices) == 1 else _average_matrices(all_matrices, methods=METHOD_LOOKUP)
+
+    stage_a_source_seed = str(args.stage_a_source_seed).strip()
+    if stage_a_source_seed:
+        stage_a_path = seed_root / f"seed_{int(stage_a_source_seed)}" / "progressive_seed_summary.json"
+        if not stage_a_path.exists():
+            raise FileNotFoundError(stage_a_path)
+        stage_a_summary = json.loads(stage_a_path.read_text(encoding="utf-8"))
+        stage_a_matrices = _matrices_for_summary(
+            stage_a_summary,
+            int(args.hidden_size),
+            display_basis=str(args.das_display_basis),
+        )
+        matrices["stage_a"] = stage_a_matrices["stage_a"]
+
+    plot_canonical_run_dir = str(args.plot_canonical_run_dir).strip()
+    if plot_canonical_run_dir:
+        matrices["plot_canonical"] = _canonical_resolution_sweep_matrices(
+            Path(plot_canonical_run_dir),
+            seeds,
+            int(args.hidden_size),
+            resolutions=_parse_resolution_subset(str(args.plot_canonical_resolutions)),
+        )
 
     out_dir = Path(args.out_dir) if str(args.out_dir).strip() else run_dir / "figures"
     suffix = f"seed{seeds[0]}" if len(seeds) == 1 else f"mean{len(seeds)}seeds"
+    if stage_a_source_seed:
+        suffix += f"_stageAseed{int(stage_a_source_seed)}"
     basis_suffix = {
         "pca": "das-pca-view",
         "canonical": "das-canonical-view",
         "das_rotated": "das-rotated-view",
     }[str(args.das_display_basis)]
     layout_suffix = "_square" if str(args.layout) == "square" else ""
+    method_suffix = "" if str(args.method_set) == "default" else f"_{args.method_set}"
     out_base = out_dir / f"progressive_heatmaps_h{args.hidden_size}_{suffix}_{basis_suffix}{layout_suffix}"
+    if method_suffix:
+        out_base = out_dir / f"progressive_heatmaps_h{args.hidden_size}_{suffix}_{basis_suffix}{layout_suffix}{method_suffix}"
     title = (
         f"GRU binary addition, h={args.hidden_size}, seed {seeds[0]}"
         if len(seeds) == 1
@@ -529,6 +748,7 @@ def main() -> None:
     if str(args.layout) == "square":
         _plot_square_grid(
             matrices,
+            methods=methods,
             hidden_size=int(args.hidden_size),
             das_display_basis=str(args.das_display_basis),
             title=title,
@@ -542,6 +762,7 @@ def main() -> None:
     else:
         _plot_grid(
             matrices,
+            methods=methods,
             hidden_size=int(args.hidden_size),
             das_display_basis=str(args.das_display_basis),
             title=title,
