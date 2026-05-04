@@ -17,6 +17,8 @@ from mcqa_delta_hierarchical_sweep import (
     _build_parser,
     _build_stage_a_command,
     _build_stage_b_or_c_command,
+    _build_stage_c_a_only_command,
+    _extract_a_only_rankings,
     _extract_native_rankings,
     _extract_stage_a_rankings,
     _extract_stage_b_best_configs,
@@ -28,12 +30,13 @@ from mcqa_delta_hierarchical_sweep import (
     _load_json,
     _normalize_args,
     _normalize_num_bands_values,
-    _select_stage_b_layers,
     _select_stage_c_configs,
     _site_catalog_tag,
     _stage_a_output_path,
     _stage_b_slug,
+    _select_stage_b_layers_for_spec,
     _stage_output_is_valid,
+    _stage_b_selection_specs,
     _write_json,
     _write_text,
 )
@@ -101,6 +104,10 @@ def _mark_task(*, sweep_root: Path, task: dict[str, object], state: str, extra: 
         "category": task.get("category"),
         "state": state,
         "stage_timestamp": task.get("stage_timestamp"),
+        "layer_selection_method": task.get("layer_selection_method", "custom"),
+        "transport_method": task.get("transport_method"),
+        "token_position_id": task.get("token_position_id"),
+        "layer": task.get("layer"),
         "updated_at": datetime.now().isoformat(),
         "expected_outputs": task.get("expected_outputs", []),
     }
@@ -223,6 +230,211 @@ def _stage_a_rankings_paths(*, sweep_root: Path, token_position_id: str) -> tupl
     )
 
 
+def _stage_a_hparam_grid_size(normalized: dict[str, object]) -> int:
+    epsilon_count = len(tuple(normalized.get("ot_epsilons", ()) or ()))
+    beta_count = len(tuple(normalized.get("uot_beta_neurals", ()) or ()))
+    methods = tuple(normalized.get("stage_a_methods", ()) or ())
+    if not methods:
+        methods = tuple(
+            method.strip()
+            for method in str(normalized.get("stage_a_method", "ot")).split(",")
+            if method.strip()
+        )
+    if not methods:
+        methods = ("ot",)
+    grid_size = 0
+    if "ot" in methods:
+        grid_size += max(1, epsilon_count)
+    if "uot" in methods:
+        grid_size += max(1, epsilon_count) * max(1, beta_count)
+    return max(1, grid_size)
+
+
+def _stage_a_runtime_accounting(
+    *,
+    normalized: dict[str, object],
+    stage_runtime_seconds: float | None,
+) -> dict[str, object]:
+    grid_size = _stage_a_hparam_grid_size(normalized)
+    selection = str(normalized.get("stage_a_hparam_selection", "rowwise"))
+    if selection == "rowwise":
+        policy = "rowwise_calibrated_grid_included"
+        paper_runtime_seconds = stage_runtime_seconds
+    elif grid_size == 1:
+        policy = "joint_single_plan"
+        paper_runtime_seconds = stage_runtime_seconds
+    else:
+        policy = "joint_external_sweep_not_counted"
+        paper_runtime_seconds = None
+    return {
+        "stage_a_method": str(normalized.get("stage_a_method", "ot")),
+        "stage_a_hparam_selection": selection,
+        "stage_a_hparam_grid_size": int(grid_size),
+        "stage_a_runtime_policy": policy,
+        "diagnostic_runtime_seconds": stage_runtime_seconds,
+        "paper_runtime_seconds": paper_runtime_seconds,
+    }
+
+
+def _stage_a_rerank_output_path(*, results_root: str | Path, stage_timestamp: str) -> Path:
+    return Path(results_root) / f"{stage_timestamp}_mcqa_layer_sweep" / "layer_sweep_manifest.json"
+
+
+def _layer_sweep_manifest_is_complete(path: Path, layer_indices: Iterable[int]) -> bool:
+    if not _stage_output_is_valid(path):
+        return False
+    try:
+        payload = _load_json(path)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        return False
+    required = {int(layer) for layer in layer_indices}
+    observed: set[int] = set()
+    for record in runs:
+        if not isinstance(record, dict):
+            continue
+        try:
+            layer = int(record.get("layer"))
+        except (TypeError, ValueError):
+            continue
+        output_path = record.get("output_path")
+        if output_path is None:
+            continue
+        if _stage_output_is_valid(Path(str(output_path))):
+            observed.add(layer)
+    return required.issubset(observed)
+
+
+def _stage_a_candidate_layers_by_var(
+    rankings: dict[str, list[dict[str, object]]],
+    *,
+    top_k: int,
+) -> dict[str, tuple[int, ...]]:
+    candidates: dict[str, tuple[int, ...]] = {}
+    for target_var in DEFAULT_TARGET_VARS:
+        layers: list[int] = []
+        for entry in rankings.get(target_var, [])[: max(1, int(top_k))]:
+            if entry.get("layer") is not None:
+                layers.append(int(entry["layer"]))
+        candidates[target_var] = tuple(dict.fromkeys(layers))
+    return candidates
+
+
+def _build_stage_a_rerank_command(
+    *,
+    args: argparse.Namespace,
+    normalized: dict[str, object],
+    stage_timestamp: str,
+    token_position_id: str,
+    layer_indices: tuple[int, ...],
+) -> tuple[str, ...]:
+    command = [
+        sys.executable,
+        "mcqa_run_cloud.py",
+        "--preset",
+        "full",
+        "--layer-sweep",
+        "--device",
+        str(args.device),
+        "--model-name",
+        str(args.model_name),
+        "--dataset-path",
+        str(args.dataset_path),
+        "--dataset-size",
+        str(int(args.dataset_size)),
+        "--split-seed",
+        str(int(args.split_seed)),
+        "--train-pool-size",
+        str(int(args.train_pool_size)),
+        "--calibration-pool-size",
+        str(int(args.calibration_pool_size)),
+        "--test-pool-size",
+        str(int(args.test_pool_size)),
+        "--batch-size",
+        str(int(args.batch_size)),
+        "--methods",
+        "bruteforce",
+        "--target-vars",
+        ",".join(str(target_var) for target_var in normalized["target_vars"]),
+        "--layer-indices",
+        ",".join(str(layer) for layer in layer_indices),
+        "--token-position-ids",
+        str(token_position_id),
+        "--resolutions",
+        "full",
+        "--ot-epsilons",
+        "1",
+        "--ot-lambdas",
+        ",".join(f"{float(value):g}" for value in normalized["ot_lambdas"]),
+        "--signature-modes",
+        str(args.signature_mode),
+        "--calibration-metric",
+        str(args.calibration_metric),
+        "--calibration-family-weights",
+        ",".join(f"{float(value):g}" for value in normalized["calibration_family_weights"]),
+        "--results-root",
+        str(args.results_root),
+        "--results-timestamp",
+        str(stage_timestamp),
+        "--signatures-dir",
+        str(args.signatures_dir),
+    ]
+    if args.dataset_config:
+        command.extend(["--dataset-config", str(args.dataset_config)])
+    if bool(args.prompt_hf_login):
+        command.append("--prompt-hf-login")
+    return tuple(command)
+
+
+def _merge_stage_a_rerank_rankings(
+    *,
+    proposal_rankings: dict[str, list[dict[str, object]]],
+    calibration_rankings: dict[str, list[dict[str, object]]],
+    candidates_by_var: dict[str, tuple[int, ...]],
+    top_k: int,
+) -> dict[str, list[dict[str, object]]]:
+    merged: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+    for target_var in DEFAULT_TARGET_VARS:
+        proposal_entries = proposal_rankings.get(target_var, [])
+        proposal_by_layer = {
+            int(entry["layer"]): (rank, entry)
+            for rank, entry in enumerate(proposal_entries, start=1)
+            if entry.get("layer") is not None
+        }
+        candidate_layers = {int(layer) for layer in candidates_by_var.get(target_var, ())}
+        rows: list[dict[str, object]] = []
+        for entry in calibration_rankings.get(target_var, []):
+            if entry.get("layer") is None:
+                continue
+            layer = int(entry["layer"])
+            if layer not in candidate_layers:
+                continue
+            proposal_rank, proposal = proposal_by_layer.get(layer, (None, {}))
+            row = dict(entry)
+            row["selection_basis"] = f"top{int(top_k)}_transport_candidates_full_layer_calibration"
+            row["proposal_rank"] = proposal_rank
+            row["proposal_layer_score"] = proposal.get("layer_score", proposal.get("target_mass", proposal.get("selection_score")))
+            row["proposal_method"] = proposal.get("method")
+            row["proposal_epsilon"] = proposal.get("epsilon")
+            row["proposal_uot_beta_neural"] = proposal.get("uot_beta_neural")
+            row["proposal_selected_mass"] = proposal.get("selected_mass")
+            rows.append(row)
+        rows.sort(
+            key=lambda row: (
+                float(row.get("selection_score", -1.0)),
+                float(row.get("exact_acc", -1.0)),
+                -float(row.get("proposal_rank") or 10**9),
+            ),
+            reverse=True,
+        )
+        merged[target_var] = rows
+    return merged
+
+
 def run_stage_a(args: argparse.Namespace) -> None:
     _require_hf_token(args)
     normalized = _normalize_args(args)
@@ -259,11 +471,81 @@ def run_stage_a(args: argparse.Namespace) -> None:
             print(f"[parallel-stage-a] using existing output {stage_output}")
             stage_runtime_seconds = None
 
-        rankings = _extract_stage_a_rankings(aggregate_path=stage_output)
+        rankings = _extract_stage_a_rankings(
+            aggregate_path=stage_output,
+            hparam_selection=str(normalized.get("stage_a_hparam_selection", "rowwise")),
+        )
+        rerank_runtime_seconds = None
+        rerank_top_k = int(normalized.get("stage_a_rerank_top_k", 0) or 0)
+        if rerank_top_k > 0:
+            proposal_rankings = rankings
+            proposal_json_path = ranking_json_path.with_name(
+                f"{ranking_json_path.stem}_transport_proposal{ranking_json_path.suffix}"
+            )
+            proposal_txt_path = ranking_txt_path.with_name(
+                f"{ranking_txt_path.stem}_transport_proposal{ranking_txt_path.suffix}"
+            )
+            _write_json(proposal_json_path, proposal_rankings)
+            _write_text(
+                proposal_txt_path,
+                _format_stage_a_summary(token_position_id=str(token_position_id), rankings=proposal_rankings),
+            )
+            candidates_by_var = _stage_a_candidate_layers_by_var(proposal_rankings, top_k=rerank_top_k)
+            rerank_layers = tuple(
+                sorted(
+                    {
+                        int(layer)
+                        for layers in candidates_by_var.values()
+                        for layer in layers
+                    }
+                )
+            )
+            if rerank_layers:
+                rerank_timestamp = (
+                    f"{str(normalized['results_timestamp'])}_stageA_{str(token_position_id)}"
+                    f"_top{int(rerank_top_k)}_full_layer_rerank"
+                )
+                rerank_output = _stage_a_rerank_output_path(
+                    results_root=args.results_root,
+                    stage_timestamp=rerank_timestamp,
+                )
+                if not _layer_sweep_manifest_is_complete(rerank_output, rerank_layers):
+                    rerank_command = _build_stage_a_rerank_command(
+                        args=args,
+                        normalized=normalized,
+                        stage_timestamp=rerank_timestamp,
+                        token_position_id=str(token_position_id),
+                        layer_indices=rerank_layers,
+                    )
+                    print(
+                        "[parallel-stage-a-rerank] running "
+                        f"top_k={rerank_top_k} layers={list(rerank_layers)} "
+                        f"command={' '.join(rerank_command)}"
+                    )
+                    rerank_start = perf_counter()
+                    subprocess.run(rerank_command, cwd=repo_root, check=True)
+                    rerank_runtime_seconds = float(perf_counter() - rerank_start)
+                else:
+                    print(f"[parallel-stage-a-rerank] using existing output {rerank_output}")
+                calibration_rankings = _extract_stage_a_rankings(aggregate_path=rerank_output)
+                rankings = _merge_stage_a_rerank_rankings(
+                    proposal_rankings=proposal_rankings,
+                    calibration_rankings=calibration_rankings,
+                    candidates_by_var=candidates_by_var,
+                    top_k=rerank_top_k,
+                )
+                if stage_runtime_seconds is not None and rerank_runtime_seconds is not None:
+                    stage_runtime_seconds = float(stage_runtime_seconds) + float(rerank_runtime_seconds)
+                elif rerank_runtime_seconds is not None:
+                    stage_runtime_seconds = float(rerank_runtime_seconds)
         _write_json(ranking_json_path, rankings)
         _write_text(
             ranking_txt_path,
             _format_stage_a_summary(token_position_id=str(token_position_id), rankings=rankings),
+        )
+        runtime_accounting = _stage_a_runtime_accounting(
+            normalized=normalized,
+            stage_runtime_seconds=stage_runtime_seconds,
         )
         stage_statuses[f"stage_a_{str(token_position_id)}"] = {
             "state": "completed",
@@ -271,7 +553,30 @@ def run_stage_a(args: argparse.Namespace) -> None:
             "expected_outputs": [str(stage_output), str(ranking_json_path), str(ranking_txt_path)],
             "completed_at": datetime.now().isoformat(),
             "runtime_seconds": stage_runtime_seconds,
+            "stage_a_rerank_top_k": int(rerank_top_k),
+            "stage_a_rerank_runtime_seconds": rerank_runtime_seconds,
+            **runtime_accounting,
         }
+
+    runtime_lines = [
+        "MCQA Stage A runtime summary",
+        f"results_timestamp: {normalized['results_timestamp']}",
+        f"stage_a_method: {normalized.get('stage_a_method')}",
+        f"stage_a_hparam_selection: {normalized.get('stage_a_hparam_selection')}",
+        f"stage_a_rerank_top_k: {normalized.get('stage_a_rerank_top_k', 0)}",
+        f"stage_a_hparam_grid_size: {_stage_a_hparam_grid_size(normalized)}",
+        "",
+    ]
+    for key, status in stage_statuses.items():
+        diagnostic = status.get("diagnostic_runtime_seconds")
+        paper = status.get("paper_runtime_seconds")
+        runtime_lines.append(
+            f"{key}: policy={status.get('stage_a_runtime_policy')} "
+            f"diagnostic_runtime_s={'n/a' if diagnostic is None else f'{float(diagnostic):.2f}'} "
+            f"paper_runtime_s={'n/a' if paper is None else f'{float(paper):.2f}'}"
+        )
+    _write_json(sweep_root / "stage_a_runtime_summary.json", stage_statuses)
+    _write_text(sweep_root / "stage_a_runtime_summary.txt", "\n".join(runtime_lines) + "\n")
 
     _write_json(
         sweep_root / "parallel_manifest.json",
@@ -279,6 +584,9 @@ def run_stage_a(args: argparse.Namespace) -> None:
             "kind": "mcqa_delta_hierarchical_parallel",
             "results_timestamp": str(normalized["results_timestamp"]),
             "results_root": str(Path(args.results_root)),
+            "stage_a_method": str(normalized.get("stage_a_method", "ot")),
+            "stage_a_hparam_selection": str(normalized.get("stage_a_hparam_selection", "rowwise")),
+            "stage_a_hparam_grid_size": _stage_a_hparam_grid_size(normalized),
             "stage_statuses": stage_statuses,
             "updated_at": datetime.now().isoformat(),
         },
@@ -305,102 +613,124 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
 
     native_tasks: list[dict[str, object]] = []
     pca_tasks: list[dict[str, object]] = []
+    selection_specs = _stage_b_selection_specs(args=args, normalized=normalized)
     for token_position_id, rankings in rankings_by_token.items():
-        selected_layers = _select_stage_b_layers(
-            rankings=rankings,
-            top_layers_per_var=int(args.stage_b_top_layers_per_var),
-            neighbor_radius=int(args.stage_b_neighbor_radius),
-            max_layers_per_var=int(args.stage_b_max_layers_per_var),
-        )
-        if not selected_layers:
-            continue
+        for selection_spec in selection_specs:
+            selected_layers = _select_stage_b_layers_for_spec(
+                rankings=rankings,
+                normalized=normalized,
+                selection_spec=selection_spec,
+            )
+            if not selected_layers:
+                continue
 
-        if str(token_position_id) == "last_token":
-            for layer in selected_layers:
-                for resolution in normalized["native_block_resolutions"]:
-                    stage_timestamp = (
-                        f"{str(normalized['results_timestamp'])}_stageB_native_{token_position_id}"
-                        f"_L{int(layer):02d}_res{int(resolution)}"
-                    )
-                    expected_outputs = _expected_native_payload_paths(
-                        args=args,
-                        normalized=normalized,
-                        stage_timestamp=stage_timestamp,
-                        layer=int(layer),
-                        resolutions=(int(resolution),),
-                    )
-                    task_normalized = dict(normalized)
-                    task_normalized["native_block_resolutions"] = (int(resolution),)
-                    native_tasks.append(
-                        {
-                            "task_id": f"native_{token_position_id}_L{int(layer):02d}_res{int(resolution)}",
-                            "category": "stage_b_native_ot",
-                            "token_position_id": str(token_position_id),
-                            "layer": int(layer),
-                            "resolution": int(resolution),
-                            "stage_timestamp": stage_timestamp,
-                            "command": list(
-                                _build_native_block_command(
-                                    args=args,
-                                    normalized=task_normalized,
-                                    stage_timestamp=stage_timestamp,
-                                    layers=(int(layer),),
-                                )
-                            ),
-                            "expected_outputs": expected_outputs,
-                            "payload_paths": expected_outputs[1:],
-                        }
-                    )
-
-        for basis_source_mode in normalized["pca_basis_source_modes"]:
-            for site_menu in normalized["pca_site_menus"]:
-                for num_bands in _normalize_num_bands_values(normalized["pca_num_bands_values"], str(site_menu)):
-                    base_slug = _stage_b_slug(
-                        token_position_id=str(token_position_id),
-                        basis_source_mode=str(basis_source_mode),
-                        site_menu=str(site_menu),
-                        num_bands=int(num_bands),
-                    )
+            for transport_method in normalized["stage_b_methods"]:
+                if str(token_position_id) == "last_token":
                     for layer in selected_layers:
-                        stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_{base_slug}_L{int(layer):02d}"
-                        payload_path = _expected_pca_payload_path(
-                            args=args,
-                            normalized=normalized,
-                            stage_timestamp=stage_timestamp,
-                            token_position_id=str(token_position_id),
-                            basis_source_mode=str(basis_source_mode),
-                            site_menu=str(site_menu),
-                            num_bands=int(num_bands),
-                            layer=int(layer),
-                        )
-                        manifest_path = Path(args.results_root) / f"{stage_timestamp}_mcqa_ot_pca_focus" / "layer_sweep_manifest.json"
-                        pca_tasks.append(
-                            {
-                                "task_id": f"pca_{base_slug}_L{int(layer):02d}",
-                                "category": "stage_b_pca_ot",
-                                "token_position_id": str(token_position_id),
-                                "basis_source_mode": str(basis_source_mode),
-                                "site_menu": str(site_menu),
-                                "num_bands": int(num_bands),
-                                "layer": int(layer),
-                                "stage_timestamp": stage_timestamp,
-                                "command": list(
-                                    _build_stage_b_or_c_command(
-                                        args=args,
-                                        normalized=normalized,
-                                        stage_timestamp=stage_timestamp,
-                                        token_position_id=str(token_position_id),
-                                        layers=(int(layer),),
-                                        basis_source_mode=str(basis_source_mode),
-                                        site_menu=str(site_menu),
-                                        num_bands=int(num_bands),
-                                        guided_das=False,
-                                    )
-                                ),
-                                "expected_outputs": [str(manifest_path), str(payload_path)],
-                                "payload_paths": [str(payload_path)],
-                            }
-                        )
+                        for resolution in normalized["native_block_resolutions"]:
+                            stage_timestamp = (
+                                f"{str(normalized['results_timestamp'])}_stageB_{selection_spec.name}_native_"
+                                f"{transport_method}_{token_position_id}_L{int(layer):02d}_res{int(resolution)}"
+                            )
+                            expected_outputs = _expected_native_payload_paths(
+                                args=args,
+                                normalized=normalized,
+                                stage_timestamp=stage_timestamp,
+                                layer=int(layer),
+                                resolutions=(int(resolution),),
+                            )
+                            task_normalized = dict(normalized)
+                            task_normalized["native_block_resolutions"] = (int(resolution),)
+                            native_tasks.append(
+                                {
+                                    "task_id": (
+                                        f"native_{selection_spec.name}_{transport_method}_{token_position_id}"
+                                        f"_L{int(layer):02d}_res{int(resolution)}"
+                                    ),
+                                    "category": f"stage_b_native_{selection_spec.name}_{transport_method}",
+                                    "layer_selection_method": selection_spec.name,
+                                    "layer_selection_top_layers_per_var": int(selection_spec.top_layers_per_var),
+                                    "layer_selection_neighbor_radius": int(selection_spec.neighbor_radius),
+                                    "layer_selection_max_layers_per_var": int(selection_spec.max_layers_per_var),
+                                    "selected_layers": [int(selected_layer) for selected_layer in selected_layers],
+                                    "transport_method": str(transport_method),
+                                    "token_position_id": str(token_position_id),
+                                    "layer": int(layer),
+                                    "resolution": int(resolution),
+                                    "stage_timestamp": stage_timestamp,
+                                    "command": list(
+                                        _build_native_block_command(
+                                            args=args,
+                                            normalized=task_normalized,
+                                            stage_timestamp=stage_timestamp,
+                                            layers=(int(layer),),
+                                            transport_method=str(transport_method),
+                                        )
+                                    ),
+                                    "expected_outputs": expected_outputs,
+                                    "payload_paths": expected_outputs[1:],
+                                }
+                            )
+
+                for basis_source_mode in normalized["pca_basis_source_modes"]:
+                    for site_menu in normalized["pca_site_menus"]:
+                        for num_bands in _normalize_num_bands_values(normalized["pca_num_bands_values"], str(site_menu)):
+                            base_slug = _stage_b_slug(
+                                token_position_id=str(token_position_id),
+                                basis_source_mode=str(basis_source_mode),
+                                site_menu=str(site_menu),
+                                num_bands=int(num_bands),
+                            )
+                            for layer in selected_layers:
+                                stage_timestamp = (
+                                    f"{str(normalized['results_timestamp'])}_stageB_{selection_spec.name}_"
+                                    f"{transport_method}_{base_slug}_L{int(layer):02d}"
+                                )
+                                payload_path = _expected_pca_payload_path(
+                                    args=args,
+                                    normalized=normalized,
+                                    stage_timestamp=stage_timestamp,
+                                    token_position_id=str(token_position_id),
+                                    basis_source_mode=str(basis_source_mode),
+                                    site_menu=str(site_menu),
+                                    num_bands=int(num_bands),
+                                    layer=int(layer),
+                                )
+                                manifest_path = Path(args.results_root) / f"{stage_timestamp}_mcqa_ot_pca_focus" / "layer_sweep_manifest.json"
+                                pca_tasks.append(
+                                    {
+                                        "task_id": f"pca_{selection_spec.name}_{transport_method}_{base_slug}_L{int(layer):02d}",
+                                        "category": f"stage_b_pca_{selection_spec.name}_{transport_method}",
+                                        "layer_selection_method": selection_spec.name,
+                                        "layer_selection_top_layers_per_var": int(selection_spec.top_layers_per_var),
+                                        "layer_selection_neighbor_radius": int(selection_spec.neighbor_radius),
+                                        "layer_selection_max_layers_per_var": int(selection_spec.max_layers_per_var),
+                                        "selected_layers": [int(selected_layer) for selected_layer in selected_layers],
+                                        "transport_method": str(transport_method),
+                                        "token_position_id": str(token_position_id),
+                                        "basis_source_mode": str(basis_source_mode),
+                                        "site_menu": str(site_menu),
+                                        "num_bands": int(num_bands),
+                                        "layer": int(layer),
+                                        "stage_timestamp": stage_timestamp,
+                                        "command": list(
+                                            _build_stage_b_or_c_command(
+                                                args=args,
+                                                normalized=normalized,
+                                                stage_timestamp=stage_timestamp,
+                                                token_position_id=str(token_position_id),
+                                                layers=(int(layer),),
+                                                basis_source_mode=str(basis_source_mode),
+                                                site_menu=str(site_menu),
+                                                num_bands=int(num_bands),
+                                                guided_das=False,
+                                                transport_method=str(transport_method),
+                                            )
+                                        ),
+                                        "expected_outputs": [str(manifest_path), str(payload_path)],
+                                        "payload_paths": [str(payload_path)],
+                                    }
+                                )
 
     _write_task_manifest(sweep_root / "stage_b_native_tasks.json", kind="stage_b_native_tasks", tasks=native_tasks)
     _write_task_manifest(sweep_root / "stage_b_pca_tasks.json", kind="stage_b_pca_tasks", tasks=pca_tasks)
@@ -409,6 +739,9 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
         "\n".join(
             [
                 "MCQA hierarchical parallel Stage B task plan",
+                f"stage_b_methods: {','.join(str(method) for method in normalized['stage_b_methods'])}",
+                "stage_b_selection_methods: "
+                + ",".join(f"{spec.name}(top={spec.top_layers_per_var},r={spec.neighbor_radius},max={spec.max_layers_per_var})" for spec in selection_specs),
                 f"native_tasks: {len(native_tasks)}",
                 f"pca_tasks: {len(pca_tasks)}",
                 "",
@@ -436,6 +769,30 @@ def _valid_payload_paths_from_tasks(tasks: Iterable[dict[str, object]], *, stric
     return payload_paths
 
 
+def _task_metadata_by_payload_path(tasks: Iterable[dict[str, object]]) -> dict[str, dict[str, object]]:
+    metadata_by_path: dict[str, dict[str, object]] = {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        metadata = {
+            "task_id": task.get("task_id"),
+            "category": task.get("category"),
+            "stage_timestamp": task.get("stage_timestamp"),
+            "layer_selection_method": task.get("layer_selection_method", "custom"),
+            "layer_selection_top_layers_per_var": task.get("layer_selection_top_layers_per_var"),
+            "layer_selection_neighbor_radius": task.get("layer_selection_neighbor_radius"),
+            "layer_selection_max_layers_per_var": task.get("layer_selection_max_layers_per_var"),
+        }
+        for payload_path in task.get("payload_paths", []):
+            path = Path(str(payload_path))
+            metadata_by_path[str(path)] = dict(metadata)
+            try:
+                metadata_by_path[str(path.resolve())] = dict(metadata)
+            except OSError:
+                pass
+    return metadata_by_path
+
+
 def aggregate_stage_b(args: argparse.Namespace, *, strict: bool = True, require_native: bool = True) -> None:
     normalized = _normalize_args(args)
     sweep_root = _sweep_root(args, normalized)
@@ -443,15 +800,20 @@ def aggregate_stage_b(args: argparse.Namespace, *, strict: bool = True, require_
     pca_manifest_path = sweep_root / "stage_b_pca_tasks.json"
 
     native_payload_paths: list[Path] = []
+    native_metadata_by_path: dict[str, dict[str, object]] = {}
     if _stage_output_is_valid(native_manifest_path) and require_native:
         native_manifest = _load_task_manifest(native_manifest_path)
         native_payload_paths = _valid_payload_paths_from_tasks(native_manifest["tasks"], strict=strict)
+        native_metadata_by_path = _task_metadata_by_payload_path(native_manifest["tasks"])
     if native_payload_paths:
-        native_ot_rankings, native_guided_rankings, a_only_rankings = _extract_native_rankings(payload_paths=native_payload_paths)
+        native_ot_rankings, native_guided_rankings, a_only_rankings = _extract_native_rankings(
+            payload_paths=native_payload_paths,
+            metadata_by_payload_path=native_metadata_by_path,
+        )
         _write_json(sweep_root / "stage_b_native_rankings.json", native_ot_rankings)
         _write_text(
             sweep_root / "stage_b_native_rankings.txt",
-            _format_native_summary(title="MCQA Hierarchical Stage B Native OT Ranking", rankings=native_ot_rankings),
+            _format_native_summary(title="MCQA Hierarchical Stage B Native Transport Ranking", rankings=native_ot_rankings),
         )
         _write_json(sweep_root / "stage_c_native_guided_rankings.json", native_guided_rankings)
         _write_text(
@@ -471,16 +833,21 @@ def aggregate_stage_b(args: argparse.Namespace, *, strict: bool = True, require_
     pca_manifest = _load_task_manifest(pca_manifest_path)
     pca_payload_paths = _valid_payload_paths_from_tasks(pca_manifest["tasks"], strict=strict)
     if pca_payload_paths:
-        stage_b_rankings = _extract_stage_b_best_configs(payload_paths=pca_payload_paths)
+        stage_b_rankings = _extract_stage_b_best_configs(
+            payload_paths=pca_payload_paths,
+            metadata_by_payload_path=_task_metadata_by_payload_path(pca_manifest["tasks"]),
+        )
         _write_json(sweep_root / "stage_b_pca_rankings.json", stage_b_rankings)
         _write_text(sweep_root / "stage_b_pca_rankings.txt", _format_stage_b_summary(rankings=stage_b_rankings))
     print(f"[parallel-aggregate-stage-b] aggregated {len(native_payload_paths)} native payloads and {len(pca_payload_paths)} PCA payloads")
 
 
-def _pca_task_lookup(tasks: Iterable[dict[str, object]]) -> dict[tuple[str, str, str, int, int], dict[str, object]]:
-    lookup: dict[tuple[str, str, str, int, int], dict[str, object]] = {}
+def _pca_task_lookup(tasks: Iterable[dict[str, object]]) -> dict[tuple[str, str, str, str, str, int, int], dict[str, object]]:
+    lookup: dict[tuple[str, str, str, str, str, int, int], dict[str, object]] = {}
     for task in tasks:
         key = (
+            str(task.get("layer_selection_method", "custom")),
+            str(task.get("transport_method", "ot")),
             str(task["token_position_id"]),
             str(task["basis_source_mode"]),
             str(task["site_menu"]),
@@ -494,6 +861,7 @@ def _pca_task_lookup(tasks: Iterable[dict[str, object]]) -> dict[tuple[str, str,
 def plan_stage_c_tasks(args: argparse.Namespace) -> None:
     normalized = _normalize_args(args)
     sweep_root = _sweep_root(args, normalized)
+    rankings_by_token = _load_stage_a_rankings_by_token(args=args, normalized=normalized, sweep_root=sweep_root)
     stage_b_rankings = _read_rankings(sweep_root / "stage_b_pca_rankings.json")
     selected_groups = _select_stage_c_configs(
         rankings=stage_b_rankings,
@@ -502,10 +870,60 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
     pca_manifest = _load_task_manifest(sweep_root / "stage_b_pca_tasks.json")
     pca_lookup = _pca_task_lookup(pca_manifest["tasks"])
     stage_c_tasks: list[dict[str, object]] = []
+    a_only_tasks: list[dict[str, object]] = []
+    selection_specs = _stage_b_selection_specs(args=args, normalized=normalized)
 
-    for (token_position_id, basis_source_mode, site_menu, num_bands), layers in selected_groups.items():
+    for token_position_id, rankings in rankings_by_token.items():
+        for selection_spec in selection_specs:
+            selected_layers = _select_stage_b_layers_for_spec(
+                rankings=rankings,
+                normalized=normalized,
+                selection_spec=selection_spec,
+            )
+            for layer in selected_layers:
+                stage_timestamp = (
+                    f"{str(normalized['results_timestamp'])}_stageC_{selection_spec.name}_a_only_"
+                    f"{token_position_id}_L{int(layer):02d}"
+                )
+                output_path = _stage_a_output_path(results_root=args.results_root, stage_timestamp=stage_timestamp)
+                a_only_tasks.append(
+                    {
+                        "task_id": f"stage_c_a_only_{selection_spec.name}_{token_position_id}_L{int(layer):02d}",
+                        "category": f"stage_c_a_only_das_{selection_spec.name}",
+                        "layer_selection_method": selection_spec.name,
+                        "layer_selection_top_layers_per_var": int(selection_spec.top_layers_per_var),
+                        "layer_selection_neighbor_radius": int(selection_spec.neighbor_radius),
+                        "layer_selection_max_layers_per_var": int(selection_spec.max_layers_per_var),
+                        "selected_layers": [int(selected_layer) for selected_layer in selected_layers],
+                        "transport_method": "das",
+                        "token_position_id": str(token_position_id),
+                        "layer": int(layer),
+                        "stage_timestamp": stage_timestamp,
+                        "command": list(
+                            _build_stage_c_a_only_command(
+                                args=args,
+                                normalized=normalized,
+                                stage_timestamp=stage_timestamp,
+                                token_position_id=str(token_position_id),
+                                layers=(int(layer),),
+                            )
+                        ),
+                        "expected_outputs": [str(output_path)],
+                        "payload_paths": [str(output_path)],
+                    }
+                )
+
+    for (layer_selection_method, transport_method, token_position_id, basis_source_mode, site_menu, num_bands), layers in selected_groups.items():
         for layer in layers:
-            key = (str(token_position_id), str(basis_source_mode), str(site_menu), int(num_bands), int(layer))
+            key = (
+                str(layer_selection_method),
+                str(transport_method),
+                str(token_position_id),
+                str(basis_source_mode),
+                str(site_menu),
+                int(num_bands),
+                int(layer),
+            )
             stage_b_task = pca_lookup.get(key)
             if stage_b_task is None:
                 raise RuntimeError(f"Could not find Stage B PCA task for Stage C key={key}")
@@ -524,6 +942,12 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
                 {
                     "task_id": f"stage_c_{stage_b_task['task_id']}",
                     "category": "stage_c_guided_das",
+                    "layer_selection_method": str(layer_selection_method),
+                    "layer_selection_top_layers_per_var": stage_b_task.get("layer_selection_top_layers_per_var"),
+                    "layer_selection_neighbor_radius": stage_b_task.get("layer_selection_neighbor_radius"),
+                    "layer_selection_max_layers_per_var": stage_b_task.get("layer_selection_max_layers_per_var"),
+                    "selected_layers": stage_b_task.get("selected_layers", []),
+                    "transport_method": str(transport_method),
                     "token_position_id": str(token_position_id),
                     "basis_source_mode": str(basis_source_mode),
                     "site_menu": str(site_menu),
@@ -541,6 +965,7 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
                             site_menu=str(site_menu),
                             num_bands=int(num_bands),
                             guided_das=True,
+                            transport_method=str(transport_method),
                         )
                     ),
                     "expected_outputs": expected_outputs,
@@ -548,34 +973,60 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
                 }
             )
     _write_task_manifest(sweep_root / "stage_c_pca_tasks.json", kind="stage_c_pca_tasks", tasks=stage_c_tasks)
+    _write_task_manifest(sweep_root / "stage_c_a_only_tasks.json", kind="stage_c_a_only_tasks", tasks=a_only_tasks)
     _write_text(
         sweep_root / "stage_c_task_plan.txt",
         "\n".join(
             [
                 "MCQA hierarchical parallel Stage C task plan",
-                f"stage_c_tasks: {len(stage_c_tasks)}",
+                "stage_b_selection_methods: "
+                + ",".join(f"{spec.name}(top={spec.top_layers_per_var},r={spec.neighbor_radius},max={spec.max_layers_per_var})" for spec in selection_specs),
+                f"stage_c_pca_tasks: {len(stage_c_tasks)}",
+                f"stage_c_a_only_tasks: {len(a_only_tasks)}",
+                "",
+                *[f"{task['task_id']} -> {task['stage_timestamp']}" for task in a_only_tasks],
                 "",
                 *[f"{task['task_id']} -> {task['stage_timestamp']}" for task in stage_c_tasks],
             ]
         ),
     )
-    print(f"[parallel-plan-stage-c] wrote {len(stage_c_tasks)} Stage C tasks to {sweep_root}")
+    print(f"[parallel-plan-stage-c] wrote {len(stage_c_tasks)} PCA Stage C tasks and {len(a_only_tasks)} A-only tasks to {sweep_root}")
 
 
 def aggregate_stage_c(args: argparse.Namespace, *, strict: bool = True) -> None:
     normalized = _normalize_args(args)
     sweep_root = _sweep_root(args, normalized)
     task_manifest_path = sweep_root / "stage_c_pca_tasks.json"
+    a_only_manifest_path = sweep_root / "stage_c_a_only_tasks.json"
     if not _stage_output_is_valid(task_manifest_path):
         if strict:
             raise FileNotFoundError(f"Missing Stage C task manifest: {task_manifest_path}")
         return
     task_manifest = _load_task_manifest(task_manifest_path)
     stage_c_payload_paths = _valid_payload_paths_from_tasks(task_manifest["tasks"], strict=strict)
-    stage_c_rankings = _extract_stage_c_rankings(payload_paths=stage_c_payload_paths)
+    stage_c_rankings = _extract_stage_c_rankings(
+        payload_paths=stage_c_payload_paths,
+        metadata_by_payload_path=_task_metadata_by_payload_path(task_manifest["tasks"]),
+    )
     _write_json(sweep_root / "stage_c_guided_rankings.json", stage_c_rankings)
     _write_text(sweep_root / "stage_c_guided_rankings.txt", _format_stage_c_summary(rankings=stage_c_rankings))
-    print(f"[parallel-aggregate-stage-c] aggregated {len(stage_c_payload_paths)} Stage C payloads")
+    a_only_payload_paths: list[Path] = []
+    if _stage_output_is_valid(a_only_manifest_path):
+        a_only_manifest = _load_task_manifest(a_only_manifest_path)
+        a_only_payload_paths = _valid_payload_paths_from_tasks(a_only_manifest["tasks"], strict=strict)
+        a_only_rankings = _extract_a_only_rankings(
+            payload_paths=a_only_payload_paths,
+            metadata_by_payload_path=_task_metadata_by_payload_path(a_only_manifest["tasks"]),
+        )
+        _write_json(sweep_root / "stage_c_a_only_rankings.json", a_only_rankings)
+        _write_text(
+            sweep_root / "stage_c_a_only_rankings.txt",
+            _format_native_summary(title="MCQA Hierarchical Stage C A-only DAS Ranking", rankings=a_only_rankings),
+        )
+    print(
+        f"[parallel-aggregate-stage-c] aggregated {len(stage_c_payload_paths)} PCA Stage C payloads "
+        f"and {len(a_only_payload_paths)} A-only payloads"
+    )
 
 
 def aggregate_final(args: argparse.Namespace, *, strict: bool = True) -> None:

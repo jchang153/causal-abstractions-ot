@@ -22,11 +22,18 @@ if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
 fi
 source "${VENV_PATH}/bin/activate"
 
-export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN before submitting the job.}"
-export HF_HOME="${SCRATCH:-/tmp/${USER}}/hf"
-export HF_HUB_CACHE="${HF_HOME}/hub"
-export HF_DATASETS_CACHE="${HF_HOME}/datasets"
-export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  if [[ -r "${HOME}/.secrets/hf_token" ]]; then
+    export HF_TOKEN="$(< "${HOME}/.secrets/hf_token")"
+  else
+    echo "[delta-mcqa-hpar-stage-a] HF_TOKEN is unset and ${HOME}/.secrets/hf_token is not readable"
+    exit 1
+  fi
+fi
+export HF_HOME="${HF_HOME:-${SCRATCH:-/tmp/${USER}}/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
@@ -35,7 +42,9 @@ export RESULTS_TIMESTAMP="${RESULTS_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 export STAGE_A_TOKEN_POSITION_IDS="${STAGE_A_TOKEN_POSITION_IDS:-last_token}"
 export STAGE_A_LAYER_INDICES="${STAGE_A_LAYER_INDICES:-}"
 export TARGET_VARS="${TARGET_VARS:-answer_pointer,answer_token}"
-export STAGE_A_METHOD="${STAGE_A_METHOD:-ot}"
+export STAGE_A_METHOD="${STAGE_A_METHOD:-uot}"
+export STAGE_A_HPARAM_SELECTION="${STAGE_A_HPARAM_SELECTION:-rowwise}"
+export STAGE_A_RERANK_TOP_K="${STAGE_A_RERANK_TOP_K:-0}"
 export SIGNATURE_MODE="${SIGNATURE_MODE:-family_label_delta_norm}"
 export OT_EPSILONS="${OT_EPSILONS:-0.5,1,2,4}"
 export UOT_BETA_NEURALS="${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
@@ -48,7 +57,8 @@ export SPLIT_SEED="${SPLIT_SEED:-0}"
 mkdir -p "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}"
 
 echo "[delta-mcqa-hpar-stage-a] host=$(hostname) token_positions=${STAGE_A_TOKEN_POSITION_IDS} timestamp=${RESULTS_TIMESTAMP} split_seed=${SPLIT_SEED}"
-echo "[delta-mcqa-hpar-stage-a] stage_a_method=${STAGE_A_METHOD} uot_beta_neurals=${UOT_BETA_NEURALS}"
+echo "[delta-mcqa-hpar-stage-a] stage_a_method=${STAGE_A_METHOD} stage_a_hparam_selection=${STAGE_A_HPARAM_SELECTION} stage_a_rerank_top_k=${STAGE_A_RERANK_TOP_K} uot_beta_neurals=${UOT_BETA_NEURALS}"
+echo "[delta-mcqa-hpar-stage-a] hf_home=${HF_HOME}"
 nvidia-smi
 
 ARGS=(
@@ -60,6 +70,8 @@ ARGS=(
   --stage-a-token-position-ids "${STAGE_A_TOKEN_POSITION_IDS}"
   --target-vars "${TARGET_VARS}"
   --stage-a-method "${STAGE_A_METHOD}"
+  --stage-a-hparam-selection "${STAGE_A_HPARAM_SELECTION}"
+  --stage-a-rerank-top-k "${STAGE_A_RERANK_TOP_K}"
   --signature-mode "${SIGNATURE_MODE}"
   --ot-epsilons "${OT_EPSILONS}"
   --uot-beta-neurals "${UOT_BETA_NEURALS}"
