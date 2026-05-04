@@ -191,8 +191,11 @@ def _compare_payload_matches_target_vars(
     )
 
 
-def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, dict[str, object]]:
-    best_by_var: dict[str, dict[str, object]] = {}
+def _best_ot_method_payloads(
+    ot_compare_payloads: list[dict[str, object]],
+) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
+    best_records_by_var: dict[str, dict[str, object]] = {}
+    best_method_payload_by_var: dict[str, dict[str, object]] = {}
     for compare_payload in ot_compare_payloads:
         epsilon = float(compare_payload.get("ot_epsilon", 0.0))
         for payload in compare_payload.get("method_payloads", {}).get("ot", []):
@@ -205,7 +208,7 @@ def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, 
                 "epsilon": float(epsilon),
                 "selected_hyperparameters": dict(payload.get("selected_hyperparameters", {})),
             }
-            previous = best_by_var.get(target_var)
+            previous = best_records_by_var.get(target_var)
             if previous is None or (
                 float(candidate["selection_score"]),
                 float(candidate["exact_acc"]),
@@ -213,8 +216,9 @@ def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, 
                 float(previous["selection_score"]),
                 float(previous["exact_acc"]),
             ):
-                best_by_var[target_var] = candidate
-    return best_by_var
+                best_records_by_var[target_var] = candidate
+                best_method_payload_by_var[target_var] = payload
+    return best_records_by_var, best_method_payload_by_var
 
 
 def _format_summary(
@@ -244,6 +248,7 @@ def _format_summary(
             f"eps={float(best.get('epsilon', 0.0)):g} "
             f"site={best.get('site_label')}"
         )
+        lines.append("support_source=selected_best_ot_row_only")
         support_summary = support_by_var.get(str(target_var), {})
         if support_summary:
             lines.append(f"support masks={[candidate.get('name') for candidate in support_summary.get('mask_candidates', [])]}")
@@ -455,14 +460,22 @@ def main() -> None:
             ot_localization_seconds = float(perf_counter() - ot_localization_start)
 
             support_start = perf_counter()
-            support_by_var = extract_ordered_site_support(
-                ot_run_payloads=ot_compare_payloads,
-                sites=sites,
-                score_slack=float(args.support_score_slack),
-            )
+            best_ot_by_var, best_method_payload_by_var = _best_ot_method_payloads(ot_compare_payloads)
+            support_by_var: dict[str, dict[str, object]] = {}
+            for target_var in selected_target_vars:
+                best_method_payload = best_method_payload_by_var.get(str(target_var))
+                if not isinstance(best_method_payload, dict):
+                    continue
+                extracted = extract_ordered_site_support(
+                    ot_run_payloads=[{"method_payloads": {"ot": [best_method_payload]}}],
+                    sites=sites,
+                    score_slack=0.0,
+                )
+                support_summary = extracted.get(str(target_var))
+                if isinstance(support_summary, dict):
+                    support_by_var[str(target_var)] = support_summary
             support_extract_seconds = float(perf_counter() - support_start)
             width_total_seconds = float(perf_counter() - width_start)
-            best_ot_by_var = _best_ot_records(ot_compare_payloads)
 
             support_path = layer_dir / (
                 f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
@@ -505,6 +518,14 @@ def main() -> None:
                 "site_labels": [site.label for site in sites],
                 "support_path": str(support_path),
                 "support_by_var": support_by_var,
+                "support_source_by_var": {
+                    str(target_var): {
+                        "mode": "selected_best_ot_row_only",
+                        "epsilon": float(best_ot_by_var.get(str(target_var), {}).get("epsilon", 0.0)),
+                    }
+                    for target_var in selected_target_vars
+                    if str(target_var) in best_ot_by_var
+                },
                 "method_by_var": best_ot_by_var,
                 "ot_output_paths": [
                     str(

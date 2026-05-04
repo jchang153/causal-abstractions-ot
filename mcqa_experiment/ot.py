@@ -1086,23 +1086,12 @@ def run_alignment_pipeline(
     selected_position_mass = _position_mass_from_transport(selected_transport, sites)
     selected_raw_position_mass = _position_mass_from_transport(selected_raw_transport, sites)
     selected_raw_captured_mass = float(selected_raw_transport.sum())
-    selected_calibration_start = perf_counter()
-    selected_calibration_result, selected_calibration_ranking = _evaluate_soft_intervention(
-        model=model,
-        bank=calibration_bank,
-        sites=sites,
-        selected_transport=selected_transport,
-        top_k=top_k,
-        strength=strength,
-        batch_size=config.batch_size,
-        device=device,
-        tokenizer=tokenizer,
-        source_target_vars=target_source_target_vars,
-        include_details=True,
-        pca_bases_by_id=pca_bases_by_id,
-    )
-    _synchronize_if_cuda(device)
-    selected_calibration_eval_seconds = float(perf_counter() - selected_calibration_start)
+    selected_calibration_result = dict(selected["result"])
+    selected_calibration_ranking = [
+        dict(entry) if isinstance(entry, dict) else entry
+        for entry in selected.get("ranking", [])
+    ]
+    selected_calibration_eval_seconds = 0.0
     holdout_start = perf_counter()
     holdout_result, holdout_ranking = _evaluate_soft_intervention(
         model=model,
