@@ -353,11 +353,17 @@ def _evaluate_stage_a_config(
             )
             result = direct_eval_payload.get("results", [{}])[0]
             calibration_result = direct_eval_payload.get("selected_calibration_result", result)
+            calibration_score = float(
+                direct_eval_payload.get(
+                    "calibration_score",
+                    calibration_result.get("selection_score", calibration_result.get("exact_acc", 0.0)),
+                )
+            )
             record = {
                 "method": str(payload.get("method", method_name)),
                 "variable": str(target_var),
                 "exact_acc": float(result.get("exact_acc", 0.0)),
-                "selection_score": float(calibration_result.get("exact_acc", result.get("selection_score", 0.0))),
+                "selection_score": float(calibration_score),
                 "site_label": str(result.get("site_label", candidate_sites[0].label)),
                 "layer": int(result.get("layer", candidate_sites[0].layer)),
                 "epsilon": float(epsilon),
@@ -407,7 +413,47 @@ def _evaluate_stage_a_config(
     }
 
 
-def _select_layer_method_by_var(
+def _format_stage_a_config_line(
+    *,
+    candidate_config: dict[str, object],
+    runtime_with_signatures_seconds: float,
+) -> str:
+    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
+    per_var_records = candidate_config.get("per_var_records", {})
+    chosen_layers = {
+        str(target_var): int(record.get("layer", -1))
+        for target_var in target_vars
+        for record in [per_var_records.get(str(target_var))]
+        if isinstance(record, dict)
+    }
+    calibration_scores = {
+        str(target_var): float(record.get("selection_score", 0.0))
+        for target_var in target_vars
+        for record in [per_var_records.get(str(target_var))]
+        if isinstance(record, dict)
+    }
+    exact_scores = {
+        str(target_var): float(record.get("exact_acc", 0.0))
+        for target_var in target_vars
+        for record in [per_var_records.get(str(target_var))]
+        if isinstance(record, dict)
+    }
+    return (
+        f"[stageA] coupling_result eps={float(candidate_config.get('epsilon', 0.0)):g} "
+        + (
+            f"beta_neural={float(candidate_config.get('uot_beta_neural')):g} "
+            if candidate_config.get("uot_beta_neural") is not None else ""
+        )
+        + f"layers={chosen_layers} "
+        + f"cal={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in calibration_scores.items())}}} "
+        + f"test={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in exact_scores.items())}}} "
+        + f"avg_cal={float(candidate_config.get('mean_calibration_score', 0.0)):.4f} "
+        + f"avg_test={float(candidate_config.get('mean_exact_acc', 0.0)):.4f} "
+        + f"runtime_with_signatures={float(runtime_with_signatures_seconds):.2f}s"
+    )
+
+
+def _select_joint_layer_config(
     *,
     model,
     tokenizer,
@@ -418,9 +464,9 @@ def _select_layer_method_by_var(
     batch_size: int,
     signature_mode: str,
     calibration_family_weights: tuple[float, ...],
-) -> dict[str, dict[str, object]]:
+    signature_prepare_runtime_seconds: float,
+) -> dict[str, object]:
     best_config: dict[str, object] | None = None
-    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
     for compare_payload in ot_compare_payloads:
         candidate_config = _evaluate_stage_a_config(
             model=model,
@@ -433,28 +479,16 @@ def _select_layer_method_by_var(
             signature_mode=signature_mode,
             calibration_family_weights=calibration_family_weights,
         )
-        epsilon = float(candidate_config.get("epsilon", 0.0))
-        beta_neural = candidate_config.get("uot_beta_neural")
-        print(
-            f"[stageA] config_result eps={epsilon:g} "
-            + (
-                f"beta_neural={float(beta_neural):g} "
-                if beta_neural is not None else ""
-            )
-            + f"mean_cal={float(candidate_config.get('mean_calibration_score', 0.0)):.4f} "
-            + f"mean_test={float(candidate_config.get('mean_exact_acc', 0.0)):.4f}"
+        candidate_config["signature_prepare_runtime_seconds"] = float(signature_prepare_runtime_seconds)
+        candidate_config["runtime_with_signatures_seconds"] = float(
+            signature_prepare_runtime_seconds + float(compare_payload.get("runtime_seconds", 0.0))
         )
-        for target_var in target_vars:
-            record = candidate_config.get("per_var_records", {}).get(str(target_var))
-            if not isinstance(record, dict):
-                continue
-            print(
-                f"  [{str(target_var)}] "
-                f"chosen_layer={int(record.get('layer', -1))} "
-                f"cal={float(record.get('selection_score', 0.0)):.4f} "
-                f"test={float(record.get('exact_acc', 0.0)):.4f} "
-                f"top_layers={list(int(layer) for layer in record.get('coupling_top_layers', []))}"
+        print(
+            _format_stage_a_config_line(
+                candidate_config=candidate_config,
+                runtime_with_signatures_seconds=float(candidate_config["runtime_with_signatures_seconds"]),
             )
+        )
         if best_config is None or (
             float(candidate_config["mean_calibration_score"]),
             float(candidate_config["mean_exact_acc"]),
@@ -465,11 +499,7 @@ def _select_layer_method_by_var(
             best_config = candidate_config
     if best_config is None:
         return {}
-    return {
-        str(target_var): dict(record)
-        for target_var, record in best_config.get("per_var_records", {}).items()
-        if isinstance(record, dict)
-    }
+    return dict(best_config)
 
 
 def _rank_layers_from_target_row(
@@ -507,7 +537,7 @@ def _format_summary(
     token_position_id: str,
     layers: tuple[int, ...],
     support_by_var: dict[str, dict[str, object]],
-    method_by_var: dict[str, dict[str, object]],
+    selected_config: dict[str, object],
 ) -> str:
     lines = [
         "MCQA PLOT Layer Summary",
@@ -515,23 +545,43 @@ def _format_summary(
         f"layers: {list(int(layer) for layer in layers)}",
         "",
     ]
+    per_var_records = selected_config.get("per_var_records", {})
+    if isinstance(per_var_records, dict) and per_var_records:
+        chosen_layers = {
+            str(target_var): int(record.get("layer", -1))
+            for target_var, record in per_var_records.items()
+            if isinstance(record, dict)
+        }
+        calibration_scores = {
+            str(target_var): float(record.get("selection_score", 0.0))
+            for target_var, record in per_var_records.items()
+            if isinstance(record, dict)
+        }
+        exact_scores = {
+            str(target_var): float(record.get("exact_acc", 0.0))
+            for target_var, record in per_var_records.items()
+            if isinstance(record, dict)
+        }
+        lines.extend(
+            [
+                "[selected_uot_coupling]",
+                f"eps={float(selected_config.get('epsilon', 0.0)):g}",
+                (
+                    f"beta_n={float(selected_config.get('uot_beta_neural')):g}"
+                    if selected_config.get("uot_beta_neural") is not None else "beta_n=NA"
+                ),
+                f"layers={chosen_layers}",
+                f"calibration_by_var={calibration_scores}",
+                f"test_by_var={exact_scores}",
+                f"avg_cal={float(selected_config.get('mean_calibration_score', 0.0)):.4f}",
+                f"avg_test={float(selected_config.get('mean_exact_acc', 0.0)):.4f}",
+                f"runtime_with_signatures={float(selected_config.get('runtime_with_signatures_seconds', 0.0)):.2f}s",
+                "",
+            ]
+        )
     for target_var in DEFAULT_TARGET_VARS:
-        selected = method_by_var.get(str(target_var), {})
+        selected = per_var_records.get(str(target_var), {}) if isinstance(per_var_records, dict) else {}
         lines.append(f"[{target_var}]")
-        if selected:
-            lines.append(
-                f"selected_single_layer method={selected.get('method')} "
-                f"exact={float(selected.get('exact_acc', 0.0)):.4f} "
-                f"cal={float(selected.get('selection_score', 0.0)):.4f} "
-                f"eps={float(selected.get('epsilon', 0.0)):g} "
-                f"site={selected.get('site_label')} "
-                + (
-                    f"beta_n={float(selected.get('uot_beta_neural')):g} "
-                    if selected.get("uot_beta_neural") is not None
-                    else ""
-                )
-                + f"coupling_argmax={selected.get('coupling_argmax_site_label')}"
-            )
         if selected.get("target_row_ranking"):
             lines.append(
                 f"coupling_row_layers={[entry.get('site_label') for entry in selected.get('target_row_ranking', [])[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]]}"
@@ -710,11 +760,14 @@ def main() -> None:
     _synchronize_if_cuda(device)
     ot_localization_seconds = float(perf_counter() - ot_localization_start)
 
-    print(
-        "[stageA] selecting PLOT(layer) winner by testing the argmax layer "
-        "from each target-variable coupling row"
+    signature_prepare_runtime_seconds = float(
+        prepared_artifacts.get("prepare_runtime_seconds", artifact_prepare_create_seconds)
     )
-    method_by_var = _select_layer_method_by_var(
+    print(
+        "[stageA] selecting one shared PLOT(layer) UOT coupling by averaging the "
+        "argmax-layer calibration accuracies across abstract variables"
+    )
+    selected_config = _select_joint_layer_config(
         model=model,
         tokenizer=tokenizer,
         banks_by_split=banks_by_split,
@@ -724,7 +777,13 @@ def main() -> None:
         batch_size=int(args.batch_size),
         signature_mode=str(args.signature_mode),
         calibration_family_weights=calibration_family_weights,
+        signature_prepare_runtime_seconds=signature_prepare_runtime_seconds,
     )
+    method_by_var = {
+        str(target_var): dict(record)
+        for target_var, record in selected_config.get("per_var_records", {}).items()
+        if isinstance(record, dict)
+    }
     support_start = perf_counter()
     print("[stageA] extracting UOT support diagnostics")
     support_by_var = extract_ordered_site_support(
@@ -749,7 +808,7 @@ def main() -> None:
             token_position_id=str(args.token_position_id),
             layers=resolved_layers,
             support_by_var=support_by_var,
-            method_by_var=method_by_var,
+            selected_config=selected_config,
         ),
     )
     write_json(
@@ -768,6 +827,7 @@ def main() -> None:
             "support_path": str(support_path),
             "support_by_var": support_by_var,
             "rankings_by_var": rankings_by_var,
+            "selected_joint_config": selected_config,
             "display_method_by_var": method_by_var,
             "method_by_var": method_by_var,
             "stage_a_transport_method": "uot",
