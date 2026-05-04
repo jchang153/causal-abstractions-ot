@@ -33,6 +33,7 @@ DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_UOT_BETA_NEURALS = (0.1, 0.3, 1.0, 3.0)
+DEFAULT_OT_LAMBDAS = (1.0,)
 DEFAULT_DISPLAY_TOP_LAYER_COUNT = 3
 DEFAULT_STAGE_A_INTERVENTION_STRENGTH = 1.0
 
@@ -80,6 +81,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
     parser.add_argument("--ot-epsilons", help="Comma-separated UOT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--uot-beta-neurals", help="Comma-separated UOT beta_neural values. Default: 0.1,0.3,1,3")
+    parser.add_argument("--ot-lambdas", help="Comma-separated Stage A intervention strengths. Default: 1")
     parser.add_argument(
         "--calibration-family-weights",
         help="Comma-separated family weights in answerPosition,randomLetter,answerPosition_randomLetter order. Default: 1,1,1",
@@ -267,6 +269,7 @@ def _evaluate_fixed_single_layer(
     site_index: int,
     device,
     batch_size: int,
+    strength: float,
     calibration_family_weights: tuple[float, ...],
 ) -> dict[str, object]:
     calibration_result, calibration_ranking = _evaluate_single_site_intervention(
@@ -274,7 +277,7 @@ def _evaluate_fixed_single_layer(
         bank=calibration_bank,
         site=site,
         site_index=int(site_index),
-        strength=float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
+        strength=float(strength),
         batch_size=int(batch_size),
         device=device,
         tokenizer=tokenizer,
@@ -285,7 +288,7 @@ def _evaluate_fixed_single_layer(
         bank=holdout_bank,
         site=site,
         site_index=int(site_index),
-        strength=float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
+        strength=float(strength),
         batch_size=int(batch_size),
         device=device,
         tokenizer=tokenizer,
@@ -301,10 +304,12 @@ def _evaluate_fixed_single_layer(
     holdout_result["selection_score"] = float(calibration_score)
     holdout_result["selection_exact_acc"] = float(calibration_result.get("exact_acc", 0.0))
     holdout_result["calibration_exact_acc"] = float(calibration_result.get("exact_acc", 0.0))
+    holdout_result["lambda"] = float(strength)
     return {
         "target_var": str(holdout_bank.target_var),
         "selected_site_label": str(site.label),
         "selected_layer": int(site.layer),
+        "lambda": float(strength),
         "calibration_score": float(calibration_score),
         "selected_calibration_result": calibration_result,
         "selected_calibration_ranking": calibration_ranking,
@@ -323,12 +328,13 @@ def _evaluate_stage_a_config(
     device,
     batch_size: int,
     signature_mode: str,
+    lambda_values: tuple[float, ...],
     calibration_family_weights: tuple[float, ...],
 ) -> dict[str, object]:
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
     epsilon = float(compare_payload.get("ot_epsilon", 0.0))
     compare_beta = compare_payload.get("uot_beta_neural")
-    per_var_records: dict[str, dict[str, object]] = {}
+    row_info_by_var: dict[str, dict[str, object]] = {}
     for target_var in target_vars:
         for method_name, payload in _iter_stage_a_transport_payloads(compare_payload):
             if str(payload.get("target_var")) != str(target_var):
@@ -340,15 +346,37 @@ def _evaluate_stage_a_config(
             candidate_sites = [sites[top_site_index]] if 0 <= int(top_site_index) < len(sites) else []
             if not candidate_sites:
                 continue
+            row_info_by_var[str(target_var)] = {
+                "method_name": str(method_name),
+                "payload": payload,
+                "row_ranking": row_ranking,
+                "site_index": int(top_site_index),
+                "site": candidate_sites[0],
+            }
+            break
+
+    best_lambda_result: dict[str, object] | None = None
+    lambda_sweep: list[dict[str, object]] = []
+    for strength in lambda_values:
+        per_var_records: dict[str, dict[str, object]] = {}
+        for target_var in target_vars:
+            row_info = row_info_by_var.get(str(target_var))
+            if not isinstance(row_info, dict):
+                continue
+            payload = row_info["payload"]
+            row_ranking = row_info["row_ranking"]
+            candidate_site = row_info["site"]
+            top_site_index = int(row_info["site_index"])
             direct_eval_payload = _evaluate_fixed_single_layer(
                 model=model,
                 tokenizer=tokenizer,
                 calibration_bank=banks_by_split["calibration"][str(target_var)],
                 holdout_bank=banks_by_split["test"][str(target_var)],
-                site=candidate_sites[0],
+                site=candidate_site,
                 site_index=int(top_site_index),
                 device=device,
                 batch_size=int(batch_size),
+                strength=float(strength),
                 calibration_family_weights=calibration_family_weights,
             )
             result = direct_eval_payload.get("results", [{}])[0]
@@ -360,57 +388,89 @@ def _evaluate_stage_a_config(
                 )
             )
             record = {
-                "method": str(payload.get("method", method_name)),
+                "method": str(payload.get("method", row_info["method_name"])),
                 "variable": str(target_var),
                 "exact_acc": float(result.get("exact_acc", 0.0)),
                 "selection_score": float(calibration_score),
-                "site_label": str(result.get("site_label", candidate_sites[0].label)),
-                "layer": int(result.get("layer", candidate_sites[0].layer)),
+                "site_label": str(result.get("site_label", candidate_site.label)),
+                "layer": int(result.get("layer", candidate_site.layer)),
                 "epsilon": float(epsilon),
                 "uot_beta_neural": None
                 if payload.get("uot_beta_neural", compare_beta) is None
                 else float(payload.get("uot_beta_neural", compare_beta)),
-                "candidate_site_labels": [site.label for site in candidate_sites],
-                "candidate_layers": [int(site.layer) for site in candidate_sites],
-                "coupling_argmax_site_label": candidate_sites[0].label,
-                "coupling_argmax_layer": int(candidate_sites[0].layer),
+                "lambda": float(strength),
+                "candidate_site_labels": [candidate_site.label],
+                "candidate_layers": [int(candidate_site.layer)],
+                "coupling_argmax_site_label": candidate_site.label,
+                "coupling_argmax_layer": int(candidate_site.layer),
                 "coupling_top_site_labels": [str(entry.get("site_label", "")) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
                 "coupling_top_layers": [int(entry.get("layer", -1)) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
-                "selection_basis": "single_site_on_coupling_argmax_layer_fixed_strength",
+                "selection_basis": "single_site_on_coupling_argmax_layer_shared_lambda_sweep",
                 "target_row_ranking": row_ranking,
                 "payload": direct_eval_payload,
             }
-            payload["results"] = [
-                {
-                    "selection_score": float(record["selection_score"]),
-                    "exact_acc": float(record["exact_acc"]),
-                    "site_label": str(record["site_label"]),
-                    "layer": int(record["layer"]),
-                    "variable": str(target_var),
-                }
-            ]
             per_var_records[str(target_var)] = record
-            break
-    calibration_scores = [
-        float(record.get("selection_score", 0.0))
-        for target_var in target_vars
-        for record in [per_var_records.get(str(target_var))]
-        if isinstance(record, dict)
-    ]
-    exact_scores = [
-        float(record.get("exact_acc", 0.0))
-        for target_var in target_vars
-        for record in [per_var_records.get(str(target_var))]
-        if isinstance(record, dict)
-    ]
-    return {
-        "method": "uot",
-        "epsilon": float(epsilon),
-        "uot_beta_neural": None if compare_beta is None else float(compare_beta),
-        "per_var_records": per_var_records,
-        "mean_calibration_score": float(sum(calibration_scores) / len(calibration_scores)) if calibration_scores else 0.0,
-        "mean_exact_acc": float(sum(exact_scores) / len(exact_scores)) if exact_scores else 0.0,
-    }
+
+        calibration_scores = [
+            float(record.get("selection_score", 0.0))
+            for target_var in target_vars
+            for record in [per_var_records.get(str(target_var))]
+            if isinstance(record, dict)
+        ]
+        exact_scores = [
+            float(record.get("exact_acc", 0.0))
+            for target_var in target_vars
+            for record in [per_var_records.get(str(target_var))]
+            if isinstance(record, dict)
+        ]
+        lambda_result = {
+            "method": "uot",
+            "epsilon": float(epsilon),
+            "uot_beta_neural": None if compare_beta is None else float(compare_beta),
+            "lambda": float(strength),
+            "per_var_records": per_var_records,
+            "mean_calibration_score": float(sum(calibration_scores) / len(calibration_scores)) if calibration_scores else 0.0,
+            "mean_exact_acc": float(sum(exact_scores) / len(exact_scores)) if exact_scores else 0.0,
+        }
+        lambda_sweep.append(lambda_result)
+        if best_lambda_result is None or (
+            float(lambda_result["mean_calibration_score"]),
+            float(lambda_result["mean_exact_acc"]),
+        ) > (
+            float(best_lambda_result["mean_calibration_score"]),
+            float(best_lambda_result["mean_exact_acc"]),
+        ):
+            best_lambda_result = lambda_result
+
+    if best_lambda_result is None:
+        return {
+            "method": "uot",
+            "epsilon": float(epsilon),
+            "uot_beta_neural": None if compare_beta is None else float(compare_beta),
+            "lambda": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
+            "per_var_records": {},
+            "mean_calibration_score": 0.0,
+            "mean_exact_acc": 0.0,
+            "lambda_sweep": [],
+        }
+    for target_var, record in best_lambda_result.get("per_var_records", {}).items():
+        row_info = row_info_by_var.get(str(target_var))
+        if not isinstance(row_info, dict):
+            continue
+        payload = row_info["payload"]
+        payload["results"] = [
+            {
+                "selection_score": float(record["selection_score"]),
+                "exact_acc": float(record["exact_acc"]),
+                "site_label": str(record["site_label"]),
+                "layer": int(record["layer"]),
+                "lambda": float(record["lambda"]),
+                "variable": str(target_var),
+            }
+        ]
+    best_lambda_result = dict(best_lambda_result)
+    best_lambda_result["lambda_sweep"] = lambda_sweep
+    return best_lambda_result
 
 
 def _format_stage_a_config_line(
@@ -444,6 +504,7 @@ def _format_stage_a_config_line(
             f"beta_neural={float(candidate_config.get('uot_beta_neural')):g} "
             if candidate_config.get("uot_beta_neural") is not None else ""
         )
+        + f"lambda={float(candidate_config.get('lambda', DEFAULT_STAGE_A_INTERVENTION_STRENGTH)):g} "
         + f"layers={chosen_layers} "
         + f"cal={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in calibration_scores.items())}}} "
         + f"test={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in exact_scores.items())}}} "
@@ -463,6 +524,7 @@ def _select_joint_layer_config(
     device,
     batch_size: int,
     signature_mode: str,
+    lambda_values: tuple[float, ...],
     calibration_family_weights: tuple[float, ...],
     signature_prepare_runtime_seconds: float,
 ) -> dict[str, object]:
@@ -477,6 +539,7 @@ def _select_joint_layer_config(
             device=device,
             batch_size=batch_size,
             signature_mode=signature_mode,
+            lambda_values=lambda_values,
             calibration_family_weights=calibration_family_weights,
         )
         candidate_config["signature_prepare_runtime_seconds"] = float(signature_prepare_runtime_seconds)
@@ -570,6 +633,7 @@ def _format_summary(
                     f"beta_n={float(selected_config.get('uot_beta_neural')):g}"
                     if selected_config.get("uot_beta_neural") is not None else "beta_n=NA"
                 ),
+                f"lambda={float(selected_config.get('lambda', DEFAULT_STAGE_A_INTERVENTION_STRENGTH)):g}",
                 f"layers={chosen_layers}",
                 f"calibration_by_var={calibration_scores}",
                 f"test_by_var={exact_scores}",
@@ -640,6 +704,7 @@ def main() -> None:
 
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
     uot_beta_neurals = tuple(_parse_csv_floats(args.uot_beta_neurals) or list(DEFAULT_UOT_BETA_NEURALS))
+    ot_lambdas = tuple(_parse_csv_floats(args.ot_lambdas) or list(DEFAULT_OT_LAMBDAS))
     calibration_family_weights = tuple(
         _parse_csv_floats(args.calibration_family_weights) or list(DEFAULT_CALIBRATION_FAMILY_WEIGHTS)
     )
@@ -709,7 +774,8 @@ def main() -> None:
     ot_localization_start = perf_counter()
     print(
         f"[stageA] running joint layer UOT epsilon_sweep={list(ot_epsilons)} "
-        f"beta_neural_sweep={list(uot_beta_neurals)}"
+        f"beta_neural_sweep={list(uot_beta_neurals)} "
+        f"lambda_sweep={list(ot_lambdas)}"
     )
     for epsilon in ot_epsilons:
         for beta_neural in uot_beta_neurals:
@@ -776,6 +842,7 @@ def main() -> None:
         device=device,
         batch_size=int(args.batch_size),
         signature_mode=str(args.signature_mode),
+        lambda_values=ot_lambdas,
         calibration_family_weights=calibration_family_weights,
         signature_prepare_runtime_seconds=signature_prepare_runtime_seconds,
     )
@@ -820,6 +887,7 @@ def main() -> None:
             "signature_mode": str(args.signature_mode),
             "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
             "uot_beta_neurals": [float(beta_neural) for beta_neural in uot_beta_neurals],
+            "ot_lambdas": [float(strength) for strength in ot_lambdas],
             "support_score_slack": float(args.support_score_slack),
             "calibration_metric": DEFAULT_CALIBRATION_METRIC,
             "calibration_family_weights": [float(weight) for weight in calibration_family_weights],
