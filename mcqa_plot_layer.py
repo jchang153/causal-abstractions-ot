@@ -272,6 +272,7 @@ def _evaluate_fixed_single_layer(
     strength: float,
     calibration_family_weights: tuple[float, ...],
 ) -> dict[str, object]:
+    eval_start = perf_counter()
     calibration_result, calibration_ranking = _evaluate_single_site_intervention(
         model=model,
         bank=calibration_bank,
@@ -300,6 +301,7 @@ def _evaluate_fixed_single_layer(
         result=calibration_result,
         calibration_family_weights=calibration_family_weights,
     )
+    runtime_seconds = float(perf_counter() - eval_start)
     holdout_result["method"] = "single_layer_full_swap"
     holdout_result["selection_score"] = float(calibration_score)
     holdout_result["selection_exact_acc"] = float(calibration_result.get("exact_acc", 0.0))
@@ -310,6 +312,7 @@ def _evaluate_fixed_single_layer(
         "selected_site_label": str(site.label),
         "selected_layer": int(site.layer),
         "lambda": float(strength),
+        "runtime_seconds": float(runtime_seconds),
         "calibration_score": float(calibration_score),
         "selected_calibration_result": calibration_result,
         "selected_calibration_ranking": calibration_ranking,
@@ -407,6 +410,7 @@ def _evaluate_stage_a_config(
                 "coupling_top_layers": [int(entry.get("layer", -1)) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
                 "selection_basis": "single_site_on_coupling_argmax_layer_shared_lambda_sweep",
                 "target_row_ranking": row_ranking,
+                "runtime_seconds": float(direct_eval_payload.get("runtime_seconds", 0.0)),
                 "payload": direct_eval_payload,
             }
             per_var_records[str(target_var)] = record
@@ -465,6 +469,7 @@ def _evaluate_stage_a_config(
                 "site_label": str(record["site_label"]),
                 "layer": int(record["layer"]),
                 "lambda": float(record["lambda"]),
+                "runtime_seconds": float(record.get("runtime_seconds", 0.0)),
                 "variable": str(target_var),
             }
         ]
@@ -542,10 +547,24 @@ def _select_joint_layer_config(
             lambda_values=lambda_values,
             calibration_family_weights=calibration_family_weights,
         )
-        candidate_config["signature_prepare_runtime_seconds"] = float(signature_prepare_runtime_seconds)
-        candidate_config["runtime_with_signatures_seconds"] = float(
-            signature_prepare_runtime_seconds + float(compare_payload.get("runtime_seconds", 0.0))
+        direct_eval_runtime_seconds = float(
+            sum(
+                float(record.get("runtime_seconds", 0.0))
+                for record in candidate_config.get("per_var_records", {}).values()
+                if isinstance(record, dict)
+            )
         )
+        candidate_config["signature_prepare_runtime_seconds"] = float(signature_prepare_runtime_seconds)
+        candidate_config["transport_solve_runtime_seconds"] = float(compare_payload.get("runtime_seconds", 0.0))
+        candidate_config["direct_eval_runtime_seconds"] = float(direct_eval_runtime_seconds)
+        candidate_config["runtime_with_signatures_seconds"] = float(
+            signature_prepare_runtime_seconds
+            + float(compare_payload.get("runtime_seconds", 0.0))
+            + direct_eval_runtime_seconds
+        )
+        for record in candidate_config.get("per_var_records", {}).values():
+            if isinstance(record, dict):
+                record["runtime_with_signatures_seconds"] = float(candidate_config["runtime_with_signatures_seconds"])
         print(
             _format_stage_a_config_line(
                 candidate_config=candidate_config,
@@ -862,7 +881,7 @@ def main() -> None:
     total_seconds = float(perf_counter() - stage_start)
     rankings_by_var = _rank_layers_from_target_row(
         selected_method_by_var=method_by_var,
-        runtime_seconds=total_seconds,
+        runtime_seconds=float(selected_config.get("runtime_with_signatures_seconds", total_seconds)),
     )
 
     support_path = sweep_root / f"mcqa_plot_layer_pos-{str(args.token_position_id)}_sig-{str(args.signature_mode)}_support.json"

@@ -106,6 +106,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--basis-source-mode", default=DEFAULT_BASIS_SOURCE_MODE, choices=("pair_bank", "all_variants"))
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
+    parser.add_argument("--ot-top-k-values", help="Comma-separated OT top-k values. Default: 1,2,4")
+    parser.add_argument("--ot-lambdas", help="Comma-separated OT lambdas. Default: 0.5,1,2,4")
+    parser.add_argument(
+        "--calibration-family-weights",
+        help="Comma-separated family weights in answerPosition,randomLetter,answerPosition_randomLetter order. Default: 1,1,1",
+    )
     parser.add_argument("--support-score-slack", type=float, default=0.05)
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument("--screen-das", action="store_true")
@@ -714,6 +720,11 @@ def main() -> None:
     if int(args.num_bands) <= 0:
         raise ValueError("num_bands must be > 0")
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
+    ot_top_k_values = tuple(_parse_csv_ints(args.ot_top_k_values) or list(DEFAULT_OT_TOP_K_VALUES))
+    ot_lambdas = tuple(_parse_csv_floats(args.ot_lambdas) or list(DEFAULT_OT_LAMBDAS))
+    calibration_family_weights = tuple(
+        _parse_csv_floats(args.calibration_family_weights) or list(DEFAULT_CALIBRATION_FAMILY_WEIGHTS)
+    )
     top_prefix_sizes = tuple(_parse_csv_ints(args.top_prefix_sizes) or list(DEFAULT_TOP_PREFIX_SIZES))
     screen_mask_names = tuple(_parse_csv_strings(args.screen_mask_names) or list(DEFAULT_SCREEN_MASK_NAMES))
     guided_mask_names = tuple(_parse_csv_strings(args.guided_mask_names) or list(DEFAULT_GUIDED_DAS_MASK_NAMES))
@@ -842,13 +853,13 @@ def main() -> None:
                     batch_size=int(args.batch_size),
                     epsilon=float(epsilon),
                     signature_mode=str(args.signature_mode),
-                    top_k_values=DEFAULT_OT_TOP_K_VALUES,
-                    lambda_values=DEFAULT_OT_LAMBDAS,
+                    top_k_values=ot_top_k_values,
+                    lambda_values=ot_lambdas,
                     source_target_vars=target_vars,
                     calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                    calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                    top_k_values_by_var={target_var: DEFAULT_OT_TOP_K_VALUES for target_var in target_vars},
-                    lambda_values_by_var={target_var: DEFAULT_OT_LAMBDAS for target_var in target_vars},
+                    calibration_family_weights=calibration_family_weights,
+                    top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
+                    lambda_values_by_var={target_var: ot_lambdas for target_var in target_vars},
                 )
                 if prepared_artifacts is None:
                     artifact_prepare_start = perf_counter()
@@ -893,6 +904,9 @@ def main() -> None:
                     "basis_source_mode": str(args.basis_source_mode),
                     "ot_epsilon": float(epsilon),
                     "signature_mode": str(args.signature_mode),
+                    "ot_top_k_values": [int(value) for value in ot_top_k_values],
+                    "ot_lambdas": [float(value) for value in ot_lambdas],
+                    "calibration_family_weights": [float(weight) for weight in calibration_family_weights],
                     "model_name": base_run.MODEL_NAME,
                     "basis": {
                         "basis_id": str(basis.basis_id),

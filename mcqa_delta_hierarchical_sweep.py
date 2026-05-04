@@ -301,6 +301,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
     parser.add_argument("--ot-epsilons", default="0.5,1,2,4")
     parser.add_argument("--stage-a-uot-beta-neurals", default="0.1,0.3,1,3")
+    parser.add_argument(
+        "--stage-a-ot-lambdas",
+        default=None,
+        help="Comma-separated Stage A-only lambdas for the row-argmax layer evaluations. Defaults to --ot-lambdas.",
+    )
     parser.add_argument("--ot-top-k-values", default="1,2,4")
     parser.add_argument("--ot-lambdas", default="0.5,1,2,4")
     parser.add_argument("--calibration-metric", default=DEFAULT_CALIBRATION_METRIC)
@@ -359,6 +364,11 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     stage_a_uot_beta_neurals = _parse_csv_floats(args.stage_a_uot_beta_neurals) or DEFAULT_STAGE_A_UOT_BETA_NEURALS
     ot_top_k_values = _parse_csv_ints(args.ot_top_k_values) or DEFAULT_OT_TOP_K_VALUES
     ot_lambdas = _parse_csv_floats(args.ot_lambdas) or DEFAULT_OT_LAMBDAS
+    stage_a_ot_lambdas = (
+        _parse_csv_floats(args.stage_a_ot_lambdas)
+        if args.stage_a_ot_lambdas is not None
+        else None
+    ) or ot_lambdas
     calibration_family_weights = _parse_csv_floats(args.calibration_family_weights) or DEFAULT_CALIBRATION_FAMILY_WEIGHTS
     guided_mask_names = _parse_csv_strings(args.guided_mask_names) or DEFAULT_GUIDED_MASK_NAMES
     guided_subspace_dims = None
@@ -386,6 +396,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "native_resolutions": tuple(int(resolution) for resolution in native_resolutions),
         "ot_epsilons": tuple(float(epsilon) for epsilon in ot_epsilons),
         "stage_a_uot_beta_neurals": tuple(float(beta) for beta in stage_a_uot_beta_neurals),
+        "stage_a_ot_lambdas": tuple(float(value) for value in stage_a_ot_lambdas),
         "ot_top_k_values": tuple(int(value) for value in ot_top_k_values),
         "ot_lambdas": tuple(float(value) for value in ot_lambdas),
         "calibration_family_weights": tuple(float(weight) for weight in calibration_family_weights),
@@ -435,6 +446,16 @@ def _build_stage_a_command(
         ",".join(
             str(beta).rstrip("0").rstrip(".") if "." in str(beta) else str(beta)
             for beta in normalized["stage_a_uot_beta_neurals"]
+        ),
+        "--ot-lambdas",
+        ",".join(
+            str(value).rstrip("0").rstrip(".") if "." in str(value) else str(value)
+            for value in normalized["stage_a_ot_lambdas"]
+        ),
+        "--calibration-family-weights",
+        ",".join(
+            str(weight).rstrip("0").rstrip(".") if "." in str(weight) else str(weight)
+            for weight in normalized["calibration_family_weights"]
         ),
         "--signature-mode",
         str(args.signature_mode),
@@ -498,6 +519,15 @@ def _build_stage_b_or_c_command(
         str(basis_source_mode),
         "--ot-epsilons",
         ",".join(str(epsilon).rstrip("0").rstrip(".") if "." in str(epsilon) else str(epsilon) for epsilon in normalized["ot_epsilons"]),
+        "--ot-top-k-values",
+        ",".join(str(value) for value in normalized["ot_top_k_values"]),
+        "--ot-lambdas",
+        ",".join(str(value).rstrip("0").rstrip(".") if "." in str(value) else str(value) for value in normalized["ot_lambdas"]),
+        "--calibration-family-weights",
+        ",".join(
+            str(weight).rstrip("0").rstrip(".") if "." in str(weight) else str(weight)
+            for weight in normalized["calibration_family_weights"]
+        ),
         "--signature-mode",
         str(args.signature_mode),
         "--results-root",
@@ -568,6 +598,15 @@ def _build_native_block_command(
         ",".join(str(resolution) for resolution in normalized["native_resolutions"]),
         "--ot-epsilons",
         ",".join(str(epsilon).rstrip("0").rstrip(".") if "." in str(epsilon) else str(epsilon) for epsilon in normalized["ot_epsilons"]),
+        "--ot-top-k-values",
+        ",".join(str(value) for value in normalized["ot_top_k_values"]),
+        "--ot-lambdas",
+        ",".join(str(value).rstrip("0").rstrip(".") if "." in str(value) else str(value) for value in normalized["ot_lambdas"]),
+        "--calibration-family-weights",
+        ",".join(
+            str(weight).rstrip("0").rstrip(".") if "." in str(weight) else str(weight)
+            for weight in normalized["calibration_family_weights"]
+        ),
         "--signature-mode",
         str(args.signature_mode),
         "--results-root",
@@ -919,6 +958,9 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
             ]
             if display_entry.get("uot_beta_neural") is not None:
                 parts.append(f"beta_n={float(display_entry.get('uot_beta_neural')):g}")
+            runtime_value = display_entry.get("runtime_with_signatures_seconds", display_entry.get("runtime_seconds"))
+            if runtime_value is not None:
+                parts.append(f"runtime={float(runtime_value):.2f}s")
             lines.append("  method " + " ".join(parts))
         for entry in rankings.get(target_var, []):
             parts = [
@@ -1470,6 +1512,7 @@ def _write_status(
             "stage_a_token_position_ids": list(normalized["stage_a_token_position_ids"]),
             "stage_a_layer_indices": list(normalized["stage_a_layer_indices"]),
             "stage_a_uot_beta_neurals": list(normalized["stage_a_uot_beta_neurals"]),
+            "stage_a_ot_lambdas": list(normalized["stage_a_ot_lambdas"]),
             "stage_b_top_layers_per_var": int(args.stage_b_top_layers_per_var),
             "stage_b_neighbor_radius": int(args.stage_b_neighbor_radius),
             "stage_b_max_layers_per_var": int(args.stage_b_max_layers_per_var),

@@ -87,6 +87,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional comma-separated native support widths. Runs the full OT sweep separately for each width.",
     )
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
+    parser.add_argument("--ot-top-k-values", help="Comma-separated OT top-k values. Default: 1,2,4")
+    parser.add_argument("--ot-lambdas", help="Comma-separated OT lambdas. Default: 0.5,1,2,4")
+    parser.add_argument(
+        "--calibration-family-weights",
+        help="Comma-separated family weights in answerPosition,randomLetter,answerPosition_randomLetter order. Default: 1,1,1",
+    )
     parser.add_argument("--support-score-slack", type=float, default=0.05)
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument("--results-root", default="results/delta")
@@ -206,6 +212,11 @@ def main() -> None:
         hidden_size=int(model.config.hidden_size),
     )
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
+    ot_top_k_values = tuple(_parse_csv_ints(args.ot_top_k_values) or list(DEFAULT_OT_TOP_K_VALUES))
+    ot_lambdas = tuple(_parse_csv_floats(args.ot_lambdas) or list(DEFAULT_OT_LAMBDAS))
+    calibration_family_weights = tuple(
+        _parse_csv_floats(args.calibration_family_weights) or list(DEFAULT_CALIBRATION_FAMILY_WEIGHTS)
+    )
     token_position_ids = tuple(token_position.id for token_position in token_positions)
     hidden_size = int(model.config.hidden_size)
 
@@ -280,13 +291,13 @@ def main() -> None:
                         batch_size=int(args.batch_size),
                         epsilon=1.0,
                         signature_mode=str(args.signature_mode),
-                        top_k_values=DEFAULT_OT_TOP_K_VALUES,
-                        lambda_values=DEFAULT_OT_LAMBDAS,
+                        top_k_values=ot_top_k_values,
+                        lambda_values=ot_lambdas,
                         source_target_vars=target_vars,
                         calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                        calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                        top_k_values_by_var={target_var: DEFAULT_OT_TOP_K_VALUES for target_var in target_vars},
-                        lambda_values_by_var={target_var: DEFAULT_OT_LAMBDAS for target_var in target_vars},
+                        calibration_family_weights=calibration_family_weights,
+                        top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
+                        lambda_values_by_var={target_var: ot_lambdas for target_var in target_vars},
                     ),
                 )
                 artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
@@ -341,12 +352,12 @@ def main() -> None:
                             batch_size=int(args.batch_size),
                             ot_epsilon=float(epsilon),
                             signature_mode=str(args.signature_mode),
-                            ot_top_k_values=DEFAULT_OT_TOP_K_VALUES,
-                            ot_lambdas=DEFAULT_OT_LAMBDAS,
+                            ot_top_k_values=ot_top_k_values,
+                            ot_lambdas=ot_lambdas,
                             calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                            calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                            ot_top_k_values_by_var={target_var: DEFAULT_OT_TOP_K_VALUES for target_var in target_vars},
-                            ot_lambdas_by_var={target_var: DEFAULT_OT_LAMBDAS for target_var in target_vars},
+                            calibration_family_weights=calibration_family_weights,
+                            ot_top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
+                            ot_lambdas_by_var={target_var: ot_lambdas for target_var in target_vars},
                             resolution=int(native_resolution),
                             layers=(int(layer),),
                             token_position_ids=(DEFAULT_TOKEN_POSITION_ID,),
@@ -402,6 +413,9 @@ def main() -> None:
                 "native_resolution": int(native_resolution),
                 "native_resolutions": [int(resolution) for resolution in native_resolutions],
                 "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
+                "ot_top_k_values": [int(value) for value in ot_top_k_values],
+                "ot_lambdas": [float(value) for value in ot_lambdas],
+                "calibration_family_weights": [float(weight) for weight in calibration_family_weights],
                 "support_score_slack": float(args.support_score_slack),
                 "site_labels": [site.label for site in sites],
                 "support_path": str(support_path),

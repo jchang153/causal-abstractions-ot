@@ -214,6 +214,13 @@ def _native_selected_width_epsilon_runtime(
             continue
         layer = int(payload.get("layer", -1))
         native_resolution = int(payload.get("native_resolution", payload.get("atomic_width", -1)))
+        timing_seconds = payload.get("timing_seconds", {})
+        signature_setup_seconds = 0.0
+        if isinstance(timing_seconds, dict):
+            signature_setup_seconds = (
+                _as_float(timing_seconds.get("t_artifact_prepare_load"))
+                + _as_float(timing_seconds.get("t_artifact_prepare_create"))
+            )
         for ot_path_str in payload.get("ot_output_paths", []):
             compare_payload = _load_json(Path(str(ot_path_str)))
             if not isinstance(compare_payload, dict):
@@ -228,8 +235,12 @@ def _native_selected_width_epsilon_runtime(
                 target_var = str(method_payload.get("target_var"))
                 if target_var not in TARGET_VARS:
                     continue
-                runtime_grid[(target_var, layer, native_resolution, epsilon)] = _as_float(
+                method_runtime_seconds = _as_float(
                     method_payload.get("runtime_seconds", method_payload.get("wall_runtime_seconds"))
+                )
+                method_signature_seconds = _as_float(method_payload.get("signature_prepare_runtime_seconds"))
+                runtime_grid[(target_var, layer, native_resolution, epsilon)] = float(
+                    method_runtime_seconds - method_signature_seconds + signature_setup_seconds
                 )
 
     downstream_by_var: dict[str, float] = {}
@@ -285,6 +296,15 @@ def _pca_selected_config_epsilon_runtime(
         basis_source_mode = str(payload.get("basis_source_mode"))
         site_menu = str(payload.get("site_menu"))
         num_bands = int(payload.get("num_bands", -1))
+        timing_seconds = payload.get("timing_seconds", {})
+        config_setup_seconds = 0.0
+        if isinstance(timing_seconds, dict):
+            config_setup_seconds = (
+                _as_float(timing_seconds.get("t_stageB_pca_fit"))
+                + _as_float(timing_seconds.get("t_stageB_pca_site_build"))
+                + _as_float(timing_seconds.get("t_artifact_prepare_load"))
+                + _as_float(timing_seconds.get("t_artifact_prepare_create"))
+            )
         for ot_path_str in payload.get("ot_output_paths", []):
             compare_payload = _load_json(Path(str(ot_path_str)))
             if not isinstance(compare_payload, dict):
@@ -299,8 +319,12 @@ def _pca_selected_config_epsilon_runtime(
                 target_var = str(method_payload.get("target_var"))
                 if target_var not in TARGET_VARS:
                     continue
-                runtime_grid[(target_var, layer, basis_source_mode, site_menu, num_bands, epsilon)] = _as_float(
+                method_runtime_seconds = _as_float(
                     method_payload.get("runtime_seconds", method_payload.get("wall_runtime_seconds"))
+                )
+                method_signature_seconds = _as_float(method_payload.get("signature_prepare_runtime_seconds"))
+                runtime_grid[(target_var, layer, basis_source_mode, site_menu, num_bands, epsilon)] = float(
+                    method_runtime_seconds - method_signature_seconds + config_setup_seconds
                 )
 
     downstream_by_var: dict[str, float] = {}
@@ -341,14 +365,47 @@ def _stage_a_selected_plan_runtime(
     sweep_root: Path,
     rankings: dict[str, object],
     entries_by_var: dict[str, dict[str, object] | None],
-) -> tuple[dict[str, float], dict[str, dict[str, object]]]:
+) -> tuple[dict[str, float], dict[str, dict[str, object]], float | None]:
     stage_a_payload_path = _stage_a_payload_path(sweep_root)
     if stage_a_payload_path is None or not stage_a_payload_path.exists():
-        return ({var: 0.0 for var in TARGET_VARS}, {})
+        return ({var: 0.0 for var in TARGET_VARS}, {}, None)
 
     stage_a_payload = _load_json(stage_a_payload_path)
     if not isinstance(stage_a_payload, dict):
-        return ({var: 0.0 for var in TARGET_VARS}, {})
+        return ({var: 0.0 for var in TARGET_VARS}, {}, None)
+
+    selected_joint_config = stage_a_payload.get("selected_joint_config")
+    if isinstance(selected_joint_config, dict):
+        shared_runtime_seconds = _as_float(
+            selected_joint_config.get(
+                "runtime_with_signatures_seconds",
+                selected_joint_config.get("runtime_seconds"),
+            )
+        )
+        if shared_runtime_seconds > 0.0:
+            downstream_by_var = {
+                str(target_var): (shared_runtime_seconds if entries_by_var.get(str(target_var)) else 0.0)
+                for target_var in TARGET_VARS
+            }
+            selected_records = {
+                str(target_var): {
+                    "target_var": str(target_var),
+                    "method": "uot",
+                    "epsilon": _as_float(selected_joint_config.get("epsilon")),
+                    "uot_beta_neural": (
+                        None
+                        if selected_joint_config.get("uot_beta_neural") is None
+                        else _as_float(selected_joint_config.get("uot_beta_neural"))
+                    ),
+                    "lambda": _as_float(selected_joint_config.get("lambda"), default=1.0),
+                    "runtime_seconds": float(shared_runtime_seconds),
+                    "payload_path": str(stage_a_payload_path),
+                    "shared_joint_coupling": True,
+                }
+                for target_var in TARGET_VARS
+                if entries_by_var.get(str(target_var))
+            }
+            return downstream_by_var, selected_records, float(shared_runtime_seconds)
 
     runtime_records: list[dict[str, object]] = []
     for compare_path_str in stage_a_payload.get("ot_output_paths", []):
@@ -429,7 +486,7 @@ def _stage_a_selected_plan_runtime(
         downstream_by_var[target_var] = _as_float(selected.get("runtime_seconds")) if selected else 0.0
         if selected is not None:
             selected_records[target_var] = dict(selected)
-    return downstream_by_var, selected_records
+    return downstream_by_var, selected_records, None
 
 
 def _iter_run_payloads(path: Path) -> list[dict[str, object]]:
@@ -508,7 +565,7 @@ def build_paper_runtime_summary(
     pca_stage_b_by_layer = _runtime_by_layer_from_rankings(pca_rankings)
 
     stage_a_entries = {var: _stage_a_display_entry(stage_a_rankings, var) for var in TARGET_VARS}
-    stage_a_selected_runtime_by_var, stage_a_selected_runtime_records = _stage_a_selected_plan_runtime(
+    stage_a_selected_runtime_by_var, stage_a_selected_runtime_records, stage_a_selected_shared_runtime = _stage_a_selected_plan_runtime(
         sweep_root=sweep_root,
         rankings=stage_a_rankings,
         entries_by_var=stage_a_entries,
@@ -520,11 +577,15 @@ def build_paper_runtime_summary(
             stage_a_seconds=0.0,
             downstream_by_var=stage_a_selected_runtime_by_var,
             entries_by_var=stage_a_entries,
-            notes="Reported runtime charges only the selected Stage A coupling plan per variable (one epsilon/beta configuration), not the full Stage A sweep over coupling hyperparameters.",
+            serial_downstream_seconds=stage_a_selected_shared_runtime,
+            parallel_downstream_seconds=stage_a_selected_shared_runtime,
+            notes="Reported runtime charges only the selected Stage A shared coupling plan, including signature formation and argmax-layer evaluation, not the full Stage A sweep over coupling hyperparameters.",
         )
     )
     if stage_a_selected_runtime_records:
         records[-1]["selected_stage_a_plan_runtime_records_by_var"] = stage_a_selected_runtime_records
+    if stage_a_selected_shared_runtime is not None:
+        records[-1]["selected_stage_a_shared_runtime_seconds"] = float(stage_a_selected_shared_runtime)
 
     native_entries = {var: _first_entry(native_rankings, var) for var in TARGET_VARS}
     native_downstream, native_parallel_by_var, native_runtime_by_layer_by_var = _native_selected_width_epsilon_runtime(
