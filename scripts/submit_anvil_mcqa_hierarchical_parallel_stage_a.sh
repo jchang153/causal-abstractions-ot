@@ -18,6 +18,9 @@ echo "[submit-anvil-hpar-a] stage_a_token_position_ids=${STAGE_A_TOKEN_POSITION_
 echo "[submit-anvil-hpar-a] stage_a_method=${STAGE_A_METHOD:-uot}"
 echo "[submit-anvil-hpar-a] stage_a_hparam_selection=${STAGE_A_HPARAM_SELECTION:-rowwise}"
 echo "[submit-anvil-hpar-a] stage_a_rerank_top_k=${STAGE_A_RERANK_TOP_K:-0}"
+echo "[submit-anvil-hpar-a] stage_a_rerank_drop_ratio=${STAGE_A_RERANK_DROP_RATIO:-0}"
+echo "[submit-anvil-hpar-a] stage_a_rerank_min_k=${STAGE_A_RERANK_MIN_K:-6}"
+echo "[submit-anvil-hpar-a] stage_a_rerank_max_k=${STAGE_A_RERANK_MAX_K:-8}"
 echo "[submit-anvil-hpar-a] uot_beta_neurals=${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
 echo "[submit-anvil-hpar-a] split_seed=${SPLIT_SEED}"
 

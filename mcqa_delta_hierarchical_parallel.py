@@ -324,6 +324,84 @@ def _stage_a_candidate_layers_by_var(
     return candidates
 
 
+def _stage_a_entry_mass(entry: dict[str, object]) -> float:
+    return float(entry.get("layer_score", entry.get("target_mass", entry.get("selection_score", 0.0))))
+
+
+def _stage_a_adaptive_candidate_count(
+    entries: list[dict[str, object]],
+    *,
+    min_k: int,
+    max_k: int,
+    drop_ratio: float,
+) -> int:
+    if not entries:
+        return 0
+    min_count = min(len(entries), max(1, int(min_k)))
+    max_count = min(len(entries), max(min_count, int(max_k)))
+    ratio = float(drop_ratio)
+    if ratio <= 0.0:
+        return max_count
+
+    for index in range(min_count - 1, max_count - 1):
+        current_mass = _stage_a_entry_mass(entries[index])
+        next_mass = _stage_a_entry_mass(entries[index + 1])
+        if current_mass > 0.0 and next_mass / current_mass < ratio:
+            return index + 1
+    return max_count
+
+
+def _stage_a_adaptive_candidate_layers_by_var(
+    rankings: dict[str, list[dict[str, object]]],
+    *,
+    min_k: int,
+    max_k: int,
+    drop_ratio: float,
+) -> dict[str, tuple[int, ...]]:
+    candidates: dict[str, tuple[int, ...]] = {}
+    for target_var in DEFAULT_TARGET_VARS:
+        entries = [entry for entry in rankings.get(target_var, []) if entry.get("layer") is not None]
+        count = _stage_a_adaptive_candidate_count(
+            entries,
+            min_k=int(min_k),
+            max_k=int(max_k),
+            drop_ratio=float(drop_ratio),
+        )
+        candidates[target_var] = tuple(dict.fromkeys(int(entry["layer"]) for entry in entries[:count]))
+    return candidates
+
+
+def _stage_a_rerank_policy(normalized: dict[str, object]) -> dict[str, object]:
+    fixed_top_k = int(normalized.get("stage_a_rerank_top_k", 0) or 0)
+    if fixed_top_k > 0:
+        return {
+            "enabled": True,
+            "mode": "top_k",
+            "label": f"top{fixed_top_k}",
+            "top_k": fixed_top_k,
+            "min_k": fixed_top_k,
+            "max_k": fixed_top_k,
+            "drop_ratio": 0.0,
+        }
+
+    drop_ratio = float(normalized.get("stage_a_rerank_drop_ratio", 0.0) or 0.0)
+    if drop_ratio <= 0.0:
+        return {"enabled": False, "mode": "disabled", "label": "none"}
+
+    min_k = max(1, int(normalized.get("stage_a_rerank_min_k", 6) or 6))
+    max_k = max(min_k, int(normalized.get("stage_a_rerank_max_k", 8) or 8))
+    ratio_label = f"{drop_ratio:g}".replace(".", "p")
+    return {
+        "enabled": True,
+        "mode": "adaptive_drop",
+        "label": f"drop{ratio_label}_min{min_k}_max{max_k}",
+        "top_k": 0,
+        "min_k": min_k,
+        "max_k": max_k,
+        "drop_ratio": drop_ratio,
+    }
+
+
 def _build_stage_a_rerank_command(
     *,
     args: argparse.Namespace,
@@ -395,7 +473,7 @@ def _merge_stage_a_rerank_rankings(
     proposal_rankings: dict[str, list[dict[str, object]]],
     calibration_rankings: dict[str, list[dict[str, object]]],
     candidates_by_var: dict[str, tuple[int, ...]],
-    top_k: int,
+    selection_label: str,
 ) -> dict[str, list[dict[str, object]]]:
     merged: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     for target_var in DEFAULT_TARGET_VARS:
@@ -415,7 +493,7 @@ def _merge_stage_a_rerank_rankings(
                 continue
             proposal_rank, proposal = proposal_by_layer.get(layer, (None, {}))
             row = dict(entry)
-            row["selection_basis"] = f"top{int(top_k)}_transport_candidates_full_layer_calibration"
+            row["selection_basis"] = f"{selection_label}_transport_candidates_full_layer_calibration"
             row["proposal_rank"] = proposal_rank
             row["proposal_layer_score"] = proposal.get("layer_score", proposal.get("target_mass", proposal.get("selection_score")))
             row["proposal_method"] = proposal.get("method")
@@ -476,8 +554,10 @@ def run_stage_a(args: argparse.Namespace) -> None:
             hparam_selection=str(normalized.get("stage_a_hparam_selection", "rowwise")),
         )
         rerank_runtime_seconds = None
-        rerank_top_k = int(normalized.get("stage_a_rerank_top_k", 0) or 0)
-        if rerank_top_k > 0:
+        rerank_policy = _stage_a_rerank_policy(normalized)
+        rerank_top_k = int(rerank_policy.get("top_k", 0) or 0)
+        candidates_by_var: dict[str, tuple[int, ...]] = {}
+        if bool(rerank_policy.get("enabled", False)):
             proposal_rankings = rankings
             proposal_json_path = ranking_json_path.with_name(
                 f"{ranking_json_path.stem}_transport_proposal{ranking_json_path.suffix}"
@@ -490,7 +570,15 @@ def run_stage_a(args: argparse.Namespace) -> None:
                 proposal_txt_path,
                 _format_stage_a_summary(token_position_id=str(token_position_id), rankings=proposal_rankings),
             )
-            candidates_by_var = _stage_a_candidate_layers_by_var(proposal_rankings, top_k=rerank_top_k)
+            if str(rerank_policy.get("mode")) == "top_k":
+                candidates_by_var = _stage_a_candidate_layers_by_var(proposal_rankings, top_k=rerank_top_k)
+            else:
+                candidates_by_var = _stage_a_adaptive_candidate_layers_by_var(
+                    proposal_rankings,
+                    min_k=int(rerank_policy.get("min_k", 6)),
+                    max_k=int(rerank_policy.get("max_k", 8)),
+                    drop_ratio=float(rerank_policy.get("drop_ratio", 0.0)),
+                )
             rerank_layers = tuple(
                 sorted(
                     {
@@ -501,9 +589,10 @@ def run_stage_a(args: argparse.Namespace) -> None:
                 )
             )
             if rerank_layers:
+                rerank_label = str(rerank_policy.get("label", "rerank"))
                 rerank_timestamp = (
                     f"{str(normalized['results_timestamp'])}_stageA_{str(token_position_id)}"
-                    f"_top{int(rerank_top_k)}_full_layer_rerank"
+                    f"_{rerank_label}_full_layer_rerank"
                 )
                 rerank_output = _stage_a_rerank_output_path(
                     results_root=args.results_root,
@@ -519,7 +608,8 @@ def run_stage_a(args: argparse.Namespace) -> None:
                     )
                     print(
                         "[parallel-stage-a-rerank] running "
-                        f"top_k={rerank_top_k} layers={list(rerank_layers)} "
+                        f"policy={rerank_policy} candidates_by_var={candidates_by_var} "
+                        f"layers={list(rerank_layers)} "
                         f"command={' '.join(rerank_command)}"
                     )
                     rerank_start = perf_counter()
@@ -532,7 +622,7 @@ def run_stage_a(args: argparse.Namespace) -> None:
                     proposal_rankings=proposal_rankings,
                     calibration_rankings=calibration_rankings,
                     candidates_by_var=candidates_by_var,
-                    top_k=rerank_top_k,
+                    selection_label=str(rerank_policy.get("label", "rerank")),
                 )
                 if stage_runtime_seconds is not None and rerank_runtime_seconds is not None:
                     stage_runtime_seconds = float(stage_runtime_seconds) + float(rerank_runtime_seconds)
@@ -554,6 +644,11 @@ def run_stage_a(args: argparse.Namespace) -> None:
             "completed_at": datetime.now().isoformat(),
             "runtime_seconds": stage_runtime_seconds,
             "stage_a_rerank_top_k": int(rerank_top_k),
+            "stage_a_rerank_policy": rerank_policy,
+            "stage_a_rerank_candidate_layers_by_var": {
+                str(target_var): list(layers)
+                for target_var, layers in candidates_by_var.items()
+            },
             "stage_a_rerank_runtime_seconds": rerank_runtime_seconds,
             **runtime_accounting,
         }
@@ -564,6 +659,9 @@ def run_stage_a(args: argparse.Namespace) -> None:
         f"stage_a_method: {normalized.get('stage_a_method')}",
         f"stage_a_hparam_selection: {normalized.get('stage_a_hparam_selection')}",
         f"stage_a_rerank_top_k: {normalized.get('stage_a_rerank_top_k', 0)}",
+        f"stage_a_rerank_drop_ratio: {normalized.get('stage_a_rerank_drop_ratio', 0.0)}",
+        f"stage_a_rerank_min_k: {normalized.get('stage_a_rerank_min_k', 6)}",
+        f"stage_a_rerank_max_k: {normalized.get('stage_a_rerank_max_k', 8)}",
         f"stage_a_hparam_grid_size: {_stage_a_hparam_grid_size(normalized)}",
         "",
     ]
@@ -587,6 +685,10 @@ def run_stage_a(args: argparse.Namespace) -> None:
             "stage_a_method": str(normalized.get("stage_a_method", "ot")),
             "stage_a_hparam_selection": str(normalized.get("stage_a_hparam_selection", "rowwise")),
             "stage_a_hparam_grid_size": _stage_a_hparam_grid_size(normalized),
+            "stage_a_rerank_top_k": int(normalized.get("stage_a_rerank_top_k", 0) or 0),
+            "stage_a_rerank_drop_ratio": float(normalized.get("stage_a_rerank_drop_ratio", 0.0) or 0.0),
+            "stage_a_rerank_min_k": int(normalized.get("stage_a_rerank_min_k", 6) or 6),
+            "stage_a_rerank_max_k": int(normalized.get("stage_a_rerank_max_k", 8) or 8),
             "stage_statuses": stage_statuses,
             "updated_at": datetime.now().isoformat(),
         },

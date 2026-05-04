@@ -27,16 +27,23 @@ def _seed_from_name(name: str) -> int | None:
     return None if match is None else int(match.group(1))
 
 
-def _runtime_from_manifest(root: Path) -> tuple[float, float, str]:
+def _manifest_from_root(root: Path) -> dict[str, object] | None:
     manifest_path = root / "parallel_manifest.json"
     if not manifest_path.exists():
-        return 0.0, 0.0, "missing"
+        return None
     payload = _load_json(manifest_path)
     if not isinstance(payload, dict):
-        return 0.0, 0.0, "malformed"
+        return None
+    return payload
+
+
+def _runtime_from_manifest(root: Path) -> tuple[float, float, str]:
+    payload = _manifest_from_root(root)
+    if payload is None:
+        return 0.0, 0.0, "missing"
     statuses = payload.get("stage_statuses")
     if not isinstance(statuses, dict):
-        return 0.0, 0.0, "missing_status"
+        return 0.0, 0.0, "malformed"
     for status in statuses.values():
         if not isinstance(status, dict):
             continue
@@ -45,6 +52,15 @@ def _runtime_from_manifest(root: Path) -> tuple[float, float, str]:
         paper_runtime = diagnostic if paper is None else _as_float(paper)
         return paper_runtime, diagnostic, str(status.get("stage_a_runtime_policy", "unknown"))
     return 0.0, 0.0, "missing_status"
+
+
+def _mode_from_root(root: Path) -> str:
+    payload = _manifest_from_root(root)
+    if payload is not None:
+        selection = str(payload.get("stage_a_hparam_selection", ""))
+        if selection in {"rowwise", "joint"}:
+            return selection
+    return "rowwise" if "rowwise" in root.name else "joint"
 
 
 def _top_entry(rankings: dict[str, object], target_var: str) -> dict[str, object]:
@@ -64,7 +80,7 @@ def _record_from_root(root: Path) -> dict[str, object] | None:
     rankings = _load_json(rankings_path)
     if not isinstance(rankings, dict):
         return None
-    mode = "rowwise" if "rowwise" in root.name else "joint"
+    mode = _mode_from_root(root)
     paper_runtime, diagnostic_runtime, runtime_policy = _runtime_from_manifest(root)
     top = {var: _top_entry(rankings, var) for var in TARGET_VARS}
     cal_scores = [_as_float(top[var].get("handle_calibration_score", top[var].get("selection_score"))) for var in TARGET_VARS]

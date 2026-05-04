@@ -353,6 +353,27 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--stage-a-rerank-drop-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "If positive and --stage-a-rerank-top-k is unset, adaptively rerank transport candidates until "
+            "the next mass/current mass ratio drops below this threshold."
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-rerank-min-k",
+        type=int,
+        default=6,
+        help="Minimum per-variable candidate layers for adaptive Stage A reranking.",
+    )
+    parser.add_argument(
+        "--stage-a-rerank-max-k",
+        type=int,
+        default=8,
+        help="Maximum per-variable candidate layers for adaptive Stage A reranking.",
+    )
+    parser.add_argument(
         "--stage-a-hparam-selection",
         default=DEFAULT_STAGE_A_HPARAM_SELECTION,
         choices=("rowwise", "joint"),
@@ -477,6 +498,9 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "stage_a_method": ",".join(str(method) for method in stage_a_methods),
         "stage_a_methods": tuple(str(method) for method in stage_a_methods),
         "stage_a_rerank_top_k": max(0, int(getattr(args, "stage_a_rerank_top_k", 0))),
+        "stage_a_rerank_drop_ratio": max(0.0, float(getattr(args, "stage_a_rerank_drop_ratio", 0.0))),
+        "stage_a_rerank_min_k": max(1, int(getattr(args, "stage_a_rerank_min_k", 6))),
+        "stage_a_rerank_max_k": max(1, int(getattr(args, "stage_a_rerank_max_k", 8))),
         "stage_a_hparam_selection": str(getattr(args, "stage_a_hparam_selection", DEFAULT_STAGE_A_HPARAM_SELECTION)),
         "stage_b_methods": tuple(str(method) for method in stage_b_methods),
         "stage_b_selection_methods": tuple(str(method) for method in stage_b_selection_methods),
