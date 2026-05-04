@@ -80,6 +80,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
     parser.add_argument("--ot-epsilons", help="Comma-separated UOT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--uot-beta-neurals", help="Comma-separated UOT beta_neural values. Default: 0.1,0.3,1,3")
+    parser.add_argument(
+        "--calibration-family-weights",
+        help="Comma-separated family weights in answerPosition,randomLetter,answerPosition_randomLetter order. Default: 1,1,1",
+    )
     parser.add_argument("--support-score-slack", type=float, default=0.05)
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument("--results-root", default="results")
@@ -174,6 +178,7 @@ def _build_transport_only_compare_payload(
     epsilon: float,
     beta_neural: float,
     signature_mode: str,
+    calibration_family_weights: tuple[float, ...],
 ) -> dict[str, object]:
     solve_start = perf_counter()
     config = OTConfig(
@@ -185,7 +190,7 @@ def _build_transport_only_compare_payload(
         selection_verbose=True,
         source_target_vars=target_vars,
         calibration_metric=DEFAULT_CALIBRATION_METRIC,
-        calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
+        calibration_family_weights=tuple(float(weight) for weight in calibration_family_weights),
     )
     transport, transport_meta = solve_uot_transport(
         variable_signatures_by_var,
@@ -233,6 +238,25 @@ def _sanitize_stage_a_eval_result(record: dict[str, object]) -> dict[str, object
     return cleaned
 
 
+def _stage_a_calibration_score(
+    *,
+    result: dict[str, object],
+    calibration_family_weights: tuple[float, ...],
+) -> float:
+    exact_acc = float(result.get("exact_acc", 0.0))
+    family_exact_accs = result.get("family_exact_accs", {})
+    if not isinstance(family_exact_accs, dict):
+        return exact_acc
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for family_name, weight in zip(DEFAULT_COUNTERFACTUAL_NAMES, calibration_family_weights):
+        if family_name not in family_exact_accs:
+            continue
+        weighted_sum += float(weight) * float(family_exact_accs[family_name])
+        total_weight += float(weight)
+    return exact_acc if total_weight <= 0.0 else float(weighted_sum / total_weight)
+
+
 def _evaluate_fixed_single_layer(
     *,
     model,
@@ -243,6 +267,7 @@ def _evaluate_fixed_single_layer(
     site_index: int,
     device,
     batch_size: int,
+    calibration_family_weights: tuple[float, ...],
 ) -> dict[str, object]:
     calibration_result, calibration_ranking = _evaluate_single_site_intervention(
         model=model,
@@ -268,14 +293,19 @@ def _evaluate_fixed_single_layer(
     )
     calibration_result = _sanitize_stage_a_eval_result(calibration_result)
     holdout_result = _sanitize_stage_a_eval_result(holdout_result)
+    calibration_score = _stage_a_calibration_score(
+        result=calibration_result,
+        calibration_family_weights=calibration_family_weights,
+    )
     holdout_result["method"] = "single_layer_full_swap"
-    holdout_result["selection_score"] = float(calibration_result.get("exact_acc", 0.0))
+    holdout_result["selection_score"] = float(calibration_score)
     holdout_result["selection_exact_acc"] = float(calibration_result.get("exact_acc", 0.0))
     holdout_result["calibration_exact_acc"] = float(calibration_result.get("exact_acc", 0.0))
     return {
         "target_var": str(holdout_bank.target_var),
         "selected_site_label": str(site.label),
         "selected_layer": int(site.layer),
+        "calibration_score": float(calibration_score),
         "selected_calibration_result": calibration_result,
         "selected_calibration_ranking": calibration_ranking,
         "ranking": holdout_ranking,
@@ -293,6 +323,7 @@ def _evaluate_stage_a_config(
     device,
     batch_size: int,
     signature_mode: str,
+    calibration_family_weights: tuple[float, ...],
 ) -> dict[str, object]:
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
     epsilon = float(compare_payload.get("ot_epsilon", 0.0))
@@ -318,6 +349,7 @@ def _evaluate_stage_a_config(
                 site_index=int(top_site_index),
                 device=device,
                 batch_size=int(batch_size),
+                calibration_family_weights=calibration_family_weights,
             )
             result = direct_eval_payload.get("results", [{}])[0]
             calibration_result = direct_eval_payload.get("selected_calibration_result", result)
@@ -385,6 +417,7 @@ def _select_layer_method_by_var(
     device,
     batch_size: int,
     signature_mode: str,
+    calibration_family_weights: tuple[float, ...],
 ) -> dict[str, dict[str, object]]:
     best_config: dict[str, object] | None = None
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
@@ -398,6 +431,7 @@ def _select_layer_method_by_var(
             device=device,
             batch_size=batch_size,
             signature_mode=signature_mode,
+            calibration_family_weights=calibration_family_weights,
         )
         epsilon = float(candidate_config.get("epsilon", 0.0))
         beta_neural = candidate_config.get("uot_beta_neural")
@@ -556,6 +590,9 @@ def main() -> None:
 
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
     uot_beta_neurals = tuple(_parse_csv_floats(args.uot_beta_neurals) or list(DEFAULT_UOT_BETA_NEURALS))
+    calibration_family_weights = tuple(
+        _parse_csv_floats(args.calibration_family_weights) or list(DEFAULT_CALIBRATION_FAMILY_WEIGHTS)
+    )
     train_banks = {target_var: banks_by_split["train"][target_var] for target_var in target_vars}
     cache_spec = base_run._signature_cache_spec(
         train_bank=train_banks[target_vars[0]],
@@ -590,7 +627,7 @@ def main() -> None:
                 signature_mode=str(args.signature_mode),
                 source_target_vars=target_vars,
                 calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
+                calibration_family_weights=calibration_family_weights,
             ),
         )
         artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
@@ -652,6 +689,7 @@ def main() -> None:
                     epsilon=float(epsilon),
                     beta_neural=float(beta_neural),
                     signature_mode=str(args.signature_mode),
+                    calibration_family_weights=calibration_family_weights,
                 )
                 write_json(output_path, compare_payload)
                 write_text_report(
@@ -685,6 +723,7 @@ def main() -> None:
         device=device,
         batch_size=int(args.batch_size),
         signature_mode=str(args.signature_mode),
+        calibration_family_weights=calibration_family_weights,
     )
     support_start = perf_counter()
     print("[stageA] extracting UOT support diagnostics")
@@ -723,6 +762,8 @@ def main() -> None:
             "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
             "uot_beta_neurals": [float(beta_neural) for beta_neural in uot_beta_neurals],
             "support_score_slack": float(args.support_score_slack),
+            "calibration_metric": DEFAULT_CALIBRATION_METRIC,
+            "calibration_family_weights": [float(weight) for weight in calibration_family_weights],
             "site_labels": [site.label for site in sites],
             "support_path": str(support_path),
             "support_by_var": support_by_var,
