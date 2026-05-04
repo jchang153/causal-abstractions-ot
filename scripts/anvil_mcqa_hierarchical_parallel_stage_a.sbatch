@@ -51,16 +51,18 @@ export OT_LAMBDAS="${OT_LAMBDAS:-0.5,1,2,4}"
 export CALIBRATION_METRIC="${CALIBRATION_METRIC:-family_weighted_macro_exact_acc}"
 export CALIBRATION_FAMILY_WEIGHTS="${CALIBRATION_FAMILY_WEIGHTS:-1,1.5,2}"
 export SPLIT_SEED="${SPLIT_SEED:-0}"
+export BATCH_SIZE="${BATCH_SIZE:-64}"
 
 mkdir -p "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}"
 
 echo "[anvil-mcqa-hpar-stage-a] host=$(hostname) token_positions=${STAGE_A_TOKEN_POSITION_IDS} timestamp=${RESULTS_TIMESTAMP} split_seed=${SPLIT_SEED}"
-echo "[anvil-mcqa-hpar-stage-a] stage_a_method=${STAGE_A_METHOD} stage_a_hparam_selection=${STAGE_A_HPARAM_SELECTION} stage_a_rerank_top_k=${STAGE_A_RERANK_TOP_K} stage_a_rerank_drop_ratio=${STAGE_A_RERANK_DROP_RATIO} stage_a_rerank_min_k=${STAGE_A_RERANK_MIN_K} stage_a_rerank_max_k=${STAGE_A_RERANK_MAX_K} uot_beta_neurals=${UOT_BETA_NEURALS}"
+echo "[anvil-mcqa-hpar-stage-a] stage_a_method=${STAGE_A_METHOD} stage_a_hparam_selection=${STAGE_A_HPARAM_SELECTION} stage_a_rerank_top_k=${STAGE_A_RERANK_TOP_K} stage_a_rerank_drop_ratio=${STAGE_A_RERANK_DROP_RATIO} stage_a_rerank_min_k=${STAGE_A_RERANK_MIN_K} stage_a_rerank_max_k=${STAGE_A_RERANK_MAX_K} uot_beta_neurals=${UOT_BETA_NEURALS} batch_size=${BATCH_SIZE}"
 nvidia-smi
 
 ARGS=(
   --device cuda
   --dataset-path jchang153/copycolors_mcqa
+  --batch-size "${BATCH_SIZE}"
   --results-root "${RESULTS_ROOT}"
   --results-timestamp "${RESULTS_TIMESTAMP}"
   --signatures-dir signatures
