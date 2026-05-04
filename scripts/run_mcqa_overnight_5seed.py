@@ -100,6 +100,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--full-das-max-epochs", type=int, default=100)
     parser.add_argument("--full-das-min-epochs", type=int, default=5)
+    parser.add_argument("--full-das-restarts", type=int, default=2)
     parser.add_argument("--prompt-hf-login", action="store_true")
     return parser
 
@@ -286,6 +287,8 @@ def main() -> None:
             str(int(args.full_das_max_epochs)),
             "--das-min-epochs",
             str(int(args.full_das_min_epochs)),
+            "--das-restarts",
+            str(max(1, int(args.full_das_restarts))),
             "--das-subspace-dims",
             ",".join(str(dim) for dim in regular_das_subspace_dims),
             "--results-root",
