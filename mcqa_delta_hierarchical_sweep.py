@@ -301,6 +301,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
     parser.add_argument("--ot-epsilons", default="0.5,1,2,4")
     parser.add_argument("--stage-a-uot-beta-neurals", default="0.1,0.3,1,3")
+    parser.add_argument("--stage-a-row-top-k", type=int, default=6)
     parser.add_argument(
         "--stage-a-ot-lambdas",
         default=None,
@@ -396,6 +397,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "native_resolutions": tuple(int(resolution) for resolution in native_resolutions),
         "ot_epsilons": tuple(float(epsilon) for epsilon in ot_epsilons),
         "stage_a_uot_beta_neurals": tuple(float(beta) for beta in stage_a_uot_beta_neurals),
+        "stage_a_row_top_k": max(1, int(args.stage_a_row_top_k)),
         "stage_a_ot_lambdas": tuple(float(value) for value in stage_a_ot_lambdas),
         "ot_top_k_values": tuple(int(value) for value in ot_top_k_values),
         "ot_lambdas": tuple(float(value) for value in ot_lambdas),
@@ -447,6 +449,8 @@ def _build_stage_a_command(
             str(beta).rstrip("0").rstrip(".") if "." in str(beta) else str(beta)
             for beta in normalized["stage_a_uot_beta_neurals"]
         ),
+        "--stage-a-row-top-k",
+        str(int(normalized["stage_a_row_top_k"])),
         "--ot-lambdas",
         ",".join(
             str(value).rstrip("0").rstrip(".") if "." in str(value) else str(value)
@@ -1599,6 +1603,7 @@ def _write_status(
             "stage_a_token_position_ids": list(normalized["stage_a_token_position_ids"]),
             "stage_a_layer_indices": list(normalized["stage_a_layer_indices"]),
             "stage_a_uot_beta_neurals": list(normalized["stage_a_uot_beta_neurals"]),
+            "stage_a_row_top_k": int(normalized["stage_a_row_top_k"]),
             "stage_a_ot_lambdas": list(normalized["stage_a_ot_lambdas"]),
             "stage_b_top_layers_per_var": int(args.stage_b_top_layers_per_var),
             "stage_b_neighbor_radius": int(args.stage_b_neighbor_radius),

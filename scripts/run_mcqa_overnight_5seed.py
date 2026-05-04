@@ -72,6 +72,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-a-token-position-ids", default="last_token")
     parser.add_argument("--ot-epsilons", default="0.5,1,2")
     parser.add_argument("--stage-a-uot-beta-neurals", default="0.03,0.3,1")
+    parser.add_argument("--stage-a-row-top-k", type=int, default=6)
     parser.add_argument("--stage-a-ot-lambdas", default="0.5,1,2")
     parser.add_argument("--ot-top-k-values", default="1,2,4")
     parser.add_argument(
@@ -132,6 +133,7 @@ def main() -> None:
         "stage_a_grid": {
             "ot_epsilons": str(args.ot_epsilons),
             "uot_beta_neurals": str(args.stage_a_uot_beta_neurals),
+            "row_top_k": int(args.stage_a_row_top_k),
             "ot_lambdas": str(args.stage_a_ot_lambdas),
         },
         "downstream_ot_grid": {
@@ -194,6 +196,8 @@ def main() -> None:
             str(args.ot_epsilons),
             "--stage-a-uot-beta-neurals",
             str(args.stage_a_uot_beta_neurals),
+            "--stage-a-row-top-k",
+            str(int(args.stage_a_row_top_k)),
             "--stage-a-ot-lambdas",
             str(args.stage_a_ot_lambdas),
             "--ot-top-k-values",
