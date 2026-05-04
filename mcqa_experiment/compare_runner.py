@@ -24,6 +24,7 @@ class CompareExperimentConfig:
     summary_path: Path
     methods: tuple[str, ...] = ("ot",)
     target_vars: tuple[str, ...] = ("answer_pointer", "answer_token")
+    ot_source_target_vars: tuple[str, ...] | None = None
     batch_size: int = 16
     ot_epsilon: float = 1.0
     uot_beta_neural: float = 1.0
@@ -59,6 +60,14 @@ def run_comparison(
     prepared_ot_artifacts: dict[str, object] | None = None,
 ) -> dict[str, object]:
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in config.target_vars)
+    source_target_vars = tuple(
+        canonicalize_target_var(target_var)
+        for target_var in (
+            config.ot_source_target_vars
+            if config.ot_source_target_vars is not None
+            else config.target_vars
+        )
+    )
     token_position_ids = tuple(token_position.id for token_position in token_positions)
     ot_sites = enumerate_residual_sites(
         num_layers=int(model.config.num_hidden_layers),
@@ -83,7 +92,6 @@ def run_comparison(
         prepared_artifacts = None
         ot_config = None
         if method in {"ot", "uot"} and target_vars:
-            source_target_vars = target_vars
             ot_config = OTConfig(
                 method=method,
                 batch_size=config.batch_size,
@@ -123,6 +131,7 @@ def run_comparison(
                     signature_mode=config.signature_mode,
                     top_k_values=config.ot_top_k_values,
                     lambda_values=config.ot_lambdas,
+                    source_target_vars=source_target_vars,
                     calibration_metric=config.calibration_metric,
                     calibration_family_weights=config.calibration_family_weights,
                     top_k_values_by_var=config.ot_top_k_values_by_var,
@@ -148,7 +157,7 @@ def run_comparison(
                     signature_mode=config.signature_mode,
                     top_k_values=config.ot_top_k_values,
                     lambda_values=config.ot_lambdas,
-                    source_target_vars=target_vars,
+                    source_target_vars=source_target_vars,
                     calibration_metric=config.calibration_metric,
                     calibration_family_weights=config.calibration_family_weights,
                     top_k_values_by_var=config.ot_top_k_values_by_var,
@@ -216,6 +225,7 @@ def run_comparison(
         "model_name": config.model_name,
         "methods": list(config.methods),
         "target_vars": list(target_vars),
+        "ot_source_target_vars": list(source_target_vars),
         "signature_mode": config.signature_mode,
         "ot_epsilon": float(config.ot_epsilon),
         "uot_beta_neural": float(config.uot_beta_neural),

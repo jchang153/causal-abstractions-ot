@@ -84,6 +84,32 @@ def _parse_csv_floats(value: str | None) -> list[float] | None:
     return [float(item) for item in items]
 
 
+def _parse_layer_target_vars(value: str | None) -> dict[int, tuple[str, ...]]:
+    if value is None or str(value).strip() == "":
+        return {}
+    resolved: dict[int, tuple[str, ...]] = {}
+    for entry in str(value).split(";"):
+        item = str(entry).strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                "--layer-target-vars entries must look like "
+                "'17:answer_pointer;23:answer_token|answer_pointer'"
+            )
+        layer_text, vars_text = item.split(":", 1)
+        layer = int(layer_text)
+        target_vars = tuple(
+            canonicalize_target_var(target_var)
+            for target_var in str(vars_text).split("|")
+            if str(target_var).strip()
+        )
+        if not target_vars:
+            raise ValueError(f"--layer-target-vars must provide at least one target var for layer {layer}")
+        resolved[int(layer)] = tuple(dict.fromkeys(target_vars))
+    return resolved
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fixed-layer PCA-site OT focus runner for MCQA.")
     parser.add_argument("--device", default="cuda")
@@ -96,7 +122,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-pool-size", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layers", help="Comma-separated focused layers. Default: 20,25")
+    parser.add_argument(
+        "--layer-target-vars",
+        default=None,
+        help=(
+            "Optional per-layer calibration target vars like "
+            "'17:answer_pointer;23:answer_token|answer_pointer'. "
+            "OT couplings are still formed with both abstract variables."
+        ),
+    )
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
+    parser.add_argument("--target-vars", default="answer_pointer,answer_token")
     parser.add_argument("--site-menu", default=DEFAULT_SITE_MENU, choices=("partition", "mixed"))
     parser.add_argument("--num-bands", type=int, default=DEFAULT_NUM_BANDS)
     parser.add_argument("--band-scheme", default=DEFAULT_BAND_SCHEME, choices=("equal", "head"))
@@ -170,6 +206,29 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _compare_payload_matches_target_vars(
+    *,
+    payload: dict[str, object] | None,
+    expected_target_vars: tuple[str, ...],
+    expected_transport_target_vars: tuple[str, ...],
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    actual_target_vars = payload.get("target_vars")
+    if not isinstance(actual_target_vars, list):
+        return False
+    if tuple(str(target_var) for target_var in actual_target_vars) != tuple(
+        str(target_var) for target_var in expected_target_vars
+    ):
+        return False
+    actual_transport_target_vars = payload.get("transport_target_vars")
+    if not isinstance(actual_transport_target_vars, list):
+        return False
+    return tuple(str(target_var) for target_var in actual_transport_target_vars) == tuple(
+        str(target_var) for target_var in expected_transport_target_vars
+    )
 
 
 def _load_existing_runs(path: Path) -> list[dict[str, object]]:
@@ -609,6 +668,8 @@ def _format_layer_summary(
     num_bands: int,
     band_scheme: str,
     top_prefix_sizes: tuple[int, ...],
+    target_vars: tuple[str, ...],
+    transport_target_vars: tuple[str, ...],
     basis: LayerPCABasis,
     site_metrics: list[dict[str, object]],
     ot_compare_payloads: list[dict[str, object]],
@@ -621,6 +682,8 @@ def _format_layer_summary(
         f"layer: {int(layer)}",
         f"token_position: {token_position_id}",
         f"signature_mode: {signature_mode}",
+        f"target_vars: {list(str(target_var) for target_var in target_vars)}",
+        f"transport_target_vars: {list(str(target_var) for target_var in transport_target_vars)}",
         f"basis_source_mode: {basis_source_mode}",
         f"site_menu: {site_menu}",
         f"num_bands: {int(num_bands)}",
@@ -647,7 +710,7 @@ def _format_layer_summary(
         )
     lines.append("")
     lines.append("pooled PCA support:")
-    for target_var in DEFAULT_TARGET_VARS:
+    for target_var in target_vars:
         summary = support_by_var.get(str(target_var), {})
         if not summary:
             continue
@@ -659,7 +722,7 @@ def _format_layer_summary(
     if screen_payloads:
         lines.append("")
         lines.append("tiny PCA-span DAS screen:")
-        for target_var in DEFAULT_TARGET_VARS:
+        for target_var in target_vars:
             payload = screen_payloads.get(str(target_var))
             if payload is None:
                 continue
@@ -672,7 +735,7 @@ def _format_layer_summary(
     if guided_payloads:
         lines.append("")
         lines.append("guided PCA-span DAS sweep:")
-        for target_var in DEFAULT_TARGET_VARS:
+        for target_var in target_vars:
             payload = guided_payloads.get(str(target_var))
             if payload is None:
                 continue
@@ -719,6 +782,11 @@ def main() -> None:
         raise ValueError("No layers selected")
     if int(args.num_bands) <= 0:
         raise ValueError("num_bands must be > 0")
+    requested_target_vars = tuple(
+        canonicalize_target_var(target_var)
+        for target_var in (_parse_csv_strings(args.target_vars) or list(DEFAULT_TARGET_VARS))
+    )
+    layer_target_vars = _parse_layer_target_vars(args.layer_target_vars)
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
     ot_top_k_values = tuple(_parse_csv_ints(args.ot_top_k_values) or list(DEFAULT_OT_TOP_K_VALUES))
     ot_lambdas = tuple(_parse_csv_floats(args.ot_lambdas) or list(DEFAULT_OT_LAMBDAS))
@@ -745,8 +813,8 @@ def main() -> None:
     banks_by_split = context["banks_by_split"]
     data_metadata = context["data_metadata"]
     device = context["device"]
-    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
-    fit_bank_for_basis = banks_by_split["train"][target_vars[0]]
+    transport_target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
+    fit_bank_for_basis = banks_by_split["train"][transport_target_vars[0]]
     token_position_by_id = {
         str(token_position.id): token_position
         for token_position in token_positions
@@ -765,6 +833,7 @@ def main() -> None:
     )
 
     for layer in layers:
+        target_vars = layer_target_vars.get(int(layer), requested_target_vars)
         layer_start = perf_counter()
         layer_dir = sweep_root / f"layer_{int(layer):02d}"
         layer_dir.mkdir(parents=True, exist_ok=True)
@@ -847,6 +916,12 @@ def main() -> None:
             output_path = layer_dir / f"{output_stem}.json"
             summary_path = layer_dir / f"{output_stem}.txt"
             compare_payload = _load_existing_payload(output_path)
+            if not _compare_payload_matches_target_vars(
+                payload=compare_payload,
+                expected_target_vars=target_vars,
+                expected_transport_target_vars=transport_target_vars,
+            ):
+                compare_payload = None
             if compare_payload is None:
                 ot_config = OTConfig(
                     method="ot",
@@ -855,17 +930,17 @@ def main() -> None:
                     signature_mode=str(args.signature_mode),
                     top_k_values=ot_top_k_values,
                     lambda_values=ot_lambdas,
-                    source_target_vars=target_vars,
+                    source_target_vars=transport_target_vars,
                     calibration_metric=DEFAULT_CALIBRATION_METRIC,
                     calibration_family_weights=calibration_family_weights,
-                    top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
-                    lambda_values_by_var={target_var: ot_lambdas for target_var in target_vars},
+                    top_k_values_by_var={target_var: ot_top_k_values for target_var in transport_target_vars},
+                    lambda_values_by_var={target_var: ot_lambdas for target_var in transport_target_vars},
                 )
                 if prepared_artifacts is None:
                     artifact_prepare_start = perf_counter()
                     prepared_artifacts = prepare_alignment_artifacts(
                         model=model,
-                        fit_banks_by_var={target_var: banks_by_split["train"][target_var] for target_var in target_vars},
+                        fit_banks_by_var={target_var: banks_by_split["train"][target_var] for target_var in transport_target_vars},
                         sites=pca_sites,
                         device=device,
                         config=ot_config,
@@ -882,7 +957,7 @@ def main() -> None:
                     method_payloads.append(
                         run_alignment_pipeline(
                             model=model,
-                            fit_banks_by_var={source_var: banks_by_split["train"][source_var] for source_var in target_vars},
+                            fit_banks_by_var={source_var: banks_by_split["train"][source_var] for source_var in transport_target_vars},
                             calibration_bank=banks_by_split["calibration"][target_var],
                             holdout_bank=banks_by_split["test"][target_var],
                             sites=pca_sites,
@@ -904,6 +979,8 @@ def main() -> None:
                     "basis_source_mode": str(args.basis_source_mode),
                     "ot_epsilon": float(epsilon),
                     "signature_mode": str(args.signature_mode),
+                    "target_vars": [str(target_var) for target_var in target_vars],
+                    "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
                     "ot_top_k_values": [int(value) for value in ot_top_k_values],
                     "ot_lambdas": [float(value) for value in ot_lambdas],
                     "calibration_family_weights": [float(weight) for weight in calibration_family_weights],
@@ -1031,6 +1108,8 @@ def main() -> None:
                 layer=int(layer),
                 token_position_id=str(args.token_position_id),
                 signature_mode=str(args.signature_mode),
+                target_vars=target_vars,
+                transport_target_vars=transport_target_vars,
                 basis_source_mode=str(args.basis_source_mode),
                 site_menu=str(args.site_menu),
                 num_bands=int(args.num_bands),
@@ -1049,6 +1128,8 @@ def main() -> None:
             "kind": "mcqa_plot_pca_support_layer",
             "layer": int(layer),
             "token_position_id": str(args.token_position_id),
+            "target_vars": [str(target_var) for target_var in target_vars],
+            "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
             "site_menu": str(args.site_menu),
             "num_bands": int(args.num_bands),
             "band_scheme": str(args.band_scheme),
@@ -1133,6 +1214,8 @@ def main() -> None:
                 "kind": "mcqa_plot_das_pca_support_layer",
                 "layer": int(layer),
                 "token_position_id": str(args.token_position_id),
+                "target_vars": [str(target_var) for target_var in target_vars],
+                "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
                 "site_menu": str(args.site_menu),
                 "num_bands": int(args.num_bands),
                 "band_scheme": str(args.band_scheme),

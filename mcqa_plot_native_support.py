@@ -61,6 +61,32 @@ def _parse_csv_floats(value: str | None) -> list[float] | None:
     return [float(item) for item in items]
 
 
+def _parse_layer_target_vars(value: str | None) -> dict[int, tuple[str, ...]]:
+    if value is None or str(value).strip() == "":
+        return {}
+    resolved: dict[int, tuple[str, ...]] = {}
+    for entry in str(value).split(";"):
+        item = str(entry).strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                "--layer-target-vars entries must look like "
+                "'17:answer_pointer|answer_token;24:answer_token'"
+            )
+        layer_text, vars_text = item.split(":", 1)
+        layer = int(layer_text)
+        target_vars = tuple(
+            canonicalize_target_var(target_var)
+            for target_var in str(vars_text).split("|")
+            if str(target_var).strip()
+        )
+        if not target_vars:
+            raise ValueError(f"--layer-target-vars must provide at least one target var for layer {layer}")
+        resolved[int(layer)] = tuple(dict.fromkeys(target_vars))
+    return resolved
+
+
 def _normalize_native_resolutions(values: list[int] | tuple[int, ...], *, hidden_size: int) -> tuple[int, ...]:
     resolved = [max(1, min(int(value), int(hidden_size))) for value in values if int(value) > 0]
     if not resolved:
@@ -81,6 +107,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-pool-size", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layers", required=True, help="Comma-separated focused layers.")
+    parser.add_argument(
+        "--layer-target-vars",
+        default=None,
+        help=(
+            "Optional per-layer calibration target vars like "
+            "'17:answer_pointer;18:answer_pointer;23:answer_token|answer_pointer'. "
+            "OT couplings are still formed with both abstract variables."
+        ),
+    )
     parser.add_argument(
         "--native-resolutions",
         default=None,
@@ -133,6 +168,29 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
         return None
 
 
+def _compare_payload_matches_target_vars(
+    *,
+    payload: dict[str, object] | None,
+    expected_target_vars: tuple[str, ...],
+    expected_transport_target_vars: tuple[str, ...],
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    actual_target_vars = payload.get("target_vars")
+    if not isinstance(actual_target_vars, list):
+        return False
+    if tuple(str(target_var) for target_var in actual_target_vars) != tuple(
+        str(target_var) for target_var in expected_target_vars
+    ):
+        return False
+    actual_transport_target_vars = payload.get("ot_source_target_vars", payload.get("transport_target_vars"))
+    if not isinstance(actual_transport_target_vars, list):
+        return False
+    return tuple(str(target_var) for target_var in actual_transport_target_vars) == tuple(
+        str(target_var) for target_var in expected_transport_target_vars
+    )
+
+
 def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, dict[str, object]]:
     best_by_var: dict[str, dict[str, object]] = {}
     for compare_payload in ot_compare_payloads:
@@ -159,15 +217,25 @@ def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, 
     return best_by_var
 
 
-def _format_summary(*, layer: int, native_resolution: int, support_by_var: dict[str, dict[str, object]], best_ot_by_var: dict[str, dict[str, object]]) -> str:
+def _format_summary(
+    *,
+    layer: int,
+    native_resolution: int,
+    target_vars: tuple[str, ...],
+    transport_target_vars: tuple[str, ...],
+    support_by_var: dict[str, dict[str, object]],
+    best_ot_by_var: dict[str, dict[str, object]],
+) -> str:
     lines = [
         "MCQA PLOT Native Support Summary",
         f"layer: {int(layer)}",
         f"token_position_id: {DEFAULT_TOKEN_POSITION_ID}",
         f"native_resolution: {int(native_resolution)}",
+        f"target_vars: {list(str(target_var) for target_var in target_vars)}",
+        f"transport_target_vars: {list(str(target_var) for target_var in transport_target_vars)}",
         "",
     ]
-    for target_var in DEFAULT_TARGET_VARS:
+    for target_var in target_vars:
         best = best_ot_by_var.get(str(target_var), {})
         lines.append(f"[{target_var}]")
         lines.append(
@@ -203,10 +271,11 @@ def main() -> None:
     banks_by_split = context["banks_by_split"]
     data_metadata = context["data_metadata"]
     device = context["device"]
-    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
+    transport_target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
     layers = tuple(_parse_csv_ints(args.layers) or [])
     if not layers:
         raise ValueError("No layers selected")
+    layer_target_vars = _parse_layer_target_vars(args.layer_target_vars)
     native_resolutions = _normalize_native_resolutions(
         _parse_csv_ints(args.native_resolutions) or list(DEFAULT_NATIVE_RESOLUTIONS),
         hidden_size=int(model.config.hidden_size),
@@ -223,7 +292,7 @@ def main() -> None:
     print(
         f"[stageB native] start layers={list(int(layer) for layer in layers)} "
         f"native_resolutions={list(int(width) for width in native_resolutions)} "
-        f"target_vars={list(target_vars)}"
+        f"transport_target_vars={list(transport_target_vars)}"
     )
     print(
         "[stageB native] signature construction is per (layer, native_resolution) family, "
@@ -235,7 +304,7 @@ def main() -> None:
         f"(layers={len(layers)} x widths={len(native_resolutions)})"
     )
 
-    train_banks = {target_var: banks_by_split["train"][target_var] for target_var in target_vars}
+    train_banks = {target_var: banks_by_split["train"][target_var] for target_var in transport_target_vars}
     all_payloads: list[dict[str, object]] = []
     manifest_runs: list[dict[str, object]] = []
 
@@ -258,7 +327,7 @@ def main() -> None:
                 selected_token_position_ids=(DEFAULT_TOKEN_POSITION_ID,),
             )
             cache_spec = base_run._signature_cache_spec(
-                train_bank=train_banks[target_vars[0]],
+                train_bank=train_banks[transport_target_vars[0]],
                 resolution=int(native_resolution),
                 resolved_resolution=int(native_resolution),
                 signature_mode=str(args.signature_mode),
@@ -278,7 +347,7 @@ def main() -> None:
                 print(
                     f"[stageB native] signature cache miss layer={int(layer)} width={int(native_resolution)} "
                     f"sites={len(sites)}; building one shared neural-site signature pass "
-                    f"for target_vars={list(target_vars)} and reusing it across epsilons={list(float(e) for e in ot_epsilons)}"
+                    f"for transport_target_vars={list(transport_target_vars)} and reusing it across epsilons={list(float(e) for e in ot_epsilons)}"
                 )
                 artifact_prepare_start = perf_counter()
                 prepared_artifacts = prepare_alignment_artifacts(
@@ -293,11 +362,11 @@ def main() -> None:
                         signature_mode=str(args.signature_mode),
                         top_k_values=ot_top_k_values,
                         lambda_values=ot_lambdas,
-                        source_target_vars=target_vars,
+                        source_target_vars=transport_target_vars,
                         calibration_metric=DEFAULT_CALIBRATION_METRIC,
                         calibration_family_weights=calibration_family_weights,
-                        top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
-                        lambda_values_by_var={target_var: ot_lambdas for target_var in target_vars},
+                        top_k_values_by_var={target_var: ot_top_k_values for target_var in transport_target_vars},
+                        lambda_values_by_var={target_var: ot_lambdas for target_var in transport_target_vars},
                     ),
                 )
                 artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
@@ -317,12 +386,17 @@ def main() -> None:
                 )
                 print(
                     f"[stageB native] reuse one shared neural-site signature family "
-                    f"across target_vars={list(target_vars)} and epsilons={list(float(e) for e in ot_epsilons)}"
+                    f"across transport_target_vars={list(transport_target_vars)} and epsilons={list(float(e) for e in ot_epsilons)}"
                 )
             _synchronize_if_cuda(device)
 
             ot_compare_payloads: list[dict[str, object]] = []
             ot_localization_start = perf_counter()
+            selected_target_vars = layer_target_vars.get(int(layer), transport_target_vars)
+            print(
+                f"[stageB native] layer={int(layer)} width={int(native_resolution)} "
+                f"calibrating target_vars={list(selected_target_vars)} from shared transport rows={list(transport_target_vars)}"
+            )
             print(
                 f"[stageB native] sweeping OT over layer={int(layer)} width={int(native_resolution)} "
                 f"epsilons={list(float(e) for e in ot_epsilons)}"
@@ -335,6 +409,12 @@ def main() -> None:
                 output_path = layer_dir / f"{output_stem}.json"
                 summary_path = layer_dir / f"{output_stem}.txt"
                 compare_payload = _load_existing_payload(output_path)
+                if not _compare_payload_matches_target_vars(
+                    payload=compare_payload,
+                    expected_target_vars=selected_target_vars,
+                    expected_transport_target_vars=transport_target_vars,
+                ):
+                    compare_payload = None
                 if compare_payload is None:
                     compare_payload = run_comparison(
                         model=model,
@@ -348,7 +428,8 @@ def main() -> None:
                             output_path=output_path,
                             summary_path=summary_path,
                             methods=("ot",),
-                            target_vars=target_vars,
+                            target_vars=selected_target_vars,
+                            ot_source_target_vars=transport_target_vars,
                             batch_size=int(args.batch_size),
                             ot_epsilon=float(epsilon),
                             signature_mode=str(args.signature_mode),
@@ -356,8 +437,8 @@ def main() -> None:
                             ot_lambdas=ot_lambdas,
                             calibration_metric=DEFAULT_CALIBRATION_METRIC,
                             calibration_family_weights=calibration_family_weights,
-                            ot_top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
-                            ot_lambdas_by_var={target_var: ot_lambdas for target_var in target_vars},
+                            ot_top_k_values_by_var={target_var: ot_top_k_values for target_var in transport_target_vars},
+                            ot_lambdas_by_var={target_var: ot_lambdas for target_var in transport_target_vars},
                             resolution=int(native_resolution),
                             layers=(int(layer),),
                             token_position_ids=(DEFAULT_TOKEN_POSITION_ID,),
@@ -401,6 +482,8 @@ def main() -> None:
                 _format_summary(
                     layer=int(layer),
                     native_resolution=int(native_resolution),
+                    target_vars=selected_target_vars,
+                    transport_target_vars=transport_target_vars,
                     support_by_var=support_by_var,
                     best_ot_by_var=best_ot_by_var,
                 ),
@@ -411,6 +494,8 @@ def main() -> None:
                 "token_position_id": DEFAULT_TOKEN_POSITION_ID,
                 "signature_mode": str(args.signature_mode),
                 "native_resolution": int(native_resolution),
+                "target_vars": [str(target_var) for target_var in selected_target_vars],
+                "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
                 "native_resolutions": [int(resolution) for resolution in native_resolutions],
                 "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
                 "ot_top_k_values": [int(value) for value in ot_top_k_values],

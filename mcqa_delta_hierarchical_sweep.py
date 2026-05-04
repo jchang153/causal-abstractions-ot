@@ -479,6 +479,8 @@ def _build_stage_b_or_c_command(
     stage_timestamp: str,
     token_position_id: str,
     layers: tuple[int, ...],
+    requested_target_vars: tuple[str, ...],
+    layer_target_vars: dict[int, tuple[str, ...]] | None,
     basis_source_mode: str,
     site_menu: str,
     num_bands: int,
@@ -507,6 +509,8 @@ def _build_stage_b_or_c_command(
         ",".join(str(layer) for layer in layers),
         "--token-position-id",
         str(token_position_id),
+        "--target-vars",
+        ",".join(str(target_var) for target_var in requested_target_vars),
         "--site-menu",
         str(site_menu),
         "--num-bands",
@@ -537,6 +541,11 @@ def _build_stage_b_or_c_command(
         "--signatures-dir",
         str(args.signatures_dir),
     ]
+    _append_optional_arg(
+        command,
+        "--layer-target-vars",
+        _encode_layer_target_vars_arg(target_vars_by_layer=layer_target_vars or {}),
+    )
     if guided_das:
         command.extend(
             [
@@ -570,6 +579,7 @@ def _build_native_block_command(
     normalized: dict[str, object],
     stage_timestamp: str,
     layers: tuple[int, ...],
+    layer_target_vars: dict[int, tuple[str, ...]] | None,
 ) -> tuple[str, ...]:
     command = [
         sys.executable,
@@ -616,6 +626,11 @@ def _build_native_block_command(
         "--signatures-dir",
         str(args.signatures_dir),
     ]
+    _append_optional_arg(
+        command,
+        "--layer-target-vars",
+        _encode_layer_target_vars_arg(target_vars_by_layer=layer_target_vars or {}),
+    )
     _append_optional_arg(command, "--dataset-config", args.dataset_config)
     if bool(args.prompt_hf_login):
         command.append("--prompt-hf-login")
@@ -1116,6 +1131,46 @@ def _selected_target_vars_by_layer(
     }
 
 
+def _encode_layer_target_vars_arg(*, target_vars_by_layer: dict[int, tuple[str, ...]]) -> str | None:
+    if not target_vars_by_layer:
+        return None
+    parts: list[str] = []
+    for layer in sorted(int(layer) for layer in target_vars_by_layer):
+        target_vars = tuple(str(target_var) for target_var in target_vars_by_layer.get(int(layer), ()))
+        if not target_vars:
+            continue
+        parts.append(f"{int(layer)}:{'|'.join(target_vars)}")
+    if not parts:
+        return None
+    return ";".join(parts)
+
+
+def _stage_b_payload_matches_target_vars(
+    *,
+    payload_path: Path,
+    expected_target_vars: tuple[str, ...],
+    expected_transport_target_vars: tuple[str, ...] = DEFAULT_TARGET_VARS,
+) -> bool:
+    if not _stage_output_is_valid(payload_path):
+        return False
+    payload = _load_json(payload_path)
+    if not isinstance(payload, dict):
+        return False
+    actual_target_vars = payload.get("target_vars")
+    if not isinstance(actual_target_vars, list):
+        return False
+    if tuple(str(target_var) for target_var in actual_target_vars) != tuple(
+        str(target_var) for target_var in expected_target_vars
+    ):
+        return False
+    actual_transport_target_vars = payload.get("transport_target_vars")
+    if not isinstance(actual_transport_target_vars, list):
+        return False
+    return tuple(str(target_var) for target_var in actual_transport_target_vars) == tuple(
+        str(target_var) for target_var in expected_transport_target_vars
+    )
+
+
 def _das_payload_matches_target_vars(*, payload_path: Path, expected_target_vars: tuple[str, ...]) -> bool:
     if not _stage_output_is_valid(payload_path):
         return False
@@ -1132,6 +1187,13 @@ def _das_payload_matches_target_vars(*, payload_path: Path, expected_target_vars
         if not isinstance(payloads_by_var, dict):
             return False
         return tuple(str(target_var) for target_var in payloads_by_var.keys()) == expected
+    if kind == "mcqa_plot_das_pca_support_layer":
+        if isinstance(actual, list):
+            return tuple(str(target_var) for target_var in actual) == expected
+        guided_output_paths = payload.get("guided_output_paths", {})
+        if not isinstance(guided_output_paths, dict):
+            return False
+        return tuple(str(target_var) for target_var in guided_output_paths.keys()) == expected
     if kind == "mcqa_plot_das_layer":
         method_payloads = payload.get("method_payloads", {}).get("das", [])
         actual_target_vars: list[str] = []
@@ -1400,6 +1462,31 @@ def _select_stage_c_configs(
             grouped.setdefault(key, []).append(int(entry["layer"]))
     return {
         key: tuple(sorted(dict.fromkeys(layers)))
+        for key, layers in grouped.items()
+    }
+
+
+def _select_stage_c_config_targets(
+    *,
+    rankings: dict[str, list[dict[str, object]]],
+    top_configs_per_var: int,
+) -> dict[tuple[str, str, str, int], dict[int, tuple[str, ...]]]:
+    grouped: dict[tuple[str, str, str, int], dict[int, list[str]]] = {}
+    for target_var in DEFAULT_TARGET_VARS:
+        for entry in rankings.get(target_var, [])[: max(1, int(top_configs_per_var))]:
+            key = (
+                str(entry["token_position_id"]),
+                str(entry["basis_source_mode"]),
+                str(entry["site_menu"]),
+                int(entry["num_bands"]),
+            )
+            layer_group = grouped.setdefault(key, {})
+            layer_group.setdefault(int(entry["layer"]), []).append(str(target_var))
+    return {
+        key: {
+            int(layer): tuple(dict.fromkeys(str(target_var) for target_var in target_vars))
+            for layer, target_vars in layers.items()
+        }
         for key, layers in grouped.items()
     }
 
@@ -1738,6 +1825,7 @@ def main() -> None:
                 neighbor_radius=int(args.stage_b_neighbor_radius),
                 max_layers_per_var=int(args.stage_b_max_layers_per_var),
             )
+            selected_target_vars_by_layer = _selected_target_vars_by_layer(selected_by_var=selected_layers_by_var)
             if not selected_layers:
                 continue
             _print_stage_b_layer_selection(
@@ -1758,7 +1846,16 @@ def main() -> None:
                 signature_mode=str(args.signature_mode),
             )
             expected_outputs = [str(manifest_output_path), *[str(path) for path in payload_output_paths]]
-            if all(_stage_output_is_valid(path) for path in payload_output_paths):
+            if all(
+                _stage_b_payload_matches_target_vars(
+                    payload_path=path,
+                    expected_target_vars=selected_target_vars_by_layer.get(
+                        int(path.parent.name.split("_")[1]),
+                        tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS),
+                    ),
+                )
+                for path in payload_output_paths
+            ):
                 native_payload_paths.extend(payload_output_paths)
                 _mark_stage(
                     manifest_path=manifest_path,
@@ -1788,6 +1885,7 @@ def main() -> None:
                     normalized=normalized,
                     stage_timestamp=stage_timestamp,
                     layers=selected_layers,
+                    layer_target_vars=selected_target_vars_by_layer,
                 ),
                 expected_outputs=tuple(expected_outputs),
             )
@@ -1976,6 +2074,7 @@ def main() -> None:
                 neighbor_radius=int(args.stage_b_neighbor_radius),
                 max_layers_per_var=int(args.stage_b_max_layers_per_var),
             )
+            selected_target_vars_by_layer = _selected_target_vars_by_layer(selected_by_var=selected_layers_by_var)
             if not selected_layers:
                 continue
             if str(token_position_id) not in stage_b_selection_logged:
@@ -2015,7 +2114,16 @@ def main() -> None:
                                     )
                                 )
                             )
-                        if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
+                        if _stage_output_is_valid(Path(expected_outputs[0])) and all(
+                            _stage_b_payload_matches_target_vars(
+                                payload_path=Path(path),
+                                expected_target_vars=selected_target_vars_by_layer.get(
+                                    int(Path(path).parent.name.split("_")[1]),
+                                    tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS),
+                                ),
+                            )
+                            for path in expected_outputs[1:]
+                        ):
                             stage_b_payload_paths.extend(Path(path) for path in expected_outputs[1:])
                             _mark_stage(
                                 manifest_path=manifest_path,
@@ -2047,6 +2155,8 @@ def main() -> None:
                                 stage_timestamp=stage_timestamp,
                                 token_position_id=str(token_position_id),
                                 layers=selected_layers,
+                                requested_target_vars=tuple(str(target_var) for target_var in normalized["target_vars"]),
+                                layer_target_vars=selected_target_vars_by_layer,
                                 basis_source_mode=str(basis_source_mode),
                                 site_menu=str(site_menu),
                                 num_bands=int(num_bands),
@@ -2102,12 +2212,13 @@ def main() -> None:
                 stage_b_rankings = payload
 
     if "stage_c_plot_das_pca_support" in normalized["stages"]:
-        selected_config_groups = _select_stage_c_configs(
+        selected_config_targets = _select_stage_c_config_targets(
             rankings=stage_b_rankings,
             top_configs_per_var=int(args.stage_c_top_configs_per_var),
         )
         stage_c_payload_paths: list[Path] = []
-        for (token_position_id, basis_source_mode, site_menu, num_bands), layers in selected_config_groups.items():
+        for (token_position_id, basis_source_mode, site_menu, num_bands), layer_target_vars in selected_config_targets.items():
+            layers = tuple(sorted(int(layer) for layer in layer_target_vars))
             stage_slug = _stage_b_slug(
                 token_position_id=str(token_position_id),
                 basis_source_mode=str(basis_source_mode),
@@ -2124,28 +2235,30 @@ def main() -> None:
                 top_prefix_sizes=normalized["pca_top_prefix_sizes"],
             )
             expected_outputs: list[str] = []
+            plot_payload_paths: list[Path] = []
+            das_payload_paths: list[Path] = []
             for layer in layers:
-                expected_outputs.append(
-                    str(
-                        sweep_run_root
-                        / f"layer_{int(layer):02d}"
-                        / (
-                            f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
-                            f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_plot_pca_support.json"
-                        )
+                plot_payload_path = (
+                    sweep_run_root
+                    / f"layer_{int(layer):02d}"
+                    / (
+                        f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
+                        f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_plot_pca_support.json"
                     )
                 )
-                expected_outputs.append(
-                    str(
-                        sweep_run_root
-                        / f"layer_{int(layer):02d}"
-                        / (
-                            f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
-                            f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_plot_das_pca_support.json"
-                        )
+                das_payload_path = (
+                    sweep_run_root
+                    / f"layer_{int(layer):02d}"
+                    / (
+                        f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
+                        f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_plot_das_pca_support.json"
                     )
                 )
-                for target_var in normalized["target_vars"]:
+                plot_payload_paths.append(plot_payload_path)
+                das_payload_paths.append(das_payload_path)
+                expected_outputs.append(str(plot_payload_path))
+                expected_outputs.append(str(das_payload_path))
+                for target_var in layer_target_vars.get(int(layer), tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS)):
                     expected_outputs.append(
                         str(
                             sweep_run_root
@@ -2156,7 +2269,29 @@ def main() -> None:
                             )
                         )
                     )
-            if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
+            if (
+                all(_stage_output_is_valid(Path(path)) for path in expected_outputs)
+                and all(
+                    _stage_b_payload_matches_target_vars(
+                        payload_path=plot_payload_path,
+                        expected_target_vars=layer_target_vars.get(
+                            int(plot_payload_path.parent.name.split("_")[1]),
+                            tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS),
+                        ),
+                    )
+                    for plot_payload_path in plot_payload_paths
+                )
+                and all(
+                    _das_payload_matches_target_vars(
+                        payload_path=das_payload_path,
+                        expected_target_vars=layer_target_vars.get(
+                            int(das_payload_path.parent.name.split("_")[1]),
+                            tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS),
+                        ),
+                    )
+                    for das_payload_path in das_payload_paths
+                )
+            ):
                 stage_c_payload_paths.extend(Path(path) for path in expected_outputs if path.endswith("_plot_das_pca_support.json"))
                 _mark_stage(
                     manifest_path=manifest_path,
@@ -2187,6 +2322,8 @@ def main() -> None:
                     stage_timestamp=stage_timestamp,
                     token_position_id=str(token_position_id),
                     layers=layers,
+                    requested_target_vars=tuple(str(target_var) for target_var in normalized["target_vars"]),
+                    layer_target_vars=layer_target_vars,
                     basis_source_mode=str(basis_source_mode),
                     site_menu=str(site_menu),
                     num_bands=int(num_bands),
