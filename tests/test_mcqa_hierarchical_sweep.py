@@ -8,11 +8,14 @@ from mcqa_delta_hierarchical_sweep import (
     _extract_stage_b_best_configs,
     _select_stage_b_layers,
     _select_stage_c_configs,
+    _select_stage_c_native_configs,
 )
 from mcqa_delta_hierarchical_parallel import (
     plan_stage_b_tasks,
     plan_stage_c_tasks,
 )
+from mcqa_experiment.sites import ResidualSite
+from mcqa_experiment.support import extract_block_mask_support
 
 
 def _write_layer_run(path: Path, *, layer: int, pointer_cal: float, pointer_exact: float, token_cal: float, token_exact: float) -> None:
@@ -182,7 +185,7 @@ def test_extract_stage_b_best_configs_collapses_epsilons_per_config(tmp_path: Pa
                             "results": [
                                 {
                                     "variable": "answer_token",
-                                    "exact_acc": 0.9,
+                                    "exact_acc": 0.95,
                                     "selection_score": 0.8,
                                     "site_label": "soft:k1,l2",
                                 }
@@ -205,7 +208,7 @@ def test_extract_stage_b_best_configs_collapses_epsilons_per_config(tmp_path: Pa
                             "results": [
                                 {
                                     "variable": "answer_token",
-                                    "exact_acc": 0.93,
+                                    "exact_acc": 0.9,
                                     "selection_score": 0.81,
                                     "site_label": "soft:k1,l2",
                                 }
@@ -235,7 +238,7 @@ def test_extract_stage_b_best_configs_collapses_epsilons_per_config(tmp_path: Pa
 
     assert len(rankings["answer_token"]) == 1
     best = rankings["answer_token"][0]
-    assert best["exact_acc"] == 0.93
+    assert best["exact_acc"] == 0.9
     assert best["epsilon"] == 1.0
     assert best["basis_source_mode"] == "pair_bank"
     assert best["site_menu"] == "mixed"
@@ -270,6 +273,83 @@ def test_select_stage_c_configs_groups_by_token_basis_menu_and_bands() -> None:
     selected = _select_stage_c_configs(rankings=rankings, top_configs_per_var=1)
 
     assert selected == {("custom", "ot", "last_token", "all_variants", "partition", 8): (20, 25)}
+
+
+def test_extract_block_mask_support_places_calibrated_plot_handle_first() -> None:
+    sites = [
+        ResidualSite(layer=18, token_position_id="last_token", dim_start=0, dim_end=10),
+        ResidualSite(layer=18, token_position_id="last_token", dim_start=10, dim_end=20),
+        ResidualSite(layer=18, token_position_id="last_token", dim_start=20, dim_end=30),
+    ]
+    payloads = [
+        {
+            "method_payloads": {
+                "ot": [
+                    {
+                        "target_var": "answer_pointer",
+                        "source_target_vars": ["answer_pointer", "answer_token"],
+                        "target_var_row_index": 0,
+                        "transport": [[0.8, 0.1, 0.1], [0.1, 0.8, 0.1]],
+                        "results": [
+                            {
+                                "variable": "answer_pointer",
+                                "exact_acc": 0.95,
+                                "selection_score": 0.80,
+                                "selected_site_labels": [sites[0].label],
+                                "top_k": 1,
+                                "lambda": 1.0,
+                            }
+                        ],
+                    },
+                    {
+                        "target_var": "answer_pointer",
+                        "source_target_vars": ["answer_pointer", "answer_token"],
+                        "target_var_row_index": 0,
+                        "transport": [[0.1, 0.6, 0.3], [0.6, 0.1, 0.3]],
+                        "results": [
+                            {
+                                "variable": "answer_pointer",
+                                "exact_acc": 0.80,
+                                "selection_score": 0.90,
+                                "selected_site_labels": [sites[1].label, sites[2].label],
+                                "top_k": 2,
+                                "lambda": 2.0,
+                            }
+                        ],
+                    },
+                ]
+            }
+        }
+    ]
+
+    support = extract_block_mask_support(ot_run_payloads=payloads, sites=sites)
+
+    pointer_support = support["answer_pointer"]
+    assert pointer_support["selected_trial"]["selection_score"] == 0.90
+    assert pointer_support["selected_trial"]["exact_acc"] == 0.80
+    assert pointer_support["mask_candidates"][0]["name"] == "Selected"
+    assert pointer_support["mask_candidates"][0]["site_indices"] == [1, 2]
+
+
+def test_select_stage_c_native_configs_uses_top_calibrated_plot_configs_per_variable() -> None:
+    rankings = {
+        "answer_pointer": [
+            {"layer": 18, "resolution": 128, "token_position_id": "last_token", "transport_method": "ot", "selection_score": 0.90},
+            {"layer": 18, "resolution": 256, "token_position_id": "last_token", "transport_method": "ot", "selection_score": 0.85},
+            {"layer": 18, "resolution": 384, "token_position_id": "last_token", "transport_method": "ot", "selection_score": 0.80},
+        ],
+        "answer_token": [
+            {"layer": 24, "resolution": 128, "token_position_id": "last_token", "transport_method": "ot", "selection_score": 0.95},
+            {"layer": 18, "resolution": 128, "token_position_id": "last_token", "transport_method": "ot", "selection_score": 0.70},
+        ],
+    }
+
+    selected = _select_stage_c_native_configs(rankings=rankings, top_configs_per_var=2)
+
+    assert selected[("custom", "ot", "last_token", 18, 128)] == ("answer_pointer", "answer_token")
+    assert selected[("custom", "ot", "last_token", 18, 256)] == ("answer_pointer",)
+    assert selected[("custom", "ot", "last_token", 24, 128)] == ("answer_token",)
+    assert ("custom", "ot", "last_token", 18, 384) not in selected
 
 
 def test_parallel_stage_b_planner_writes_disjoint_task_roots(tmp_path: Path) -> None:

@@ -40,6 +40,7 @@ DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.5, 2.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
+DEFAULT_UOT_BETA_NEURALS = (0.03, 0.1, 0.3, 1.0, 3.0)
 DEFAULT_BAND_SCHEME = "equal"
 DEFAULT_BASIS_SOURCE_MODE = "all_variants"
 DEFAULT_SCREEN_MAX_EPOCHS = 25
@@ -47,7 +48,7 @@ DEFAULT_SCREEN_MIN_EPOCHS = 2
 DEFAULT_SCREEN_MASK_NAMES = ("Top1", "Top2")
 DEFAULT_GUIDED_DAS_MAX_EPOCHS = 100
 DEFAULT_GUIDED_DAS_MIN_EPOCHS = 5
-DEFAULT_GUIDED_DAS_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
+DEFAULT_GUIDED_DAS_MASK_NAMES = ("Selected",)
 
 
 def _synchronize_if_cuda(device: torch.device | str) -> None:
@@ -98,7 +99,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated top-prefix sizes for mixed PCA menus. Default: 8,16,32,64",
     )
     parser.add_argument("--basis-source-mode", default=DEFAULT_BASIS_SOURCE_MODE, choices=("pair_bank", "all_variants"))
+    parser.add_argument("--methods", default="ot", help="Single transport method for this focus run: ot or uot.")
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
+    parser.add_argument("--uot-beta-neurals", help="Comma-separated UOT neural KL penalties. Default: 0.03,0.1,0.3,1,3")
+    parser.add_argument("--ot-top-k-values", help="Comma-separated intervention top-k calibration grid. Default: 1,2,4")
+    parser.add_argument("--ot-lambdas", help="Comma-separated intervention strength calibration grid. Default: 0.5,1,2,4")
     parser.add_argument("--support-score-slack", type=float, default=0.05)
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument("--screen-das", action="store_true")
@@ -112,7 +117,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guided-das", action="store_true")
     parser.add_argument(
         "--guided-mask-names",
-        help="Comma-separated PCA support masks for the guided DAS sweep. Default: Top1,Top2,Top4,S50,S80",
+        help="Comma-separated PCA support masks for the guided DAS sweep. Default: Selected.",
     )
     parser.add_argument(
         "--guided-subspace-dims",
@@ -333,27 +338,77 @@ def _site_catalog_tag(
     return tag
 
 
-def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+def _format_number(value: float | int) -> str:
+    text = str(value)
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _transport_sweep_points(
+    *,
+    method: str,
+    ot_epsilons: tuple[float, ...],
+    uot_beta_neurals: tuple[float, ...],
+) -> tuple[tuple[float, float | None], ...]:
+    if str(method) == "ot":
+        return tuple((float(epsilon), None) for epsilon in ot_epsilons)
+    if str(method) == "uot":
+        return tuple(
+            (float(epsilon), float(beta))
+            for epsilon in ot_epsilons
+            for beta in uot_beta_neurals
+        )
+    raise ValueError(f"Unsupported transport method {method!r}")
+
+
+def _transport_output_stem(
+    *,
+    layer: int,
+    token_position_id: str,
+    site_catalog_tag: str,
+    basis_source_mode: str,
+    signature_mode: str,
+    epsilon: float,
+    method: str,
+    uot_beta_neural: float | None,
+) -> str:
+    stem = (
+        f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
+        f"_basis-{str(basis_source_mode)}_sig-{str(signature_mode)}_eps-{_format_number(float(epsilon))}"
+    )
+    if str(method) == "uot":
+        stem += f"_bn-{_format_number(float(uot_beta_neural if uot_beta_neural is not None else 1.0))}"
+    return f"{stem}_{str(method)}"
+
+
+def _selection_score(record: dict[str, object]) -> float:
+    if "selection_score" in record and record["selection_score"] is not None:
+        return float(record["selection_score"])
+    if "selection_exact_acc" in record and record["selection_exact_acc"] is not None:
+        return float(record["selection_exact_acc"])
+    if "calibration_exact_acc" in record and record["calibration_exact_acc"] is not None:
+        return float(record["calibration_exact_acc"])
+    return -1.0
+
+
+def _best_transport_records(transport_compare_payloads: list[dict[str, object]], *, method: str) -> dict[str, dict[str, object]]:
     best_by_var: dict[str, dict[str, object]] = {}
-    for compare_payload in ot_compare_payloads:
+    for compare_payload in transport_compare_payloads:
         epsilon = float(compare_payload.get("ot_epsilon", 0.0))
-        for payload in compare_payload.get("method_payloads", {}).get("ot", []):
+        uot_beta_neural = compare_payload.get("uot_beta_neural")
+        for payload in compare_payload.get("method_payloads", {}).get(str(method), []):
             result = payload.get("results", [{}])[0]
             target_var = str(payload.get("target_var"))
             record = {
                 "exact_acc": float(result.get("exact_acc", 0.0)),
-                "selection_score": float(result.get("selection_score", 0.0)),
+                "selection_score": _selection_score(result),
                 "site_label": str(result.get("site_label")),
                 "epsilon": float(epsilon),
+                "method": str(method),
             }
+            if uot_beta_neural is not None:
+                record["uot_beta_neural"] = float(uot_beta_neural)
             previous = best_by_var.get(target_var)
-            if previous is None or (
-                float(record["exact_acc"]),
-                float(record["selection_score"]),
-            ) > (
-                float(previous["exact_acc"]),
-                float(previous["selection_score"]),
-            ):
+            if previous is None or float(record["selection_score"]) > float(previous["selection_score"]):
                 best_by_var[target_var] = record
     return best_by_var
 
@@ -544,18 +599,20 @@ def _format_layer_summary(
     num_bands: int,
     band_scheme: str,
     top_prefix_sizes: tuple[int, ...],
+    transport_method: str,
     basis: LayerPCABasis,
     site_metrics: list[dict[str, object]],
-    ot_compare_payloads: list[dict[str, object]],
+    transport_compare_payloads: list[dict[str, object]],
     support_by_var: dict[str, dict[str, object]],
     screen_payloads: dict[str, dict[str, object]],
     guided_payloads: dict[str, dict[str, object]],
 ) -> str:
     lines = [
-        "MCQA PCA OT Summary",
+        "MCQA PCA Transport Summary",
         f"layer: {int(layer)}",
         f"token_position: {token_position_id}",
         f"signature_mode: {signature_mode}",
+        f"transport_method: {transport_method}",
         f"basis_source_mode: {basis_source_mode}",
         f"site_menu: {site_menu}",
         f"num_bands: {int(num_bands)}",
@@ -573,12 +630,15 @@ def _format_layer_summary(
             f"var={float(metric['variance_share']):.4f}"
         )
     lines.append("")
-    lines.append("best OT by epsilon:")
-    for target_var, record in _best_ot_records(ot_compare_payloads).items():
+    lines.append(f"best {str(transport_method).upper()} by transport sweep:")
+    for target_var, record in _best_transport_records(transport_compare_payloads, method=str(transport_method)).items():
+        beta_text = ""
+        if record.get("uot_beta_neural") is not None:
+            beta_text = f" beta={float(record['uot_beta_neural']):g}"
         lines.append(
-            f"OT[{target_var}] exact={float(record['exact_acc']):.4f} "
+            f"{str(transport_method).upper()}[{target_var}] exact={float(record['exact_acc']):.4f} "
             f"cal={float(record['selection_score']):.4f} "
-            f"eps={float(record['epsilon']):g} site={record['site_label']}"
+            f"eps={float(record['epsilon']):g}{beta_text} site={record['site_label']}"
         )
     lines.append("")
     lines.append("pooled PCA support:")
@@ -622,25 +682,28 @@ def _format_layer_summary(
 
 def _write_epsilon_summary(path: Path, *, payload: dict[str, object]) -> None:
     lines = [
-        "MCQA PCA OT Epsilon Summary",
+        "MCQA PCA Transport Sweep Summary",
         f"layer: {int(payload['layer'])}",
         f"token_position: {payload['token_position_id']}",
         f"site_menu: {payload['site_menu']}",
         f"num_bands: {int(payload['num_bands'])}",
         f"band_scheme: {payload['band_scheme']}",
         f"basis_source_mode: {payload['basis_source_mode']}",
+        f"transport_method: {payload.get('transport_method', 'ot')}",
         f"ot_epsilon: {float(payload['ot_epsilon']):g}",
+        f"uot_beta_neural: {payload.get('uot_beta_neural')}",
         f"signature_mode: {payload['signature_mode']}",
         f"basis_id: {payload['basis']['basis_id']}",
         "",
     ]
-    for result_payload in payload.get("method_payloads", {}).get("ot", []):
-        result = result_payload.get("results", [{}])[0]
-        lines.append(
-            f"OT[{result_payload.get('target_var')}] exact={float(result.get('exact_acc', 0.0)):.4f} "
-            f"cal={float(result.get('selection_score', 0.0)):.4f} "
-            f"site={result.get('site_label')}"
-        )
+    for method, result_payloads in payload.get("method_payloads", {}).items():
+        for result_payload in result_payloads:
+            result = result_payload.get("results", [{}])[0]
+            lines.append(
+                f"{str(method).upper()}[{result_payload.get('target_var')}] exact={float(result.get('exact_acc', 0.0)):.4f} "
+                f"cal={float(result.get('selection_score', 0.0)):.4f} "
+                f"site={result.get('site_label')}"
+            )
     write_text_report(path, "\n".join(lines))
 
 
@@ -654,7 +717,19 @@ def main() -> None:
         raise ValueError("No layers selected")
     if int(args.num_bands) <= 0:
         raise ValueError("num_bands must be > 0")
+    methods = tuple(str(method).lower() for method in (_parse_csv_strings(args.methods) or ["ot"]))
+    if len(methods) != 1 or methods[0] not in {"ot", "uot"}:
+        raise ValueError("--methods must specify exactly one transport method: ot or uot")
+    transport_method = str(methods[0])
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
+    uot_beta_neurals = tuple(_parse_csv_floats(args.uot_beta_neurals) or list(DEFAULT_UOT_BETA_NEURALS))
+    ot_top_k_values = tuple(_parse_csv_ints(args.ot_top_k_values) or list(DEFAULT_OT_TOP_K_VALUES))
+    ot_lambdas = tuple(_parse_csv_floats(args.ot_lambdas) or list(DEFAULT_OT_LAMBDAS))
+    transport_sweep_points = _transport_sweep_points(
+        method=transport_method,
+        ot_epsilons=ot_epsilons,
+        uot_beta_neurals=uot_beta_neurals,
+    )
     top_prefix_sizes = tuple(_parse_csv_ints(args.top_prefix_sizes) or list(DEFAULT_TOP_PREFIX_SIZES))
     screen_mask_names = tuple(_parse_csv_strings(args.screen_mask_names) or list(DEFAULT_SCREEN_MASK_NAMES))
     guided_mask_names = tuple(_parse_csv_strings(args.guided_mask_names) or list(DEFAULT_GUIDED_DAS_MASK_NAMES))
@@ -750,29 +825,36 @@ def main() -> None:
         site_build_seconds = float(perf_counter() - site_build_start)
 
         prepared_artifacts = None
-        ot_compare_payloads: list[dict[str, object]] = []
+        transport_compare_payloads: list[dict[str, object]] = []
         ot_fit_cal_start = perf_counter()
-        for epsilon in ot_epsilons:
-            output_stem = (
-                f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-                f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_eps-{float(epsilon):g}_ot"
+        for epsilon, uot_beta_neural in transport_sweep_points:
+            output_stem = _transport_output_stem(
+                layer=int(layer),
+                token_position_id=str(args.token_position_id),
+                site_catalog_tag=site_catalog_tag,
+                basis_source_mode=str(args.basis_source_mode),
+                signature_mode=str(args.signature_mode),
+                epsilon=float(epsilon),
+                method=transport_method,
+                uot_beta_neural=uot_beta_neural,
             )
             output_path = layer_dir / f"{output_stem}.json"
             summary_path = layer_dir / f"{output_stem}.txt"
             compare_payload = _load_existing_payload(output_path)
             if compare_payload is None:
                 ot_config = OTConfig(
-                    method="ot",
+                    method=transport_method,
                     batch_size=int(args.batch_size),
                     epsilon=float(epsilon),
+                    uot_beta_neural=float(uot_beta_neural if uot_beta_neural is not None else uot_beta_neurals[0]),
                     signature_mode=str(args.signature_mode),
-                    top_k_values=DEFAULT_OT_TOP_K_VALUES,
-                    lambda_values=DEFAULT_OT_LAMBDAS,
+                    top_k_values=ot_top_k_values,
+                    lambda_values=ot_lambdas,
                     source_target_vars=target_vars,
                     calibration_metric=DEFAULT_CALIBRATION_METRIC,
                     calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                    top_k_values_by_var={target_var: DEFAULT_OT_TOP_K_VALUES for target_var in target_vars},
-                    lambda_values_by_var={target_var: DEFAULT_OT_LAMBDAS for target_var in target_vars},
+                    top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
+                    lambda_values_by_var={target_var: ot_lambdas for target_var in target_vars},
                 )
                 if prepared_artifacts is None:
                     prepared_artifacts = prepare_alignment_artifacts(
@@ -808,7 +890,10 @@ def main() -> None:
                     "band_scheme": str(args.band_scheme),
                     "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
                     "basis_source_mode": str(args.basis_source_mode),
+                    "transport_method": transport_method,
+                    "methods": [transport_method],
                     "ot_epsilon": float(epsilon),
+                    "uot_beta_neural": None if uot_beta_neural is None else float(uot_beta_neural),
                     "signature_mode": str(args.signature_mode),
                     "model_name": base_run.MODEL_NAME,
                     "basis": {
@@ -822,18 +907,24 @@ def main() -> None:
                     "site_labels": [site.label for site in pca_sites],
                     "site_metrics": site_metrics,
                     "data": data_metadata,
-                    "method_payloads": {"ot": method_payloads},
+                    "method_payloads": {transport_method: method_payloads},
                 }
                 write_json(output_path, compare_payload)
                 _write_epsilon_summary(summary_path, payload=compare_payload)
-            ot_compare_payloads.append(compare_payload)
+            compare_payload["transport_method"] = transport_method
+            compare_payload["methods"] = [transport_method]
+            compare_payload["ot_epsilon"] = float(epsilon)
+            compare_payload["uot_beta_neural"] = None if uot_beta_neural is None else float(uot_beta_neural)
+            write_json(output_path, compare_payload)
+            transport_compare_payloads.append(compare_payload)
         _synchronize_if_cuda(device)
         ot_fit_cal_seconds = float(perf_counter() - ot_fit_cal_start)
 
         support_start = perf_counter()
         support_by_var = extract_ordered_site_support(
-            ot_run_payloads=ot_compare_payloads,
+            ot_run_payloads=transport_compare_payloads,
             sites=pca_sites,
+            method=transport_method,
             score_slack=float(args.support_score_slack),
             prefix_sizes=(1, 2, 4),
             coverage_specs=(("S50", 0.50), ("S80", 0.80)),
@@ -930,9 +1021,10 @@ def main() -> None:
                 num_bands=int(args.num_bands),
                 band_scheme=str(args.band_scheme),
                 top_prefix_sizes=top_prefix_sizes,
+                transport_method=transport_method,
                 basis=basis,
                 site_metrics=site_metrics,
-                ot_compare_payloads=ot_compare_payloads,
+                transport_compare_payloads=transport_compare_payloads,
                 support_by_var=support_by_var,
                 screen_payloads=screen_payloads,
                 guided_payloads=guided_payloads,
@@ -949,7 +1041,12 @@ def main() -> None:
             "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
             "basis_source_mode": str(args.basis_source_mode),
             "signature_mode": str(args.signature_mode),
+            "transport_method": transport_method,
+            "methods": [transport_method],
             "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
+            "uot_beta_neurals": [float(beta) for beta in uot_beta_neurals],
+            "ot_top_k_values": [int(value) for value in ot_top_k_values],
+            "ot_lambdas": [float(value) for value in ot_lambdas],
             "basis_path": str(basis_path),
             "basis": basis.to_payload(),
             "fit_prompt_record_count": 0 if prompt_records is None else len(prompt_records),
@@ -996,17 +1093,27 @@ def main() -> None:
                 )
                 for target_var in guided_payloads
             },
-            "ot_output_paths": [
+            "transport_output_paths": [
                 str(
                     layer_dir / (
-                        f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-                        f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_eps-{float(epsilon):g}_ot.json"
+                        _transport_output_stem(
+                            layer=int(layer),
+                            token_position_id=str(args.token_position_id),
+                            site_catalog_tag=site_catalog_tag,
+                            basis_source_mode=str(args.basis_source_mode),
+                            signature_mode=str(args.signature_mode),
+                            epsilon=float(epsilon),
+                            method=transport_method,
+                            uot_beta_neural=uot_beta_neural,
+                        )
+                        + ".json"
                     )
                 )
-                for epsilon in ot_epsilons
+                for epsilon, uot_beta_neural in transport_sweep_points
             ],
             "summary_path": str(layer_summary_path),
         }
+        layer_payload["ot_output_paths"] = list(layer_payload["transport_output_paths"])
         layer_payload_path = layer_dir / (
             f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
             f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_ot_pca.json"
@@ -1023,6 +1130,7 @@ def main() -> None:
                 "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
                 "basis_source_mode": str(args.basis_source_mode),
                 "signature_mode": str(args.signature_mode),
+                "transport_method": transport_method,
                 "screen_das_enabled": bool(args.screen_das),
                 "guided_das_enabled": bool(args.guided_das),
                 "runtime_seconds": float(layer_total_seconds),
@@ -1047,6 +1155,12 @@ def main() -> None:
             "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
             "basis_source_mode": str(args.basis_source_mode),
             "signature_mode": str(args.signature_mode),
+            "transport_method": transport_method,
+            "methods": [transport_method],
+            "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
+            "uot_beta_neurals": [float(beta) for beta in uot_beta_neurals],
+            "ot_top_k_values": [int(value) for value in ot_top_k_values],
+            "ot_lambdas": [float(value) for value in ot_lambdas],
             "screen_das_enabled": bool(args.screen_das),
             "screen_mask_names": [str(mask_name) for mask_name in screen_mask_names],
             "guided_das_enabled": bool(args.guided_das),

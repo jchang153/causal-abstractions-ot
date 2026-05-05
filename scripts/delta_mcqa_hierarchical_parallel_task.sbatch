@@ -22,11 +22,18 @@ if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
 fi
 source "${VENV_PATH}/bin/activate"
 
-export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN before submitting the job.}"
-export HF_HOME="${SCRATCH:-/tmp/${USER}}/hf"
-export HF_HUB_CACHE="${HF_HOME}/hub"
-export HF_DATASETS_CACHE="${HF_HOME}/datasets"
-export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  if [[ -r "${HOME}/.secrets/hf_token" ]]; then
+    export HF_TOKEN="$(< "${HOME}/.secrets/hf_token")"
+  else
+    echo "[delta-mcqa-hpar-task] HF_TOKEN is unset and ${HOME}/.secrets/hf_token is not readable"
+    exit 1
+  fi
+fi
+export HF_HOME="${HF_HOME:-${SCRATCH:-/tmp/${USER}}/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
@@ -39,7 +46,7 @@ fi
 
 mkdir -p "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}"
 
-echo "[delta-mcqa-hpar-task] host=$(hostname) task_file=${TASK_FILE} task_index=${TASK_INDEX}"
+echo "[delta-mcqa-hpar-task] host=$(hostname) task_file=${TASK_FILE} task_index=${TASK_INDEX} hf_home=${HF_HOME}"
 nvidia-smi
 
 srun --unbuffered python mcqa_delta_hierarchical_parallel.py run-task \

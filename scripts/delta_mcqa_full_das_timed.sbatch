@@ -22,11 +22,18 @@ if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
 fi
 source "${VENV_PATH}/bin/activate"
 
-export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN before submitting the job.}"
-export HF_HOME="${SCRATCH:-/tmp/${USER}}/hf"
-export HF_HUB_CACHE="${HF_HOME}/hub"
-export HF_DATASETS_CACHE="${HF_HOME}/datasets"
-export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  if [[ -r "${HOME}/.secrets/hf_token" ]]; then
+    export HF_TOKEN="$(< "${HOME}/.secrets/hf_token")"
+  else
+    echo "[delta-mcqa-full-das] HF_TOKEN is unset and ${HOME}/.secrets/hf_token is not readable"
+    exit 1
+  fi
+fi
+export HF_HOME="${HF_HOME:-${SCRATCH:-/tmp/${USER}}/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export RESULTS_ROOT="${RESULTS_ROOT:-results/delta}"
@@ -40,6 +47,7 @@ export DAS_MIN_EPOCHS="${DAS_MIN_EPOCHS:-5}"
 export DAS_PLATEAU_PATIENCE="${DAS_PLATEAU_PATIENCE:-2}"
 export DAS_PLATEAU_REL_DELTA="${DAS_PLATEAU_REL_DELTA:-0.001}"
 export DAS_LEARNING_RATE="${DAS_LEARNING_RATE:-0.001}"
+export DAS_RESTARTS="${DAS_RESTARTS:-2}"
 export CALIBRATION_METRIC="${CALIBRATION_METRIC:-family_weighted_macro_exact_acc}"
 export CALIBRATION_FAMILY_WEIGHTS="${CALIBRATION_FAMILY_WEIGHTS:-1,1.5,2}"
 
@@ -48,6 +56,8 @@ mkdir -p "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}"
 echo "[delta-mcqa-full-das] host=$(hostname) timestamp=${RESULTS_TIMESTAMP}"
 echo "[delta-mcqa-full-das] layers=${LAYERS} token_position_ids=${TOKEN_POSITION_IDS}"
 echo "[delta-mcqa-full-das] das_subspace_dims=${DAS_SUBSPACE_DIMS}"
+echo "[delta-mcqa-full-das] das_restarts=${DAS_RESTARTS}"
+echo "[delta-mcqa-full-das] hf_home=${HF_HOME}"
 nvidia-smi
 
 srun --unbuffered python mcqa_run_cloud.py \
@@ -73,6 +83,7 @@ srun --unbuffered python mcqa_run_cloud.py \
   --das-plateau-patience "${DAS_PLATEAU_PATIENCE}" \
   --das-plateau-rel-delta "${DAS_PLATEAU_REL_DELTA}" \
   --das-learning-rate "${DAS_LEARNING_RATE}" \
+  --das-restarts "${DAS_RESTARTS}" \
   --das-subspace-dims "${DAS_SUBSPACE_DIMS}" \
   --results-root "${RESULTS_ROOT}" \
   --results-timestamp "${RESULTS_TIMESTAMP}_full_das_timed" \

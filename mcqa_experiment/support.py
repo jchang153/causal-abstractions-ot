@@ -157,19 +157,92 @@ def _mask_candidates_from_ordered_support(
     return mask_candidates
 
 
+def _selection_score(payload: dict[str, object]) -> float:
+    result = payload.get("results", [{}])[0]
+    if isinstance(result, dict):
+        if result.get("selection_score") is not None:
+            return float(result.get("selection_score", 0.0))
+        if result.get("selection_exact_acc") is not None:
+            return float(result.get("selection_exact_acc", 0.0))
+        if result.get("calibration_exact_acc") is not None:
+            return float(result.get("calibration_exact_acc", 0.0))
+    return 0.0
+
+
+def _exact_acc(payload: dict[str, object]) -> float:
+    result = payload.get("results", [{}])[0]
+    if isinstance(result, dict):
+        return float(result.get("exact_acc", 0.0))
+    return 0.0
+
+
+def _selected_site_indices_from_payload(
+    payload: dict[str, object],
+    *,
+    sites: list[SiteLike],
+) -> tuple[int, ...]:
+    result = payload.get("results", [{}])[0]
+    if not isinstance(result, dict):
+        return ()
+    labels = result.get("selected_site_labels")
+    if not isinstance(labels, list) or not labels:
+        fallback_label = result.get("top_site_label") or result.get("site_label")
+        labels = [fallback_label] if fallback_label is not None else []
+    label_to_index = {str(site.label): index for index, site in enumerate(sites)}
+    selected: list[int] = []
+    for label in labels:
+        index = label_to_index.get(str(label))
+        if index is not None:
+            selected.append(int(index))
+    return tuple(dict.fromkeys(selected))
+
+
+def _selected_mask_candidate_from_payload(
+    payload: dict[str, object],
+    *,
+    sites: list[SiteLike],
+) -> dict[str, object] | None:
+    selected_indices = _selected_site_indices_from_payload(payload, sites=sites)
+    if not selected_indices:
+        return None
+    return {
+        "name": "Selected",
+        "site_indices": list(selected_indices),
+        "site_labels": [sites[site_index].label for site_index in selected_indices],
+        "site_total_dim": int(_site_mask_total_dim(sites=sites, site_mask=selected_indices)),
+        "selection_source": "best_calibrated_plot_handle",
+    }
+
+
+def _selected_trial_from_payload(payload: dict[str, object], *, method: str) -> dict[str, object]:
+    result = payload.get("results", [{}])[0]
+    result = result if isinstance(result, dict) else {}
+    return {
+        "method": str(method),
+        "selection_score": float(_selection_score(payload)),
+        "exact_acc": float(result.get("exact_acc", 0.0)),
+        "epsilon": float(payload.get("transport_meta", {}).get("epsilon_config", payload.get("ot_epsilon", 0.0))),
+        "uot_beta_neural": payload.get("transport_meta", {}).get("uot_beta_neural"),
+        "top_k": result.get("top_k"),
+        "lambda": result.get("lambda"),
+        "selected_site_labels": list(result.get("selected_site_labels", []) or []),
+    }
+
+
 def extract_ordered_site_support(
     *,
     ot_run_payloads: list[dict[str, object]],
     sites: list[SiteLike],
+    method: str = "ot",
     score_slack: float = 0.05,
     prefix_sizes: tuple[int, ...] = (1, 2, 4),
     coverage_specs: tuple[tuple[str, float], ...] = (("S50", 0.50), ("S80", 0.80)),
 ) -> dict[str, dict[str, object]]:
-    """Pool near-best OT runs into row-dominant support over an ordered site catalog."""
+    """Pool near-best OT/UOT runs into row-dominant support over an ordered site catalog."""
     grouped_payloads: dict[str, list[dict[str, object]]] = {}
     for compare_payload in ot_run_payloads:
         method_payloads = compare_payload.get("method_payloads", {})
-        for payload in method_payloads.get("ot", []):
+        for payload in method_payloads.get(str(method), []):
             grouped_payloads.setdefault(str(payload.get("target_var")), []).append(payload)
 
     support_by_var: dict[str, dict[str, object]] = {}
@@ -177,7 +250,7 @@ def extract_ordered_site_support(
         if not payloads:
             continue
         selection_scores = [
-            float(payload.get("results", [{}])[0].get("selection_score", 0.0))
+            _selection_score(payload)
             for payload in payloads
         ]
         best_score = max(selection_scores) if selection_scores else 0.0
@@ -185,12 +258,11 @@ def extract_ordered_site_support(
         kept_payloads = [
             payload
             for payload in payloads
-            if float(payload.get("results", [{}])[0].get("selection_score", 0.0)) >= score_floor
+            if _selection_score(payload) >= score_floor
         ]
         if not kept_payloads:
-            kept_payloads = [
-                max(payloads, key=lambda payload: float(payload.get("results", [{}])[0].get("selection_score", 0.0)))
-            ]
+            kept_payloads = [max(payloads, key=_selection_score)]
+        best_payload = max(payloads, key=_selection_score)
 
         site_indices = tuple(range(len(sites)))
         evidence_by_site = {site_index: 0.0 for site_index in site_indices}
@@ -237,16 +309,36 @@ def extract_ordered_site_support(
         )
         if not ranked_site_indices:
             continue
+        mask_candidates = _mask_candidates_from_ordered_support(
+            ranked_site_indices=ranked_site_indices,
+            evidence_by_site=evidence_by_site,
+            sites=sites,
+            prefix_sizes=prefix_sizes,
+            coverage_specs=coverage_specs,
+        )
+        selected_candidate = _selected_mask_candidate_from_payload(best_payload, sites=sites)
+        if selected_candidate is not None:
+            mask_candidates = [
+                selected_candidate,
+                *[
+                    candidate
+                    for candidate in mask_candidates
+                    if tuple(candidate.get("site_indices", [])) != tuple(selected_candidate["site_indices"])
+                ],
+            ]
         support_by_var[str(target_var)] = {
             "target_var": str(target_var),
             "best_selection_score": float(best_score),
             "score_slack": float(score_slack),
             "kept_trial_count": len(kept_payloads),
+            "selected_trial": _selected_trial_from_payload(best_payload, method=method),
             "kept_trials": [
                 {
-                    "selection_score": float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
-                    "exact_acc": float(payload.get("results", [{}])[0].get("exact_acc", 0.0)),
+                    "method": str(method),
+                    "selection_score": float(_selection_score(payload)),
+                    "exact_acc": float(_exact_acc(payload)),
                     "epsilon": float(payload.get("transport_meta", {}).get("epsilon_config", payload.get("ot_epsilon", 0.0))),
+                    "uot_beta_neural": payload.get("transport_meta", {}).get("uot_beta_neural"),
                 }
                 for payload in kept_payloads
             ],
@@ -260,13 +352,7 @@ def extract_ordered_site_support(
             },
             "ranked_site_indices": [int(site_index) for site_index in ranked_site_indices],
             "ranked_site_labels": [sites[site_index].label for site_index in ranked_site_indices],
-            "mask_candidates": _mask_candidates_from_ordered_support(
-                ranked_site_indices=ranked_site_indices,
-                evidence_by_site=evidence_by_site,
-                sites=sites,
-                prefix_sizes=prefix_sizes,
-                coverage_specs=coverage_specs,
-            ),
+            "mask_candidates": mask_candidates,
         }
     return support_by_var
 
@@ -275,13 +361,14 @@ def extract_layer_position_support(
     *,
     ot_run_payloads: list[dict[str, object]],
     sites: list[ResidualSite],
+    method: str = "ot",
     score_slack: float = 0.05,
 ) -> dict[str, dict[str, object]]:
-    """Pool near-best OT full-vector runs into row-dominant layer-position support."""
+    """Pool near-best OT/UOT full-vector runs into row-dominant layer-position support."""
     grouped_payloads: dict[str, list[dict[str, object]]] = {}
     for compare_payload in ot_run_payloads:
         method_payloads = compare_payload.get("method_payloads", {})
-        for payload in method_payloads.get("ot", []):
+        for payload in method_payloads.get(str(method), []):
             grouped_payloads.setdefault(str(payload.get("target_var")), []).append(payload)
 
     support_by_var: dict[str, dict[str, object]] = {}
@@ -290,7 +377,7 @@ def extract_layer_position_support(
         if not payloads:
             continue
         selection_scores = [
-            float(payload.get("results", [{}])[0].get("selection_score", 0.0))
+            _selection_score(payload)
             for payload in payloads
         ]
         best_score = max(selection_scores) if selection_scores else 0.0
@@ -298,10 +385,11 @@ def extract_layer_position_support(
         kept_payloads = [
             payload
             for payload in payloads
-            if float(payload.get("results", [{}])[0].get("selection_score", 0.0)) >= score_floor
+            if _selection_score(payload) >= score_floor
         ]
         if not kept_payloads:
-            kept_payloads = [max(payloads, key=lambda payload: float(payload.get("results", [{}])[0].get("selection_score", 0.0)))]
+            kept_payloads = [max(payloads, key=_selection_score)]
+        best_payload = max(payloads, key=_selection_score)
 
         evidence_by_position = {position: 0.0 for position in all_positions}
         mean_target_mass_by_position = {position: 0.0 for position in all_positions}
@@ -353,9 +441,11 @@ def extract_layer_position_support(
             "kept_trial_count": len(kept_payloads),
             "kept_trials": [
                 {
+                    "method": str(method),
                     "selection_score": float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
                     "exact_acc": float(payload.get("results", [{}])[0].get("exact_acc", 0.0)),
                     "epsilon": float(payload.get("transport_meta", {}).get("epsilon_config", payload.get("results", [{}])[0].get("epsilon", 0.0))),
+                    "uot_beta_neural": payload.get("transport_meta", {}).get("uot_beta_neural"),
                 }
                 for payload in kept_payloads
             ],
@@ -372,13 +462,14 @@ def extract_block_mask_support(
     *,
     ot_run_payloads: list[dict[str, object]],
     sites: list[ResidualSite],
+    method: str = "ot",
     score_slack: float = 0.05,
 ) -> dict[str, dict[str, object]]:
-    """Pool near-best OT block runs into row-dominant within-layer block masks."""
+    """Pool near-best OT/UOT block runs into row-dominant within-layer block masks."""
     grouped_payloads: dict[str, list[dict[str, object]]] = {}
     for compare_payload in ot_run_payloads:
         method_payloads = compare_payload.get("method_payloads", {})
-        for payload in method_payloads.get("ot", []):
+        for payload in method_payloads.get(str(method), []):
             grouped_payloads.setdefault(str(payload.get("target_var")), []).append(payload)
 
     support_by_var: dict[str, dict[str, object]] = {}
@@ -386,7 +477,7 @@ def extract_block_mask_support(
         if not payloads:
             continue
         selection_scores = [
-            float(payload.get("results", [{}])[0].get("selection_score", 0.0))
+            _selection_score(payload)
             for payload in payloads
         ]
         best_score = max(selection_scores) if selection_scores else 0.0
@@ -394,10 +485,11 @@ def extract_block_mask_support(
         kept_payloads = [
             payload
             for payload in payloads
-            if float(payload.get("results", [{}])[0].get("selection_score", 0.0)) >= score_floor
+            if _selection_score(payload) >= score_floor
         ]
         if not kept_payloads:
-            kept_payloads = [max(payloads, key=lambda payload: float(payload.get("results", [{}])[0].get("selection_score", 0.0)))]
+            kept_payloads = [max(payloads, key=_selection_score)]
+        best_payload = max(payloads, key=_selection_score)
 
         site_indices = tuple(range(len(sites)))
         evidence_by_site = {site_index: 0.0 for site_index in site_indices}
@@ -481,16 +573,29 @@ def extract_block_mask_support(
                     "site_total_dim": sum(int(sites[site_index].dim_end) - int(sites[site_index].dim_start) for site_index in site_mask),
                 }
             )
+        selected_candidate = _selected_mask_candidate_from_payload(best_payload, sites=sites)
+        if selected_candidate is not None:
+            mask_candidates = [
+                selected_candidate,
+                *[
+                    candidate
+                    for candidate in mask_candidates
+                    if tuple(candidate.get("site_indices", [])) != tuple(selected_candidate["site_indices"])
+                ],
+            ]
         support_by_var[str(target_var)] = {
             "target_var": str(target_var),
             "best_selection_score": float(best_score),
             "score_slack": float(score_slack),
             "kept_trial_count": len(kept_payloads),
+            "selected_trial": _selected_trial_from_payload(best_payload, method=method),
             "kept_trials": [
                 {
-                    "selection_score": float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
-                    "exact_acc": float(payload.get("results", [{}])[0].get("exact_acc", 0.0)),
+                    "method": str(method),
+                    "selection_score": float(_selection_score(payload)),
+                    "exact_acc": float(_exact_acc(payload)),
                     "epsilon": float(payload.get("transport_meta", {}).get("epsilon_config", payload.get("ot_epsilon", 0.0))),
+                    "uot_beta_neural": payload.get("transport_meta", {}).get("uot_beta_neural"),
                 }
                 for payload in kept_payloads
             ],

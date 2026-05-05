@@ -32,7 +32,7 @@ DEFAULT_PCA_BASIS_SOURCE_MODES = ("pair_bank", "all_variants")
 DEFAULT_PCA_NUM_BANDS_VALUES = (8, 16)
 DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_PCA_TOP_PREFIX_SIZES = (8, 16, 32, 64)
-DEFAULT_GUIDED_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
+DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
 DEFAULT_NATIVE_BLOCK_RESOLUTIONS = (128, 144, 192, 256, 288, 384, 576, 768)
 DEFAULT_DAS_SUBSPACE_DIMS = (
     32,
@@ -99,11 +99,8 @@ def _format_csv_numbers(values: Iterable[float | int]) -> str:
     return ",".join(_format_number(value) for value in values)
 
 
-def _score_tuple(entry: dict[str, object]) -> tuple[float, float]:
-    return (
-        float(entry.get("exact_acc", -1.0)),
-        float(entry.get("selection_score", entry.get("cal", -1.0))),
-    )
+def _score_tuple(entry: dict[str, object]) -> tuple[float, ...]:
+    return (float(entry.get("selection_score", entry.get("cal", -1.0))),)
 
 
 def _sort_best_first(entries: Iterable[dict[str, object]]) -> list[dict[str, object]]:
@@ -111,8 +108,9 @@ def _sort_best_first(entries: Iterable[dict[str, object]]) -> list[dict[str, obj
         entries,
         key=lambda entry: (
             float(entry.get("layer_score", entry.get("selection_score", entry.get("cal", -1.0)))),
-            float(entry.get("exact_acc", -1.0)),
             -int(entry.get("layer", 10**9)),
+            -int(entry.get("resolution", 10**9)) if str(entry.get("resolution", "")).isdigit() else 0,
+            -int(entry.get("num_bands", 10**9)) if str(entry.get("num_bands", "")).isdigit() else 0,
         ),
         reverse=True,
     )
@@ -157,13 +155,7 @@ def _best_result_record(payloads: Iterable[dict[str, object]]) -> dict[str, obje
         candidate = _candidate_result_record(payload)
         if candidate is None:
             continue
-        if best is None or (
-            float(candidate["selection_score"]),
-            float(candidate["exact_acc"]),
-        ) > (
-            float(best["selection_score"]),
-            float(best["exact_acc"]),
-        ):
+        if best is None or float(candidate["selection_score"]) > float(best["selection_score"]):
             best = candidate
     return best
 
@@ -202,23 +194,16 @@ def _best_joint_hyperparameter_payloads(
             continue
         group = grouped.setdefault(_joint_hyperparameter_group_key(payload), {})
         incumbent = group.get(target_var)
-        if incumbent is None or (
-            float(candidate["selection_score"]),
-            float(candidate["exact_acc"]),
-        ) > (
-            float(incumbent["selection_score"]),
-            float(incumbent["exact_acc"]),
-        ):
+        if incumbent is None or float(candidate["selection_score"]) > float(incumbent["selection_score"]):
             group[target_var] = candidate
 
     best_key: tuple[object, ...] | None = None
-    best_score: tuple[float, float, int] | None = None
+    best_score: tuple[float, int] | None = None
     for key, records_by_target in grouped.items():
         if any(target_var not in records_by_target for target_var in target_vars):
             continue
         joint_selection = sum(float(records_by_target[target_var]["selection_score"]) for target_var in target_vars) / len(target_vars)
-        joint_exact = sum(float(records_by_target[target_var]["exact_acc"]) for target_var in target_vars) / len(target_vars)
-        score = (joint_selection, joint_exact, -int(key[0]))
+        score = (joint_selection, -int(key[0]))
         if best_score is None or score > best_score:
             best_key = key
             best_score = score
@@ -234,7 +219,9 @@ def _best_joint_hyperparameter_payloads(
         "epsilon": float(best_key[2]),
         "uot_beta_neural": float(best_key[3]),
         "joint_selection_score": float(best_score[0]) if best_score is not None else -1.0,
-        "joint_exact_acc": float(best_score[1]) if best_score is not None else -1.0,
+        "joint_exact_acc": float(
+            sum(float(records[target_var]["exact_acc"]) for target_var in target_vars) / len(target_vars)
+        ),
         "joint_target_vars": list(target_vars),
         "candidate_sites": list(exemplar_payload.get("_candidate_sites", [])) if isinstance(exemplar_payload, dict) else [],
     }
@@ -421,8 +408,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pca-num-bands-values", default="8,16")
     parser.add_argument("--pca-band-scheme", default=DEFAULT_PCA_BAND_SCHEME, choices=("equal", "head"))
     parser.add_argument("--pca-top-prefix-sizes", default="8,16,32,64")
-    parser.add_argument("--stage-c-top-configs-per-var", type=int, default=2)
-    parser.add_argument("--guided-mask-names", default="Top1,Top2,Top4,S50,S80")
+    parser.add_argument("--stage-c-top-configs-per-var", type=int, default=3)
+    parser.add_argument(
+        "--guided-mask-names",
+        default="Selected",
+        help=(
+            "Comma-separated Stage C support masks. 'Selected' is the exact support chosen by "
+            "Stage B PLOT calibration; Top1/Top2/Top4/S50/S80 are optional prefix/coverage masks."
+        ),
+    )
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
     parser.add_argument("--screen-restarts", type=int, default=1)
@@ -689,6 +683,9 @@ def _build_native_block_command(
     stage_timestamp: str,
     layers: tuple[int, ...],
     transport_method: str = "ot",
+    skip_full_das: bool = False,
+    skip_guided_das: bool = False,
+    guided_mask_names: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
     command = [
         sys.executable,
@@ -745,6 +742,14 @@ def _build_native_block_command(
                 ",".join(str(dim) for dim in normalized["guided_subspace_dims"]),
             ]
         )
+    if guided_mask_names is None:
+        guided_mask_names = tuple(str(mask_name) for mask_name in normalized["guided_mask_names"])
+    if guided_mask_names:
+        command.extend(["--guided-mask-names", ",".join(str(mask_name) for mask_name in guided_mask_names)])
+    if bool(skip_full_das):
+        command.append("--skip-full-das")
+    if bool(skip_guided_das):
+        command.append("--skip-guided-das")
     _append_optional_arg(command, "--dataset-config", args.dataset_config)
     if bool(args.prompt_hf_login):
         command.append("--prompt-hf-login")
@@ -1427,6 +1432,7 @@ def _extract_native_rankings(
                         "variable": target_var,
                         "layer_selection_method": layer_selection_method,
                         "transport_method": str(transport_method),
+                        "token_position_id": str(payload.get("token_position_ids", ["last_token"])[0]),
                         "layer": layer,
                         "resolution": resolution,
                         "exact_acc": float(result.get("exact_acc", -1.0)),
@@ -1626,6 +1632,36 @@ def _select_stage_c_configs(
     return {
         key: tuple(sorted(dict.fromkeys(layers)))
         for key, layers in grouped.items()
+    }
+
+
+def _select_stage_c_native_configs(
+    *,
+    rankings: dict[str, list[dict[str, object]]],
+    top_configs_per_var: int,
+) -> dict[tuple[str, str, str, int, int], tuple[str, ...]]:
+    grouped: dict[tuple[str, str, str, int, int], list[str]] = {}
+    for target_var in DEFAULT_TARGET_VARS:
+        entries_by_method: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for entry in rankings.get(target_var, []):
+            key = (
+                str(entry.get("layer_selection_method", "custom")),
+                str(entry.get("transport_method", "ot")),
+            )
+            entries_by_method.setdefault(key, []).append(entry)
+        for (layer_selection_method, transport_method), method_entries in entries_by_method.items():
+            for entry in method_entries[: max(1, int(top_configs_per_var))]:
+                key = (
+                    str(layer_selection_method),
+                    str(transport_method),
+                    str(entry.get("token_position_id", "last_token")),
+                    int(entry["layer"]),
+                    int(entry["resolution"]),
+                )
+                grouped.setdefault(key, []).append(str(target_var))
+    return {
+        key: tuple(dict.fromkeys(target_vars))
+        for key, target_vars in grouped.items()
     }
 
 
@@ -1913,6 +1949,7 @@ def main() -> None:
                     stage_a_summary_paths.append(ranking_json_path)
 
     native_payload_paths: list[Path] = []
+    native_ot_rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     if "stage_b_native_ot" in normalized["stages"]:
         for token_position_id, rankings in stage_a_rankings_by_token.items():
             if str(token_position_id) != "last_token":
@@ -1966,13 +2003,15 @@ def main() -> None:
             stage = SweepStage(
                 name=stage_name,
                 category="stage_b_native_ot",
-                description=f"Native block OT and guided DAS for selected {token_position_id} layers {list(selected_layers)}.",
+                description=f"Native block OT support extraction for selected {token_position_id} layers {list(selected_layers)}.",
                 stage_timestamp=stage_timestamp,
                 command=_build_native_block_command(
                     args=args,
                     normalized=normalized,
                     stage_timestamp=stage_timestamp,
                     layers=selected_layers,
+                    skip_full_das=True,
+                    skip_guided_das=True,
                 ),
                 expected_outputs=tuple(expected_outputs),
             )
@@ -2011,22 +2050,18 @@ def main() -> None:
                     "completed_at": datetime.now().isoformat(),
                 },
             )
-        native_ot_rankings, native_guided_rankings, a_only_rankings = _extract_native_rankings(payload_paths=native_payload_paths)
+        native_ot_rankings, _, _ = _extract_native_rankings(payload_paths=native_payload_paths)
         _write_json(sweep_root / "stage_b_native_rankings.json", native_ot_rankings)
         _write_text(
             sweep_root / "stage_b_native_rankings.txt",
             _format_native_summary(title="MCQA Hierarchical Stage B Native OT Ranking", rankings=native_ot_rankings),
         )
-        _write_json(sweep_root / "stage_c_native_guided_rankings.json", native_guided_rankings)
-        _write_text(
-            sweep_root / "stage_c_native_guided_rankings.txt",
-            _format_native_summary(title="MCQA Hierarchical Stage C Native Guided DAS Ranking", rankings=native_guided_rankings),
-        )
-        _write_json(sweep_root / "stage_c_a_only_rankings.json", a_only_rankings)
-        _write_text(
-            sweep_root / "stage_c_a_only_rankings.txt",
-            _format_native_summary(title="MCQA Hierarchical Stage C A-only DAS Ranking", rankings=a_only_rankings),
-        )
+    else:
+        native_json_path = sweep_root / "stage_b_native_rankings.json"
+        if _stage_output_is_valid(native_json_path):
+            payload = _load_json(native_json_path)
+            if isinstance(payload, dict):
+                native_ot_rankings = payload
 
     stage_b_payload_paths: list[Path] = []
     stage_b_rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
@@ -2162,6 +2197,218 @@ def main() -> None:
                 stage_b_rankings = payload
 
     if "stage_c_guided_das" in normalized["stages"]:
+        stage_c_a_only_payload_paths: list[Path] = []
+        for token_position_id, rankings in stage_a_rankings_by_token.items():
+            selected_layers = _select_stage_b_layers(
+                rankings=rankings,
+                top_layers_per_var=int(args.stage_b_top_layers_per_var),
+                neighbor_radius=int(args.stage_b_neighbor_radius),
+                max_layers_per_var=int(args.stage_b_max_layers_per_var),
+                valid_layers=_selection_valid_layers(
+                    rankings=rankings,
+                    normalized=normalized,
+                    max_layers_per_var=int(args.stage_b_max_layers_per_var),
+                ),
+            )
+            for layer in selected_layers:
+                stage_name = f"stage_c_a_only_{str(token_position_id)}_L{int(layer):02d}"
+                stage_timestamp = f"{str(normalized['results_timestamp'])}_stageC_a_only_{str(token_position_id)}_L{int(layer):02d}"
+                output_path = _stage_a_output_path(results_root=results_root, stage_timestamp=stage_timestamp)
+                expected_outputs = [str(output_path)]
+                if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
+                    stage_c_a_only_payload_paths.append(output_path)
+                    _mark_stage(
+                        manifest_path=manifest_path,
+                        repo_root=repo_root,
+                        args=args,
+                        normalized=normalized,
+                        stage_statuses=stage_statuses,
+                        stage_name=stage_name,
+                        payload={
+                            "state": "skipped_existing",
+                            "stage_timestamp": stage_timestamp,
+                            "expected_outputs": expected_outputs,
+                            "completed_at": datetime.now().isoformat(),
+                        },
+                    )
+                    continue
+                stage = SweepStage(
+                    name=stage_name,
+                    category="stage_c_a_only_das",
+                    description=f"Full-layer DAS on Stage A-selected layer {int(layer)} at token position {token_position_id}.",
+                    stage_timestamp=stage_timestamp,
+                    command=_build_stage_c_a_only_command(
+                        args=args,
+                        normalized=normalized,
+                        stage_timestamp=stage_timestamp,
+                        token_position_id=str(token_position_id),
+                        layers=(int(layer),),
+                    ),
+                    expected_outputs=tuple(expected_outputs),
+                )
+                _mark_stage(
+                    manifest_path=manifest_path,
+                    repo_root=repo_root,
+                    args=args,
+                    normalized=normalized,
+                    stage_statuses=stage_statuses,
+                    stage_name=stage.name,
+                    payload={
+                        "state": "running",
+                        "stage_timestamp": stage_timestamp,
+                        "expected_outputs": expected_outputs,
+                        "started_at": datetime.now().isoformat(),
+                    },
+                )
+                stage_runtime_seconds = _run_stage_command(stage=stage, repo_root=repo_root)
+                missing_outputs = [path for path in expected_outputs if not _stage_output_is_valid(Path(path))]
+                if missing_outputs:
+                    raise RuntimeError(f"Stage {stage_name} missing outputs: {missing_outputs}")
+                stage_c_a_only_payload_paths.append(output_path)
+                _mark_stage(
+                    manifest_path=manifest_path,
+                    repo_root=repo_root,
+                    args=args,
+                    normalized=normalized,
+                    stage_statuses=stage_statuses,
+                    stage_name=stage.name,
+                    payload={
+                        "state": "completed",
+                        "stage_timestamp": stage_timestamp,
+                        "expected_outputs": expected_outputs,
+                        "runtime_seconds": float(stage_runtime_seconds),
+                        "wall_runtime_seconds": float(stage_runtime_seconds),
+                        "completed_at": datetime.now().isoformat(),
+                    },
+                )
+        if stage_c_a_only_payload_paths:
+            a_only_rankings = _extract_a_only_rankings(payload_paths=stage_c_a_only_payload_paths)
+            _write_json(sweep_root / "stage_c_a_only_rankings.json", a_only_rankings)
+            _write_text(
+                sweep_root / "stage_c_a_only_rankings.txt",
+                _format_native_summary(title="MCQA Hierarchical Stage C A-only DAS Ranking", rankings=a_only_rankings),
+            )
+
+        selected_native_config_groups = _select_stage_c_native_configs(
+            rankings=native_ot_rankings,
+            top_configs_per_var=int(args.stage_c_top_configs_per_var),
+        )
+        stage_c_native_payload_paths: list[Path] = []
+        for (layer_selection_method, transport_method, token_position_id, layer, resolution), target_vars in selected_native_config_groups.items():
+            stage_name = f"stage_c_native_{str(token_position_id)}_L{int(layer):02d}_res{int(resolution)}"
+            stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_native_{str(token_position_id)}"
+            native_root = results_root / f"{stage_timestamp}_mcqa_ot_das_block_focus"
+            layer_dir = native_root / f"layer_{int(layer):02d}"
+            expected_outputs = [
+                str(
+                    layer_dir
+                    / (
+                        f"mcqa_layer-{int(layer)}_pos-last_token_res-{int(resolution)}"
+                        f"_sig-{str(args.signature_mode)}_ot_das_block.json"
+                    )
+                )
+            ]
+            for target_var in normalized["target_vars"]:
+                expected_outputs.append(
+                    str(
+                        layer_dir
+                        / (
+                            f"mcqa_layer-{int(layer)}_pos-last_token_res-{int(resolution)}"
+                            f"_sig-{str(args.signature_mode)}_{str(target_var)}_das_block.json"
+                        )
+                    )
+                )
+            if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
+                stage_c_native_payload_paths.append(Path(expected_outputs[0]))
+                _mark_stage(
+                    manifest_path=manifest_path,
+                    repo_root=repo_root,
+                    args=args,
+                    normalized=normalized,
+                    stage_statuses=stage_statuses,
+                    stage_name=stage_name,
+                    payload={
+                        "state": "skipped_existing",
+                        "stage_timestamp": stage_timestamp,
+                        "expected_outputs": expected_outputs,
+                        "stage_c_target_vars": list(target_vars),
+                        "stage_c_selection_basis": "top_stage_b_plot_calibration_score_per_variable",
+                        "completed_at": datetime.now().isoformat(),
+                    },
+                )
+                continue
+            task_normalized = dict(normalized)
+            task_normalized["native_block_resolutions"] = (int(resolution),)
+            stage = SweepStage(
+                name=stage_name,
+                category="stage_c_native_guided_das",
+                description=(
+                    f"Native guided DAS on PLOT-selected support selection={layer_selection_method}, "
+                    f"method={transport_method}, token_position={token_position_id}, "
+                    f"layer={int(layer)}, resolution={int(resolution)}."
+                ),
+                stage_timestamp=stage_timestamp,
+                command=_build_native_block_command(
+                    args=args,
+                    normalized=task_normalized,
+                    stage_timestamp=stage_timestamp,
+                    layers=(int(layer),),
+                    transport_method=str(transport_method),
+                    skip_full_das=True,
+                    skip_guided_das=False,
+                    guided_mask_names=tuple(str(mask_name) for mask_name in normalized["guided_mask_names"]),
+                ),
+                expected_outputs=tuple(expected_outputs),
+            )
+            _mark_stage(
+                manifest_path=manifest_path,
+                repo_root=repo_root,
+                args=args,
+                normalized=normalized,
+                stage_statuses=stage_statuses,
+                stage_name=stage.name,
+                payload={
+                    "state": "running",
+                    "stage_timestamp": stage_timestamp,
+                    "expected_outputs": expected_outputs,
+                    "stage_c_target_vars": list(target_vars),
+                    "stage_c_selection_basis": "top_stage_b_plot_calibration_score_per_variable",
+                    "started_at": datetime.now().isoformat(),
+                },
+            )
+            stage_runtime_seconds = _run_stage_command(stage=stage, repo_root=repo_root)
+            missing_outputs = [path for path in expected_outputs if not _stage_output_is_valid(Path(path))]
+            if missing_outputs:
+                raise RuntimeError(f"Stage {stage_name} missing outputs: {missing_outputs}")
+            stage_c_native_payload_paths.append(Path(expected_outputs[0]))
+            _mark_stage(
+                manifest_path=manifest_path,
+                repo_root=repo_root,
+                args=args,
+                normalized=normalized,
+                stage_statuses=stage_statuses,
+                stage_name=stage.name,
+                payload={
+                    "state": "completed",
+                    "stage_timestamp": stage_timestamp,
+                    "expected_outputs": expected_outputs,
+                    "stage_c_target_vars": list(target_vars),
+                    "stage_c_selection_basis": "top_stage_b_plot_calibration_score_per_variable",
+                    "runtime_seconds": float(stage_runtime_seconds),
+                    "wall_runtime_seconds": float(stage_runtime_seconds),
+                    "completed_at": datetime.now().isoformat(),
+                },
+            )
+        if stage_c_native_payload_paths:
+            _, native_guided_rankings, _ = _extract_native_rankings(
+                payload_paths=list(dict.fromkeys(stage_c_native_payload_paths))
+            )
+            _write_json(sweep_root / "stage_c_native_guided_rankings.json", native_guided_rankings)
+            _write_text(
+                sweep_root / "stage_c_native_guided_rankings.txt",
+                _format_native_summary(title="MCQA Hierarchical Stage C Native Guided DAS Ranking", rankings=native_guided_rankings),
+            )
+
         selected_config_groups = _select_stage_c_configs(
             rankings=stage_b_rankings,
             top_configs_per_var=int(args.stage_c_top_configs_per_var),

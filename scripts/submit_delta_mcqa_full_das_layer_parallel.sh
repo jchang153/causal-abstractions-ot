@@ -11,6 +11,21 @@ DELTA_PARTITION="${DELTA_PARTITION:-gpuA100x4}"
 ARRAY_THROTTLE="${ARRAY_THROTTLE:-8}"
 FULL_DAS_LAYER_TIME="${FULL_DAS_LAYER_TIME:-02:00:00}"
 LAYER_INDICES="${LAYER_INDICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25}"
+export DAS_RESTARTS="${DAS_RESTARTS:-2}"
+
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  if [[ -r "${HOME}/.secrets/hf_token" ]]; then
+    export HF_TOKEN="$(< "${HOME}/.secrets/hf_token")"
+  else
+    echo "[submit-delta-full-das-layer] HF_TOKEN is unset and ${HOME}/.secrets/hf_token is not readable"
+    exit 1
+  fi
+fi
+export HF_HOME="${HF_HOME:-${SCRATCH:-/tmp/${USER}}/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 LAYER_COUNT="$(
   python -c 'import sys; print(len([x for x in sys.argv[1].split(",") if x.strip()]))' "${LAYER_INDICES}"
@@ -33,11 +48,14 @@ echo "[submit-delta-full-das-layer] array_throttle=${ARRAY_THROTTLE}"
 echo "[submit-delta-full-das-layer] time_limit=${FULL_DAS_LAYER_TIME}"
 echo "[submit-delta-full-das-layer] token_position_ids=${TOKEN_POSITION_IDS:-last_token}"
 echo "[submit-delta-full-das-layer] das_subspace_dims=${DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
+echo "[submit-delta-full-das-layer] das_restarts=${DAS_RESTARTS}"
+echo "[submit-delta-full-das-layer] hf_home=${HF_HOME}"
 
 RESULTS_TIMESTAMP="${TIMESTAMP}" \
 RESULTS_ROOT="${RESULTS_ROOT}" \
 SPLIT_SEED="${SPLIT_SEED}" \
 LAYER_INDICES="${LAYER_INDICES}" \
+DAS_RESTARTS="${DAS_RESTARTS}" \
 sbatch \
   --account="${DELTA_ACCOUNT}" \
   --partition="${DELTA_PARTITION}" \

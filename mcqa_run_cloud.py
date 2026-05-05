@@ -219,6 +219,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--das-plateau-patience", type=int)
     parser.add_argument("--das-plateau-rel-delta", type=float)
     parser.add_argument("--das-learning-rate", type=float)
+    parser.add_argument("--das-restarts", type=int)
     parser.add_argument("--das-subspace-dims", help="Comma-separated integers")
     parser.add_argument("--results-root")
     parser.add_argument("--results-timestamp")
@@ -327,6 +328,8 @@ def _override_base_run(
         base_run.DAS_PLATEAU_REL_DELTA = float(args.das_plateau_rel_delta)
     if args.das_learning_rate is not None:
         base_run.DAS_LEARNING_RATE = float(args.das_learning_rate)
+    if args.das_restarts is not None:
+        base_run.DAS_RESTARTS = int(args.das_restarts)
     das_subspace_dims = _parse_csv_ints(args.das_subspace_dims)
     if das_subspace_dims is not None:
         base_run.DAS_SUBSPACE_DIMS = das_subspace_dims
@@ -369,6 +372,7 @@ def _override_base_run(
         "das_plateau_patience": base_run.DAS_PLATEAU_PATIENCE,
         "das_plateau_rel_delta": base_run.DAS_PLATEAU_REL_DELTA,
         "das_learning_rate": base_run.DAS_LEARNING_RATE,
+        "das_restarts": base_run.DAS_RESTARTS,
         "das_subspace_dims": list(base_run.DAS_SUBSPACE_DIMS),
         "prompt_hf_login": base_run.PROMPT_HF_LOGIN,
         "run_dir": str(base_run.RUN_DIR),

@@ -223,6 +223,39 @@ def _expected_native_payload_paths(
     return outputs
 
 
+def _expected_native_guided_outputs(
+    *,
+    args: argparse.Namespace,
+    stage_timestamp: str,
+    layer: int,
+    resolution: int,
+    target_vars: tuple[str, ...],
+) -> list[str]:
+    native_root = Path(args.results_root) / f"{stage_timestamp}_mcqa_ot_das_block_focus"
+    layer_dir = native_root / f"layer_{int(layer):02d}"
+    resolution_tag = str(int(resolution))
+    outputs = [
+        str(
+            layer_dir
+            / (
+                f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}"
+                f"_sig-{str(args.signature_mode)}_ot_das_block.json"
+            )
+        )
+    ]
+    for target_var in target_vars:
+        outputs.append(
+            str(
+                layer_dir
+                / (
+                    f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}"
+                    f"_sig-{str(args.signature_mode)}_{str(target_var)}_das_block.json"
+                )
+            )
+        )
+    return outputs
+
+
 def _stage_a_rankings_paths(*, sweep_root: Path, token_position_id: str) -> tuple[Path, Path]:
     return (
         sweep_root / f"stage_a_{str(token_position_id)}_layer_rankings.json",
@@ -767,6 +800,8 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
                                             stage_timestamp=stage_timestamp,
                                             layers=(int(layer),),
                                             transport_method=str(transport_method),
+                                            skip_full_das=True,
+                                            skip_guided_das=True,
                                         )
                                     ),
                                     "expected_outputs": expected_outputs,
@@ -960,10 +995,67 @@ def _pca_task_lookup(tasks: Iterable[dict[str, object]]) -> dict[tuple[str, str,
     return lookup
 
 
+def _native_task_lookup(tasks: Iterable[dict[str, object]]) -> dict[tuple[str, str, str, int, int], dict[str, object]]:
+    lookup: dict[tuple[str, str, str, int, int], dict[str, object]] = {}
+    for task in tasks:
+        key = (
+            str(task.get("layer_selection_method", "custom")),
+            str(task.get("transport_method", "ot")),
+            str(task.get("token_position_id", "last_token")),
+            int(task["layer"]),
+            int(task["resolution"]),
+        )
+        lookup[key] = task
+    return lookup
+
+
+def _select_stage_c_native_configs(
+    *,
+    rankings: dict[str, list[dict[str, object]]],
+    top_configs_per_var: int,
+) -> dict[tuple[str, str, str, int, int], tuple[str, ...]]:
+    grouped: dict[tuple[str, str, str, int, int], list[str]] = {}
+    for target_var in DEFAULT_TARGET_VARS:
+        entries_by_method: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for entry in rankings.get(target_var, []):
+            key = (
+                str(entry.get("layer_selection_method", "custom")),
+                str(entry.get("transport_method", "ot")),
+            )
+            entries_by_method.setdefault(key, []).append(entry)
+        for (layer_selection_method, transport_method), method_entries in entries_by_method.items():
+            for entry in method_entries[: max(1, int(top_configs_per_var))]:
+                key = (
+                    str(layer_selection_method),
+                    str(transport_method),
+                    str(entry.get("token_position_id", "last_token")),
+                    int(entry["layer"]),
+                    int(entry["resolution"]),
+                )
+                grouped.setdefault(key, []).append(str(target_var))
+    return {
+        key: tuple(dict.fromkeys(target_vars))
+        for key, target_vars in grouped.items()
+    }
+
+
 def plan_stage_c_tasks(args: argparse.Namespace) -> None:
     normalized = _normalize_args(args)
     sweep_root = _sweep_root(args, normalized)
     rankings_by_token = _load_stage_a_rankings_by_token(args=args, normalized=normalized, sweep_root=sweep_root)
+    native_rankings_path = sweep_root / "stage_b_native_rankings.json"
+    native_task_manifest_path = sweep_root / "stage_b_native_tasks.json"
+    native_rankings: dict[str, list[dict[str, object]]] = {}
+    selected_native_groups: dict[tuple[str, str, str, int, int], tuple[str, ...]] = {}
+    native_lookup: dict[tuple[str, str, str, int, int], dict[str, object]] = {}
+    if _stage_output_is_valid(native_rankings_path) and _stage_output_is_valid(native_task_manifest_path):
+        native_rankings = _read_rankings(native_rankings_path)
+        selected_native_groups = _select_stage_c_native_configs(
+            rankings=native_rankings,
+            top_configs_per_var=int(args.stage_c_top_configs_per_var),
+        )
+        native_manifest = _load_task_manifest(native_task_manifest_path)
+        native_lookup = _native_task_lookup(native_manifest["tasks"])
     stage_b_rankings = _read_rankings(sweep_root / "stage_b_pca_rankings.json")
     selected_groups = _select_stage_c_configs(
         rankings=stage_b_rankings,
@@ -971,6 +1063,7 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
     )
     pca_manifest = _load_task_manifest(sweep_root / "stage_b_pca_tasks.json")
     pca_lookup = _pca_task_lookup(pca_manifest["tasks"])
+    stage_c_native_tasks: list[dict[str, object]] = []
     stage_c_tasks: list[dict[str, object]] = []
     a_only_tasks: list[dict[str, object]] = []
     selection_specs = _stage_b_selection_specs(args=args, normalized=normalized)
@@ -1014,6 +1107,61 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
                         "payload_paths": [str(output_path)],
                     }
                 )
+
+    for (layer_selection_method, transport_method, token_position_id, layer, resolution), target_vars in selected_native_groups.items():
+        key = (
+            str(layer_selection_method),
+            str(transport_method),
+            str(token_position_id),
+            int(layer),
+            int(resolution),
+        )
+        stage_b_task = native_lookup.get(key)
+        if stage_b_task is None:
+            raise RuntimeError(f"Could not find Stage B native task for Stage C key={key}")
+        stage_timestamp = str(stage_b_task["stage_timestamp"])
+        expected_outputs = _expected_native_guided_outputs(
+            args=args,
+            stage_timestamp=stage_timestamp,
+            layer=int(layer),
+            resolution=int(resolution),
+            target_vars=tuple(str(target_var) for target_var in normalized["target_vars"]),
+        )
+        task_normalized = dict(normalized)
+        task_normalized["native_block_resolutions"] = (int(resolution),)
+        stage_c_native_tasks.append(
+            {
+                "task_id": f"stage_c_{stage_b_task['task_id']}",
+                "category": "stage_c_native_guided_das",
+                "layer_selection_method": str(layer_selection_method),
+                "layer_selection_top_layers_per_var": stage_b_task.get("layer_selection_top_layers_per_var"),
+                "layer_selection_neighbor_radius": stage_b_task.get("layer_selection_neighbor_radius"),
+                "layer_selection_max_layers_per_var": stage_b_task.get("layer_selection_max_layers_per_var"),
+                "selected_layers": stage_b_task.get("selected_layers", []),
+                "transport_method": str(transport_method),
+                "token_position_id": str(token_position_id),
+                "layer": int(layer),
+                "resolution": int(resolution),
+                "stage_timestamp": stage_timestamp,
+                "stage_c_target_vars": list(target_vars),
+                "stage_c_selection_basis": "top_stage_b_plot_calibration_score_per_variable",
+                "guided_mask_names": [str(mask_name) for mask_name in normalized["guided_mask_names"]],
+                "command": list(
+                    _build_native_block_command(
+                        args=args,
+                        normalized=task_normalized,
+                        stage_timestamp=stage_timestamp,
+                        layers=(int(layer),),
+                        transport_method=str(transport_method),
+                        skip_full_das=True,
+                        skip_guided_das=False,
+                        guided_mask_names=tuple(str(mask_name) for mask_name in normalized["guided_mask_names"]),
+                    )
+                ),
+                "expected_outputs": expected_outputs,
+                "payload_paths": [expected_outputs[0]],
+            }
+        )
 
     for (layer_selection_method, transport_method, token_position_id, basis_source_mode, site_menu, num_bands), layers in selected_groups.items():
         for layer in layers:
@@ -1074,6 +1222,7 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
                     "payload_paths": [expected_outputs[0]],
                 }
             )
+    _write_task_manifest(sweep_root / "stage_c_native_tasks.json", kind="stage_c_native_tasks", tasks=stage_c_native_tasks)
     _write_task_manifest(sweep_root / "stage_c_pca_tasks.json", kind="stage_c_pca_tasks", tasks=stage_c_tasks)
     _write_task_manifest(sweep_root / "stage_c_a_only_tasks.json", kind="stage_c_a_only_tasks", tasks=a_only_tasks)
     _write_text(
@@ -1083,27 +1232,48 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
                 "MCQA hierarchical parallel Stage C task plan",
                 "stage_b_selection_methods: "
                 + ",".join(f"{spec.name}(top={spec.top_layers_per_var},r={spec.neighbor_radius},max={spec.max_layers_per_var})" for spec in selection_specs),
+                f"stage_c_native_tasks: {len(stage_c_native_tasks)}",
                 f"stage_c_pca_tasks: {len(stage_c_tasks)}",
                 f"stage_c_a_only_tasks: {len(a_only_tasks)}",
                 "",
                 *[f"{task['task_id']} -> {task['stage_timestamp']}" for task in a_only_tasks],
                 "",
+                *[f"{task['task_id']} -> {task['stage_timestamp']}" for task in stage_c_native_tasks],
+                "",
                 *[f"{task['task_id']} -> {task['stage_timestamp']}" for task in stage_c_tasks],
             ]
         ),
     )
-    print(f"[parallel-plan-stage-c] wrote {len(stage_c_tasks)} PCA Stage C tasks and {len(a_only_tasks)} A-only tasks to {sweep_root}")
+    print(
+        f"[parallel-plan-stage-c] wrote {len(stage_c_native_tasks)} native Stage C tasks, "
+        f"{len(stage_c_tasks)} PCA Stage C tasks, and {len(a_only_tasks)} A-only tasks to {sweep_root}"
+    )
 
 
 def aggregate_stage_c(args: argparse.Namespace, *, strict: bool = True) -> None:
     normalized = _normalize_args(args)
     sweep_root = _sweep_root(args, normalized)
+    native_task_manifest_path = sweep_root / "stage_c_native_tasks.json"
     task_manifest_path = sweep_root / "stage_c_pca_tasks.json"
     a_only_manifest_path = sweep_root / "stage_c_a_only_tasks.json"
     if not _stage_output_is_valid(task_manifest_path):
         if strict:
             raise FileNotFoundError(f"Missing Stage C task manifest: {task_manifest_path}")
         return
+    native_stage_c_payload_paths: list[Path] = []
+    if _stage_output_is_valid(native_task_manifest_path):
+        native_task_manifest = _load_task_manifest(native_task_manifest_path)
+        native_stage_c_payload_paths = _valid_payload_paths_from_tasks(native_task_manifest["tasks"], strict=strict)
+        if native_stage_c_payload_paths:
+            _, native_guided_rankings, _ = _extract_native_rankings(
+                payload_paths=native_stage_c_payload_paths,
+                metadata_by_payload_path=_task_metadata_by_payload_path(native_task_manifest["tasks"]),
+            )
+            _write_json(sweep_root / "stage_c_native_guided_rankings.json", native_guided_rankings)
+            _write_text(
+                sweep_root / "stage_c_native_guided_rankings.txt",
+                _format_native_summary(title="MCQA Hierarchical Stage C Native Guided DAS Ranking", rankings=native_guided_rankings),
+            )
     task_manifest = _load_task_manifest(task_manifest_path)
     stage_c_payload_paths = _valid_payload_paths_from_tasks(task_manifest["tasks"], strict=strict)
     stage_c_rankings = _extract_stage_c_rankings(
@@ -1126,7 +1296,8 @@ def aggregate_stage_c(args: argparse.Namespace, *, strict: bool = True) -> None:
             _format_native_summary(title="MCQA Hierarchical Stage C A-only DAS Ranking", rankings=a_only_rankings),
         )
     print(
-        f"[parallel-aggregate-stage-c] aggregated {len(stage_c_payload_paths)} PCA Stage C payloads "
+        f"[parallel-aggregate-stage-c] aggregated {len(native_stage_c_payload_paths)} native Stage C payloads, "
+        f"{len(stage_c_payload_paths)} PCA Stage C payloads "
         f"and {len(a_only_payload_paths)} A-only payloads"
     )
 

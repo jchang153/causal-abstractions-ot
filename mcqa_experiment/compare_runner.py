@@ -48,7 +48,7 @@ class CompareExperimentConfig:
     das_learning_rate: float = 1e-3
     das_subspace_dims: tuple[int, ...] | None = None
     das_store_candidate_holdout_metrics: bool = False
-    das_restarts: int = 1
+    das_restarts: int = 2
     resolution: int | None = None
     layers: tuple[int, ...] | None = None
     token_position_ids: tuple[str, ...] | None = ("correct_symbol", "correct_symbol_period", "last_token")

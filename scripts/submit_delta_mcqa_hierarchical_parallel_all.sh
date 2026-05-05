@@ -12,7 +12,19 @@ SUBMIT_FULL_DAS="${SUBMIT_FULL_DAS:-0}"
 SUBMIT_STAGE_C="${SUBMIT_STAGE_C:-1}"
 SPLIT_SEED="${SPLIT_SEED:-0}"
 
-export HF_TOKEN="${HF_TOKEN:-$(cat "$HOME/.secrets/hf_token")}"
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  if [[ -r "${HOME}/.secrets/hf_token" ]]; then
+    export HF_TOKEN="$(< "${HOME}/.secrets/hf_token")"
+  else
+    echo "[submit-delta-hpar-all] HF_TOKEN is unset and ${HOME}/.secrets/hf_token is not readable"
+    exit 1
+  fi
+fi
+export HF_HOME="${HF_HOME:-${SCRATCH:-/tmp/${USER}}/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 ROOT="${RESULTS_ROOT}/${TIMESTAMP}_mcqa_hierarchical_sweep"
 mkdir -p "${ROOT}"
@@ -22,8 +34,13 @@ echo "[submit-delta-hpar-all] delta_account=${DELTA_ACCOUNT}"
 echo "[submit-delta-hpar-all] delta_partition=${DELTA_PARTITION}"
 echo "[submit-delta-hpar-all] stage_b_array_throttle=${ARRAY_THROTTLE_STAGE_B}"
 echo "[submit-delta-hpar-all] stage_c_array_throttle=${ARRAY_THROTTLE_STAGE_C}"
-echo "[submit-delta-hpar-all] stage_a_method=${STAGE_A_METHOD:-ot}"
+echo "[submit-delta-hpar-all] stage_a_method=${STAGE_A_METHOD:-uot}"
+echo "[submit-delta-hpar-all] stage_a_hparam_selection=${STAGE_A_HPARAM_SELECTION:-rowwise}"
+echo "[submit-delta-hpar-all] stage_b_methods=${STAGE_B_METHODS:-ot}"
+echo "[submit-delta-hpar-all] stage_b_selection_methods=${STAGE_B_SELECTION_METHODS:-custom}"
+echo "[submit-delta-hpar-all] stage_b_layer_indices=${STAGE_B_LAYER_INDICES:-}"
 echo "[submit-delta-hpar-all] uot_beta_neurals=${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
+echo "[submit-delta-hpar-all] hf_home=${HF_HOME}"
 echo "[submit-delta-hpar-all] submit_full_das=${SUBMIT_FULL_DAS}"
 echo "[submit-delta-hpar-all] submit_stage_c=${SUBMIT_STAGE_C}"
 echo "[submit-delta-hpar-all] split_seed=${SPLIT_SEED}"
@@ -54,10 +71,11 @@ STAGE_B_SUBMITTER_JOB="$(
     --constraint="${DELTA_CONSTRAINT:-scratch}" \
     --dependency="afterok:${STAGE_A_JOB}" \
     --time="${ORCHESTRATOR_TIME:-00:30:00}" \
+    --export=ALL \
     --output="${ROOT}/mcqa-submit-b-%j.out" \
     --error="${ROOT}/mcqa-submit-b-%j.err" \
     --job-name=mcqa-submit-b \
-    --wrap="cd ${PWD} && export HF_TOKEN=\"\$(cat \$HOME/.secrets/hf_token)\" && SPLIT_SEED=${SPLIT_SEED} SUBMIT_STAGE_C=${SUBMIT_STAGE_C} ARRAY_THROTTLE_STAGE_B=${ARRAY_THROTTLE_STAGE_B} ARRAY_THROTTLE_STAGE_C=${ARRAY_THROTTLE_STAGE_C} bash scripts/delta_mcqa_hierarchical_parallel_after_stage_a.sh ${TIMESTAMP}" \
+    --wrap="cd ${PWD} && STAGE_A_METHOD=${STAGE_A_METHOD:-uot} STAGE_A_HPARAM_SELECTION=${STAGE_A_HPARAM_SELECTION:-rowwise} STAGE_B_METHODS=${STAGE_B_METHODS:-ot} STAGE_B_SELECTION_METHODS=${STAGE_B_SELECTION_METHODS:-custom} STAGE_B_LAYER_INDICES=${STAGE_B_LAYER_INDICES:-} UOT_BETA_NEURALS=${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3} OT_EPSILONS=${OT_EPSILONS:-0.5,1,2,4} OT_TOP_K_VALUES=${OT_TOP_K_VALUES:-1,2,4} OT_LAMBDAS=${OT_LAMBDAS:-0.5,1,2,4} SPLIT_SEED=${SPLIT_SEED} SUBMIT_STAGE_C=${SUBMIT_STAGE_C} ARRAY_THROTTLE_STAGE_B=${ARRAY_THROTTLE_STAGE_B} ARRAY_THROTTLE_STAGE_C=${ARRAY_THROTTLE_STAGE_C} bash scripts/delta_mcqa_hierarchical_parallel_after_stage_a.sh ${TIMESTAMP}" \
     | awk '/Submitted batch job/ {print $4}'
 )"
 echo "[submit-delta-hpar-all] stage_b_submitter_job=${STAGE_B_SUBMITTER_JOB}"

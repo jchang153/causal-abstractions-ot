@@ -8,6 +8,7 @@ RESULTS_ROOT="${RESULTS_ROOT:-results/delta}"
 DELTA_ACCOUNT="${DELTA_ACCOUNT:-bgvo-delta-gpu}"
 DELTA_PARTITION="${DELTA_PARTITION:-gpuA100x4}"
 ARRAY_THROTTLE="${ARRAY_THROTTLE:-4}"
+DELTA_STAGE_C_TIME="${DELTA_STAGE_C_TIME:-02:00:00}"
 SPLIT_SEED="${SPLIT_SEED:-0}"
 
 VENV_PATH="${VENV_PATH:-${HOME}/venvs/causal-ot}"
@@ -17,16 +18,34 @@ if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
 fi
 source "${VENV_PATH}/bin/activate"
 
-export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN before planning/submitting Stage C.}"
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  if [[ -r "${HOME}/.secrets/hf_token" ]]; then
+    export HF_TOKEN="$(< "${HOME}/.secrets/hf_token")"
+  else
+    echo "[submit-delta-hpar-c] HF_TOKEN is unset and ${HOME}/.secrets/hf_token is not readable"
+    exit 1
+  fi
+fi
+export HF_HOME="${HF_HOME:-${SCRATCH:-/tmp/${USER}}/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 echo "[submit-delta-hpar-c] timestamp=${TIMESTAMP}"
 echo "[submit-delta-hpar-c] delta_account=${DELTA_ACCOUNT}"
 echo "[submit-delta-hpar-c] delta_partition=${DELTA_PARTITION}"
 echo "[submit-delta-hpar-c] array_throttle=${ARRAY_THROTTLE}"
-echo "[submit-delta-hpar-c] stage_a_method=${STAGE_A_METHOD:-ot}"
+echo "[submit-delta-hpar-c] stage_c_time=${DELTA_STAGE_C_TIME}"
+echo "[submit-delta-hpar-c] stage_a_method=${STAGE_A_METHOD:-uot}"
+echo "[submit-delta-hpar-c] stage_a_hparam_selection=${STAGE_A_HPARAM_SELECTION:-rowwise}"
+echo "[submit-delta-hpar-c] stage_b_methods=${STAGE_B_METHODS:-ot}"
+echo "[submit-delta-hpar-c] stage_b_selection_methods=${STAGE_B_SELECTION_METHODS:-custom}"
+echo "[submit-delta-hpar-c] stage_b_layer_indices=${STAGE_B_LAYER_INDICES:-}"
 echo "[submit-delta-hpar-c] uot_beta_neurals=${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
 echo "[submit-delta-hpar-c] regular_das_subspace_dims=${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
 echo "[submit-delta-hpar-c] guided_subspace_dims=${GUIDED_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
+echo "[submit-delta-hpar-c] hf_home=${HF_HOME}"
 echo "[submit-delta-hpar-c] split_seed=${SPLIT_SEED}"
 
 COMMON_ARGS=(
@@ -37,7 +56,11 @@ COMMON_ARGS=(
   --signatures-dir signatures
   --stage-a-token-position-ids "${STAGE_A_TOKEN_POSITION_IDS:-last_token}"
   --target-vars "${TARGET_VARS:-answer_pointer,answer_token}"
-  --stage-a-method "${STAGE_A_METHOD:-ot}"
+  --stage-a-method "${STAGE_A_METHOD:-uot}"
+  --stage-a-hparam-selection "${STAGE_A_HPARAM_SELECTION:-rowwise}"
+  --stage-b-methods "${STAGE_B_METHODS:-ot}"
+  --stage-b-selection-methods "${STAGE_B_SELECTION_METHODS:-custom}"
+  --stage-b-layer-indices "${STAGE_B_LAYER_INDICES:-}"
   --signature-mode "${SIGNATURE_MODE:-family_label_delta_norm}"
   --ot-epsilons "${OT_EPSILONS:-0.5,1,2,4}"
   --uot-beta-neurals "${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
@@ -55,8 +78,8 @@ COMMON_ARGS=(
   --pca-num-bands-values "${PCA_NUM_BANDS_VALUES:-8,16}"
   --pca-band-scheme "${PCA_BAND_SCHEME:-equal}"
   --pca-top-prefix-sizes "${PCA_TOP_PREFIX_SIZES:-8,16,32,64}"
-  --stage-c-top-configs-per-var "${STAGE_C_TOP_CONFIGS_PER_VAR:-2}"
-  --guided-mask-names "${GUIDED_MASK_NAMES:-Top1,Top2,Top4,S50,S80}"
+  --stage-c-top-configs-per-var "${STAGE_C_TOP_CONFIGS_PER_VAR:-3}"
+  --guided-mask-names "${GUIDED_MASK_NAMES:-Selected}"
   --guided-max-epochs "${GUIDED_MAX_EPOCHS:-100}"
   --guided-min-epochs "${GUIDED_MIN_EPOCHS:-5}"
   --screen-restarts "${SCREEN_RESTARTS:-1}"
@@ -71,11 +94,23 @@ if [[ -n "${GUIDED_SUBSPACE_DIMS:-}" ]]; then
   COMMON_ARGS+=(--guided-subspace-dims "${GUIDED_SUBSPACE_DIMS}")
 fi
 
-python mcqa_delta_hierarchical_parallel.py aggregate-stage-b --skip-native-aggregation "${COMMON_ARGS[@]}"
+python mcqa_delta_hierarchical_parallel.py aggregate-stage-b "${COMMON_ARGS[@]}"
 python mcqa_delta_hierarchical_parallel.py plan-stage-c "${COMMON_ARGS[@]}"
 
 ROOT="${RESULTS_ROOT}/${TIMESTAMP}_mcqa_hierarchical_sweep"
+STAGE_C_NATIVE_TASK_FILE="${ROOT}/stage_c_native_tasks.json"
 STAGE_C_TASK_FILE="${ROOT}/stage_c_pca_tasks.json"
+STAGE_C_A_ONLY_TASK_FILE="${ROOT}/stage_c_a_only_tasks.json"
+STAGE_C_NATIVE_TASKS="$(
+  python - "${STAGE_C_NATIVE_TASK_FILE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text())
+print(len(payload.get("tasks", [])))
+PY
+)"
 STAGE_C_TASKS="$(
   python - "${STAGE_C_TASK_FILE}" <<'PY'
 import json
@@ -86,20 +121,44 @@ payload = json.loads(path.read_text())
 print(len(payload.get("tasks", [])))
 PY
 )"
+STAGE_C_A_ONLY_TASKS="$(
+  python - "${STAGE_C_A_ONLY_TASK_FILE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text())
+print(len(payload.get("tasks", [])))
+PY
+)"
 
-if [[ "${STAGE_C_TASKS}" -le 0 ]]; then
+if [[ "${STAGE_C_NATIVE_TASKS}" -le 0 && "${STAGE_C_TASKS}" -le 0 && "${STAGE_C_A_ONLY_TASKS}" -le 0 ]]; then
   echo "[submit-delta-hpar-c] no Stage C tasks"
   exit 0
 fi
 
-ARRAY_SPEC="0-$((STAGE_C_TASKS - 1))%${ARRAY_THROTTLE}"
-echo "[submit-delta-hpar-c] submitting Stage C tasks=${STAGE_C_TASKS} array=${ARRAY_SPEC}"
-sbatch \
-  --account="${DELTA_ACCOUNT}" \
-  --partition="${DELTA_PARTITION}" \
-  --array="${ARRAY_SPEC}" \
-  --export=ALL,TASK_FILE="${STAGE_C_TASK_FILE}" \
-  --job-name=mcqa-hpar-c \
-  scripts/delta_mcqa_hierarchical_parallel_task.sbatch
+submit_array() {
+  local task_file="$1"
+  local task_count="$2"
+  local job_name="$3"
+  if [[ "${task_count}" -le 0 ]]; then
+    echo "[submit-delta-hpar-c] no tasks for ${job_name}"
+    return
+  fi
+  local array_spec="0-$((task_count - 1))%${ARRAY_THROTTLE}"
+  echo "[submit-delta-hpar-c] submitting ${job_name}: tasks=${task_count} array=${array_spec} task_file=${task_file}"
+  sbatch \
+    --account="${DELTA_ACCOUNT}" \
+    --partition="${DELTA_PARTITION}" \
+    --array="${array_spec}" \
+    --time="${DELTA_STAGE_C_TIME}" \
+    --export=ALL,TASK_FILE="${task_file}" \
+    --job-name="${job_name}" \
+    scripts/delta_mcqa_hierarchical_parallel_task.sbatch
+}
+
+submit_array "${STAGE_C_A_ONLY_TASK_FILE}" "${STAGE_C_A_ONLY_TASKS}" "mcqa-hpar-c-a"
+submit_array "${STAGE_C_NATIVE_TASK_FILE}" "${STAGE_C_NATIVE_TASKS}" "mcqa-hpar-c-native"
+submit_array "${STAGE_C_TASK_FILE}" "${STAGE_C_TASKS}" "mcqa-hpar-c-pca"
 
 echo "[submit-delta-hpar-c] task plan: ${ROOT}/stage_c_task_plan.txt"

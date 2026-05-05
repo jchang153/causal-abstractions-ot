@@ -11,6 +11,8 @@ ARRAY_THROTTLE="${ARRAY_THROTTLE:-8}"
 SUBMIT_NATIVE="${SUBMIT_NATIVE:-1}"
 SUBMIT_PCA="${SUBMIT_PCA:-1}"
 SPLIT_SEED="${SPLIT_SEED:-0}"
+DELTA_STAGE_B_NATIVE_TIME="${DELTA_STAGE_B_NATIVE_TIME:-02:00:00}"
+DELTA_STAGE_B_PCA_TIME="${DELTA_STAGE_B_PCA_TIME:-01:00:00}"
 
 VENV_PATH="${VENV_PATH:-${HOME}/venvs/causal-ot}"
 if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
@@ -19,20 +21,39 @@ if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
 fi
 source "${VENV_PATH}/bin/activate"
 
-export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN before planning/submitting Stage B.}"
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  if [[ -r "${HOME}/.secrets/hf_token" ]]; then
+    export HF_TOKEN="$(< "${HOME}/.secrets/hf_token")"
+  else
+    echo "[submit-delta-hpar-b] HF_TOKEN is unset and ${HOME}/.secrets/hf_token is not readable"
+    exit 1
+  fi
+fi
+export HF_HOME="${HF_HOME:-${SCRATCH:-/tmp/${USER}}/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 echo "[submit-delta-hpar-b] timestamp=${TIMESTAMP}"
 echo "[submit-delta-hpar-b] delta_account=${DELTA_ACCOUNT}"
 echo "[submit-delta-hpar-b] delta_partition=${DELTA_PARTITION}"
 echo "[submit-delta-hpar-b] array_throttle=${ARRAY_THROTTLE}"
+echo "[submit-delta-hpar-b] native_time=${DELTA_STAGE_B_NATIVE_TIME}"
+echo "[submit-delta-hpar-b] pca_time=${DELTA_STAGE_B_PCA_TIME}"
 echo "[submit-delta-hpar-b] native_block_resolutions=${NATIVE_BLOCK_RESOLUTIONS:-128,144,192,256,288,384,576,768}"
-echo "[submit-delta-hpar-b] stage_a_method=${STAGE_A_METHOD:-ot}"
+echo "[submit-delta-hpar-b] stage_a_method=${STAGE_A_METHOD:-uot}"
+echo "[submit-delta-hpar-b] stage_a_hparam_selection=${STAGE_A_HPARAM_SELECTION:-rowwise}"
+echo "[submit-delta-hpar-b] stage_b_methods=${STAGE_B_METHODS:-ot}"
+echo "[submit-delta-hpar-b] stage_b_selection_methods=${STAGE_B_SELECTION_METHODS:-custom}"
+echo "[submit-delta-hpar-b] stage_b_layer_indices=${STAGE_B_LAYER_INDICES:-}"
 echo "[submit-delta-hpar-b] uot_beta_neurals=${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
 echo "[submit-delta-hpar-b] pca_site_menus=${PCA_SITE_MENUS:-partition,mixed}"
 echo "[submit-delta-hpar-b] pca_basis_source_modes=${PCA_BASIS_SOURCE_MODES:-pair_bank,all_variants}"
 echo "[submit-delta-hpar-b] pca_num_bands_values=${PCA_NUM_BANDS_VALUES:-8,16}"
 echo "[submit-delta-hpar-b] regular_das_subspace_dims=${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
 echo "[submit-delta-hpar-b] guided_subspace_dims=${GUIDED_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
+echo "[submit-delta-hpar-b] hf_home=${HF_HOME}"
 echo "[submit-delta-hpar-b] split_seed=${SPLIT_SEED}"
 
 COMMON_ARGS=(
@@ -43,7 +64,11 @@ COMMON_ARGS=(
   --signatures-dir signatures
   --stage-a-token-position-ids "${STAGE_A_TOKEN_POSITION_IDS:-last_token}"
   --target-vars "${TARGET_VARS:-answer_pointer,answer_token}"
-  --stage-a-method "${STAGE_A_METHOD:-ot}"
+  --stage-a-method "${STAGE_A_METHOD:-uot}"
+  --stage-a-hparam-selection "${STAGE_A_HPARAM_SELECTION:-rowwise}"
+  --stage-b-methods "${STAGE_B_METHODS:-ot}"
+  --stage-b-selection-methods "${STAGE_B_SELECTION_METHODS:-custom}"
+  --stage-b-layer-indices "${STAGE_B_LAYER_INDICES:-}"
   --signature-mode "${SIGNATURE_MODE:-family_label_delta_norm}"
   --ot-epsilons "${OT_EPSILONS:-0.5,1,2,4}"
   --uot-beta-neurals "${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
@@ -61,8 +86,8 @@ COMMON_ARGS=(
   --pca-num-bands-values "${PCA_NUM_BANDS_VALUES:-8,16}"
   --pca-band-scheme "${PCA_BAND_SCHEME:-equal}"
   --pca-top-prefix-sizes "${PCA_TOP_PREFIX_SIZES:-8,16,32,64}"
-  --stage-c-top-configs-per-var "${STAGE_C_TOP_CONFIGS_PER_VAR:-2}"
-  --guided-mask-names "${GUIDED_MASK_NAMES:-Top1,Top2,Top4,S50,S80}"
+  --stage-c-top-configs-per-var "${STAGE_C_TOP_CONFIGS_PER_VAR:-3}"
+  --guided-mask-names "${GUIDED_MASK_NAMES:-Selected}"
   --guided-max-epochs "${GUIDED_MAX_EPOCHS:-100}"
   --guided-min-epochs "${GUIDED_MIN_EPOCHS:-5}"
   --screen-restarts "${SCREEN_RESTARTS:-1}"
@@ -103,11 +128,16 @@ submit_array() {
     return
   fi
   local array_spec="0-$((task_count - 1))%${ARRAY_THROTTLE}"
-  echo "[submit-delta-hpar-b] submitting ${job_name}: tasks=${task_count} array=${array_spec} task_file=${task_file}"
+  local time_limit="${DELTA_STAGE_B_NATIVE_TIME}"
+  if [[ "${job_name}" == *pca* ]]; then
+    time_limit="${DELTA_STAGE_B_PCA_TIME}"
+  fi
+  echo "[submit-delta-hpar-b] submitting ${job_name}: tasks=${task_count} array=${array_spec} time=${time_limit} task_file=${task_file}"
   sbatch \
     --account="${DELTA_ACCOUNT}" \
     --partition="${DELTA_PARTITION}" \
     --array="${array_spec}" \
+    --time="${time_limit}" \
     --export=ALL,TASK_FILE="${task_file}" \
     --job-name="${job_name}" \
     scripts/delta_mcqa_hierarchical_parallel_task.sbatch
