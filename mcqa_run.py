@@ -140,7 +140,6 @@ def _signature_cache_path(*, resolution: int | None, signature_mode: str, cache_
 
 def ensure_hf_login(token: str | None, prompt_login: bool) -> str | None:
     if token:
-        hf_login(token=token, add_to_git_credential=False)
         return token
     if prompt_login:
         hf_login(add_to_git_credential=False)
