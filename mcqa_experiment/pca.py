@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -405,7 +407,27 @@ def fit_layer_token_pca_basis_from_prompt_records(
 def save_pca_basis(path: str | Path, basis: LayerPCABasis) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(basis.to_payload(), path)
+    payload = basis.to_payload()
+    fd, tmp_path_str = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.tmp.",
+        suffix=".pt",
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_path_str)
+    try:
+        try:
+            torch.save(payload, tmp_path)
+        except RuntimeError:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            # Some filesystems intermittently fail while finalizing torch's zip writer.
+            # Retry with the legacy serializer, then atomically replace the target path.
+            torch.save(payload, tmp_path, _use_new_zipfile_serialization=False)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def load_pca_basis(path: str | Path) -> LayerPCABasis:

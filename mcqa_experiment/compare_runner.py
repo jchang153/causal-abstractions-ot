@@ -196,16 +196,27 @@ def run_comparison(
             else:
                 raise ValueError(f"Unsupported method {method}")
             wall_runtime_seconds = perf_counter() - start
-            signature_prepare_runtime_seconds = float(payload.get("signature_prepare_runtime_seconds", 0.0))
+            embedded_signature_prepare_runtime_seconds = float(payload.get("signature_prepare_runtime_seconds", 0.0))
+            recorded_signature_prepare_runtime_seconds = float(
+                payload.get(
+                    "recorded_signature_prepare_runtime_seconds",
+                    payload.get(
+                        "artifact_prepare_recorded_seconds",
+                        embedded_signature_prepare_runtime_seconds,
+                    ),
+                )
+            )
             payload["wall_runtime_seconds"] = float(payload.get("wall_runtime_seconds", wall_runtime_seconds))
             payload["runtime_seconds"] = float(payload.get("runtime_seconds", wall_runtime_seconds))
-            payload["signature_prepare_runtime_seconds"] = float(signature_prepare_runtime_seconds)
+            payload["signature_prepare_runtime_seconds"] = float(embedded_signature_prepare_runtime_seconds)
+            payload["embedded_signature_prepare_runtime_seconds"] = float(embedded_signature_prepare_runtime_seconds)
+            payload["recorded_signature_prepare_runtime_seconds"] = float(recorded_signature_prepare_runtime_seconds)
             method_payloads[method].append(payload)
             all_records.extend(payload["results"])
             print(
                 f"[method] done method={method} target={target_var} "
                 f"runtime={float(payload['runtime_seconds']):.2f}s "
-                f"(wall={float(payload['wall_runtime_seconds']):.2f}s, signatures={float(signature_prepare_runtime_seconds):.2f}s)"
+                f"(wall={float(payload['wall_runtime_seconds']):.2f}s, signatures={float(recorded_signature_prepare_runtime_seconds):.2f}s)"
             )
     summary_records = summarize_method_records(all_records)
     summary_text = format_summary(

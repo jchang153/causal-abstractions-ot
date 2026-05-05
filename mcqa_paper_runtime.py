@@ -216,6 +216,7 @@ def _native_selected_width_epsilon_runtime(
     *,
     rankings: dict[str, object],
     entries_by_var: dict[str, dict[str, object] | None],
+    restrict_to_selected_layer: bool = False,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, dict[int, float]]]:
     runtime_grid: dict[tuple[str, int, int, float], float] = {}
     payload_paths: set[Path] = set()
@@ -268,11 +269,14 @@ def _native_selected_width_epsilon_runtime(
             parallel_by_var[target_var] = 0.0
             runtime_by_layer_by_var[target_var] = {}
             continue
+        selected_layer = int(entry.get("layer", -1))
         selected_width = int(entry.get("native_resolution", entry.get("atomic_width", -1)))
         selected_epsilon = _as_float(entry.get("epsilon"))
         layer_runtimes: dict[int, float] = {}
         for (row_var, layer, native_resolution, epsilon), runtime_seconds in runtime_grid.items():
             if str(row_var) != str(target_var):
+                continue
+            if restrict_to_selected_layer and int(layer) != int(selected_layer):
                 continue
             if int(native_resolution) != int(selected_width):
                 continue
@@ -284,6 +288,33 @@ def _native_selected_width_epsilon_runtime(
         downstream_by_var[str(target_var)] = float(sum(values))
         parallel_by_var[str(target_var)] = float(max(values) if values else 0.0)
     return downstream_by_var, parallel_by_var, runtime_by_layer_by_var
+
+
+def _matching_native_stage_b_entries(
+    *,
+    native_rankings: dict[str, object],
+    guided_entries_by_var: dict[str, dict[str, object] | None],
+) -> dict[str, dict[str, object] | None]:
+    matched: dict[str, dict[str, object] | None] = {}
+    for target_var, guided_entry in guided_entries_by_var.items():
+        matched[target_var] = None
+        if not guided_entry:
+            continue
+        selected_layer = int(guided_entry.get("layer", -1))
+        selected_width = int(guided_entry.get("native_resolution", guided_entry.get("atomic_width", -1)))
+        entries = native_rankings.get(target_var)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if int(entry.get("layer", -1)) != selected_layer:
+                continue
+            if int(entry.get("native_resolution", entry.get("atomic_width", -1))) != selected_width:
+                continue
+            matched[target_var] = entry
+            break
+    return matched
 
 
 def _pca_selected_config_epsilon_runtime(
@@ -669,23 +700,38 @@ def build_paper_runtime_summary(
     )
 
     native_guided_entries = {var: _first_entry(native_guided_rankings, var) for var in TARGET_VARS}
-    native_guided_stage_b_by_layer, native_guided_stage_b_serial, _ = _unique_layer_runtime(
-        native_guided_entries,
-        native_stage_b_by_layer,
+    native_guided_stage_b_entries = _matching_native_stage_b_entries(
+        native_rankings=native_rankings,
+        guided_entries_by_var=native_guided_entries,
     )
+    (
+        native_guided_stage_b_downstream,
+        native_guided_stage_b_parallel_by_var,
+        native_guided_stage_b_runtime_by_layer_by_var,
+    ) = _native_selected_width_epsilon_runtime(
+        rankings=native_rankings,
+        entries_by_var=native_guided_stage_b_entries,
+        restrict_to_selected_layer=True,
+    )
+    native_guided_stage_b_by_layer = {
+        layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in native_guided_stage_b_runtime_by_layer_by_var.values())
+        for layer in sorted(
+            {layer for layer_runtimes in native_guided_stage_b_runtime_by_layer_by_var.values() for layer in layer_runtimes}
+        )
+    }
     native_guided_downstream = {}
     native_guided_das = {}
     for var, entry in native_guided_entries.items():
         if entry:
-            stage_b_seconds = native_stage_b_by_layer.get(int(entry["layer"]), 0.0)
+            stage_b_seconds = _as_float(native_guided_stage_b_downstream.get(var))
             das_seconds = _as_float(entry.get("runtime_seconds"))
             native_guided_das[var] = das_seconds
             native_guided_downstream[var] = stage_b_seconds + das_seconds
         else:
             native_guided_das[var] = 0.0
             native_guided_downstream[var] = 0.0
-    native_guided_serial = native_guided_stage_b_serial + sum(_as_float(native_guided_das.get(var)) for var in TARGET_VARS)
-    native_guided_parallel = max(_as_float(native_guided_downstream.get(var)) for var in TARGET_VARS)
+    native_guided_serial = sum(_as_float(native_guided_downstream.get(var)) for var in TARGET_VARS)
+    native_guided_parallel = float(max((_as_float(native_guided_downstream.get(var)) for var in TARGET_VARS), default=0.0))
     records.append(
         _method_record(
             method="PLOT-DAS (native support)",
@@ -695,7 +741,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=native_guided_serial,
             parallel_downstream_seconds=native_guided_parallel,
             shared_runtime_seconds_by_layer=native_guided_stage_b_by_layer,
-            notes="Stage A plus native-support localization plus DAS over the selected native supports.",
+            notes="Stage A plus the exact selected native-support layer+width+epsilon localization runtime and DAS over the selected native supports.",
         )
     )
 
