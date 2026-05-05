@@ -423,8 +423,25 @@ def save_pca_basis(path: str | Path, basis: LayerPCABasis) -> None:
                 tmp_path.unlink()
             # Some filesystems intermittently fail while finalizing torch's zip writer.
             # Retry with the legacy serializer, then atomically replace the target path.
-            torch.save(payload, tmp_path, _use_new_zipfile_serialization=False)
+            try:
+                torch.save(payload, tmp_path, _use_new_zipfile_serialization=False)
+            except RuntimeError as exc:
+                if "no space left on device" in str(exc).lower():
+                    print(
+                        f"[pca] warning: unable to cache PCA basis at {path} due to no space left on device; "
+                        "continuing without saving the cache file"
+                    )
+                    return
+                raise
         os.replace(tmp_path, path)
+    except OSError as exc:
+        if "no space left on device" in str(exc).lower():
+            print(
+                f"[pca] warning: unable to cache PCA basis at {path} due to no space left on device; "
+                "continuing without saving the cache file"
+            )
+            return
+        raise
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
