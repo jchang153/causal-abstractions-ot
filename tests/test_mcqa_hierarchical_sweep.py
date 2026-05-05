@@ -8,6 +8,7 @@ from mcqa_delta_hierarchical_sweep import (
     _extract_stage_b_best_configs,
     _select_stage_b_layers,
     _select_stage_c_configs,
+    _select_stage_c_dim_hint_configs,
     _select_stage_c_native_configs,
 )
 from mcqa_delta_hierarchical_parallel import (
@@ -275,6 +276,36 @@ def test_select_stage_c_configs_groups_by_token_basis_menu_and_bands() -> None:
     assert selected == {("custom", "ot", "last_token", "all_variants", "partition", 8): (20, 25)}
 
 
+def test_select_stage_c_dim_hint_configs_uses_selected_handle_width() -> None:
+    rankings = {
+        "answer_pointer": [
+            {
+                "layer": 18,
+                "resolution": 128,
+                "token_position_id": "last_token",
+                "transport_method": "ot",
+                "selection_score": 0.90,
+                "selected_site_total_dim": 256,
+            },
+        ],
+        "answer_token": [
+            {
+                "layer": 24,
+                "resolution": 128,
+                "token_position_id": "last_token",
+                "transport_method": "ot",
+                "selection_score": 0.95,
+                "selected_site_total_dim": 64,
+            },
+        ],
+    }
+
+    selected = _select_stage_c_dim_hint_configs(rankings=rankings, source="native", top_configs_per_var=1)
+
+    assert [record["dim_hint_effective_dim"] for record in selected] == [256, 64]
+    assert selected[0]["dim_hint_subspace_dims"] == [128, 192, 256, 320, 384, 512]
+
+
 def test_extract_block_mask_support_places_calibrated_plot_handle_first() -> None:
     sites = [
         ResidualSite(layer=18, token_position_id="last_token", dim_start=0, dim_end=10),
@@ -440,6 +471,7 @@ def test_parallel_stage_c_planner_reuses_stage_b_task_root(tmp_path: Path) -> No
                         "layer": 23,
                         "exact_acc": 0.96,
                         "selection_score": 0.94,
+                        "selected_site_total_dim": 48,
                     }
                 ],
             }
@@ -488,10 +520,15 @@ def test_parallel_stage_c_planner_reuses_stage_b_task_root(tmp_path: Path) -> No
     plan_stage_c_tasks(args)
 
     stage_c_tasks = json.loads((sweep_root / "stage_c_pca_tasks.json").read_text())["tasks"]
+    stage_c_pca_dim_tasks = json.loads((sweep_root / "stage_c_pca_dim_tasks.json").read_text())["tasks"]
     a_only_tasks = json.loads((sweep_root / "stage_c_a_only_tasks.json").read_text())["tasks"]
-    assert len(stage_c_tasks) == 1
+    assert len(stage_c_tasks) == 0
+    assert len(stage_c_pca_dim_tasks) == 1
     assert len(a_only_tasks) == 1
-    assert stage_c_tasks[0]["stage_timestamp"] == stage_b_timestamp
-    assert any(path.endswith("_answer_token_das_guided.json") for path in stage_c_tasks[0]["expected_outputs"])
+    assert stage_c_pca_dim_tasks[0]["dim_hint_effective_dim"] == 48
+    assert stage_c_pca_dim_tasks[0]["target_var"] == "answer_token"
+    assert "--das-subspace-dims" in stage_c_pca_dim_tasks[0]["command"]
+    dim_arg = stage_c_pca_dim_tasks[0]["command"][stage_c_pca_dim_tasks[0]["command"].index("--das-subspace-dims") + 1]
+    assert dim_arg == "24,36,48,60,72,96"
     assert "--das-restarts" in a_only_tasks[0]["command"]
     assert a_only_tasks[0]["command"][a_only_tasks[0]["command"].index("--das-restarts") + 1] == "2"

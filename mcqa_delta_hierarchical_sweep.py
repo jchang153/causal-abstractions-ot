@@ -34,6 +34,7 @@ DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_PCA_TOP_PREFIX_SIZES = (8, 16, 32, 64)
 DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
 DEFAULT_NATIVE_BLOCK_RESOLUTIONS = (128, 144, 192, 256, 288, 384, 576, 768)
+DEFAULT_DIM_HINT_SCALE_FACTORS = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
 DEFAULT_DAS_SUBSPACE_DIMS = (
     32,
     64,
@@ -408,7 +409,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pca-num-bands-values", default="8,16")
     parser.add_argument("--pca-band-scheme", default=DEFAULT_PCA_BAND_SCHEME, choices=("equal", "head"))
     parser.add_argument("--pca-top-prefix-sizes", default="8,16,32,64")
-    parser.add_argument("--stage-c-top-configs-per-var", type=int, default=3)
+    parser.add_argument("--stage-c-top-configs-per-var", type=int, default=1)
     parser.add_argument(
         "--guided-mask-names",
         default="Selected",
@@ -422,6 +423,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--screen-restarts", type=int, default=1)
     parser.add_argument("--guided-restarts", type=int, default=2)
     parser.add_argument("--guided-subspace-dims", default="32,64,96,128,256,512,768,1024,1536,2048,2304")
+    parser.add_argument(
+        "--stage-c-dim-hint-scale-factors",
+        default="0.5,0.75,1,1.25,1.5,2",
+        help="Comma-separated multiplicative DAS dimension factors around the Stage B selected handle width.",
+    )
+    parser.add_argument(
+        "--enable-pca-support-guided-das",
+        action="store_true",
+        help="Also run PCA-support guided DAS. Disabled by default while the PCA support semantics are under review.",
+    )
+    parser.add_argument(
+        "--disable-dim-hint-das",
+        action="store_true",
+        help="Disable native/PCA dimension-hinted full-layer DAS Stage C branches.",
+    )
     parser.add_argument("--full-das-output", type=Path, action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument(
         "--regular-das-subspace-dims",
@@ -479,6 +495,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     if args.guided_subspace_dims is not None:
         guided_subspace_dims = _parse_csv_ints(args.guided_subspace_dims)
     regular_das_subspace_dims = _parse_csv_ints(args.regular_das_subspace_dims) or DEFAULT_DAS_SUBSPACE_DIMS
+    dim_hint_scale_factors = _parse_csv_floats(args.stage_c_dim_hint_scale_factors) or DEFAULT_DIM_HINT_SCALE_FACTORS
     results_timestamp = (
         args.results_timestamp
         or os.environ.get("RESULTS_TIMESTAMP")
@@ -512,6 +529,9 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "guided_mask_names": tuple(str(mask_name) for mask_name in guided_mask_names),
         "guided_subspace_dims": None if guided_subspace_dims is None else tuple(int(dim) for dim in guided_subspace_dims),
         "regular_das_subspace_dims": tuple(int(dim) for dim in regular_das_subspace_dims),
+        "dim_hint_scale_factors": tuple(float(value) for value in dim_hint_scale_factors),
+        "enable_pca_support_guided_das": bool(args.enable_pca_support_guided_das),
+        "enable_dim_hint_das": not bool(args.disable_dim_hint_das),
         "results_timestamp": str(results_timestamp),
     }
 
@@ -763,7 +783,13 @@ def _build_stage_c_a_only_command(
     stage_timestamp: str,
     token_position_id: str,
     layers: tuple[int, ...],
+    target_vars: tuple[str, ...] | None = None,
+    das_subspace_dims: tuple[int, ...] | None = None,
 ) -> tuple[str, ...]:
+    if target_vars is None:
+        target_vars = tuple(str(target_var) for target_var in normalized["target_vars"])
+    if das_subspace_dims is None:
+        das_subspace_dims = tuple(int(dim) for dim in normalized["regular_das_subspace_dims"])
     command = [
         sys.executable,
         "mcqa_run_cloud.py",
@@ -790,7 +816,7 @@ def _build_stage_c_a_only_command(
         "--methods",
         "das",
         "--target-vars",
-        ",".join(str(target_var) for target_var in normalized["target_vars"]),
+        ",".join(str(target_var) for target_var in target_vars),
         "--layers",
         ",".join(str(layer) for layer in layers),
         "--token-position-ids",
@@ -798,7 +824,7 @@ def _build_stage_c_a_only_command(
         "--resolutions",
         "full",
         "--das-subspace-dims",
-        ",".join(str(dim) for dim in normalized["regular_das_subspace_dims"]),
+        ",".join(str(dim) for dim in das_subspace_dims),
         "--das-restarts",
         str(max(1, int(args.guided_restarts))),
         "--signature-modes",
@@ -1277,8 +1303,105 @@ def _entry_metadata(metadata: dict[str, object]) -> dict[str, object]:
         "stage_timestamp",
         "task_id",
         "category",
+        "dim_hint_source",
+        "dim_hint_effective_dim",
+        "dim_hint_subspace_dims",
+        "stage_b_selected_top_k",
+        "stage_b_selected_lambda",
+        "stage_b_selected_site_total_dim",
+        "stage_c_target_vars",
     )
     return {field: metadata[field] for field in fields if field in metadata}
+
+
+def _selected_support_metadata(layer_payload: dict[str, object], target_var: str) -> dict[str, object]:
+    support_by_var = layer_payload.get("support_by_var", {})
+    if not isinstance(support_by_var, dict):
+        return {}
+    support_summary = support_by_var.get(str(target_var), {})
+    if not isinstance(support_summary, dict):
+        return {}
+    mask_candidates = support_summary.get("mask_candidates", [])
+    selected_mask: dict[str, object] | None = None
+    if isinstance(mask_candidates, list):
+        for candidate in mask_candidates:
+            if isinstance(candidate, dict) and str(candidate.get("name")) == "Selected":
+                selected_mask = candidate
+                break
+        if selected_mask is None:
+            for candidate in mask_candidates:
+                if isinstance(candidate, dict):
+                    selected_mask = candidate
+                    break
+    selected_trial = support_summary.get("selected_trial", {})
+    if not isinstance(selected_trial, dict):
+        selected_trial = {}
+    metadata: dict[str, object] = {}
+    if selected_mask is not None:
+        if selected_mask.get("site_total_dim") is not None:
+            metadata["selected_site_total_dim"] = int(selected_mask.get("site_total_dim", 0))
+            metadata["stage_b_selected_site_total_dim"] = int(selected_mask.get("site_total_dim", 0))
+        if isinstance(selected_mask.get("site_labels"), list):
+            metadata["selected_site_labels"] = [str(label) for label in selected_mask.get("site_labels", [])]
+    if selected_trial:
+        if selected_trial.get("top_k") is not None:
+            metadata["selected_top_k"] = int(selected_trial.get("top_k"))
+            metadata["stage_b_selected_top_k"] = int(selected_trial.get("top_k"))
+        if selected_trial.get("lambda") is not None:
+            metadata["selected_lambda"] = float(selected_trial.get("lambda"))
+            metadata["stage_b_selected_lambda"] = float(selected_trial.get("lambda"))
+    return metadata
+
+
+def _dim_hint_subspace_dims(
+    effective_dim: int,
+    *,
+    max_dim: int = 2304,
+    scale_factors: Iterable[float] = DEFAULT_DIM_HINT_SCALE_FACTORS,
+) -> tuple[int, ...]:
+    dims: list[int] = []
+    for factor in scale_factors:
+        dim = int(round(float(effective_dim) * float(factor)))
+        dim = max(1, min(int(max_dim), dim))
+        dims.append(dim)
+    dims.append(max(1, min(int(max_dim), int(effective_dim))))
+    return tuple(sorted(dict.fromkeys(dims)))
+
+
+def _select_stage_c_dim_hint_configs(
+    *,
+    rankings: dict[str, list[dict[str, object]]],
+    source: str,
+    top_configs_per_var: int = 1,
+    scale_factors: Iterable[float] = DEFAULT_DIM_HINT_SCALE_FACTORS,
+) -> list[dict[str, object]]:
+    selected: list[dict[str, object]] = []
+    for target_var in DEFAULT_TARGET_VARS:
+        entries_by_method: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for entry in rankings.get(target_var, []):
+            key = (
+                str(entry.get("layer_selection_method", "custom")),
+                str(entry.get("transport_method", "ot")),
+            )
+            entries_by_method.setdefault(key, []).append(entry)
+        for (_layer_selection_method, _transport_method), method_entries in entries_by_method.items():
+            for entry in method_entries[: max(1, int(top_configs_per_var))]:
+                effective_dim = int(entry.get("selected_site_total_dim") or entry.get("site_total_dim") or 0)
+                if effective_dim <= 0:
+                    continue
+                record = dict(entry)
+                record["variable"] = str(target_var)
+                record["dim_hint_source"] = str(source)
+                record["dim_hint_effective_dim"] = int(effective_dim)
+                record["dim_hint_subspace_dims"] = [
+                    int(dim)
+                    for dim in _dim_hint_subspace_dims(
+                        int(effective_dim),
+                        scale_factors=scale_factors,
+                    )
+                ]
+                selected.append(record)
+    return selected
 
 
 def _extract_stage_b_best_configs(
@@ -1348,6 +1471,7 @@ def _extract_stage_b_best_configs(
                         "signature_prepare_runtime_seconds": method_payload.get("signature_prepare_runtime_seconds"),
                         "layer_payload_path": str(payload_path),
                     }
+                    entry.update(_selected_support_metadata(layer_payload, target_var))
                     entry.update(_entry_metadata(metadata))
                     if uot_beta_neural is not None:
                         entry["uot_beta_neural"] = float(uot_beta_neural)
@@ -1380,6 +1504,12 @@ def _format_stage_b_summary(*, rankings: dict[str, list[dict[str, object]]]) -> 
                 f"eps={float(entry['epsilon']):g}",
                 f"site={entry.get('site_label')}",
             ]
+            if entry.get("selected_top_k") is not None:
+                parts.append(f"k={entry.get('selected_top_k')}")
+            if entry.get("selected_lambda") is not None:
+                parts.append(f"lambda={float(entry.get('selected_lambda')):g}")
+            if entry.get("selected_site_total_dim") is not None:
+                parts.append(f"selected_width={entry.get('selected_site_total_dim')}")
             if entry.get("uot_beta_neural") is not None:
                 parts.append(f"beta={float(entry['uot_beta_neural']):g}")
             if entry.get("runtime_seconds") is not None:
@@ -1444,6 +1574,7 @@ def _extract_native_rankings(
                         "signature_prepare_runtime_seconds": method_payload.get("signature_prepare_runtime_seconds"),
                         "payload_path": str(payload_path),
                     }
+                    entry.update(_selected_support_metadata(payload, target_var))
                     entry.update(_entry_metadata(metadata))
                     if uot_beta_neural is not None:
                         entry["uot_beta_neural"] = float(uot_beta_neural)
@@ -1454,6 +1585,10 @@ def _extract_native_rankings(
         block_output_paths = payload.get("block_output_paths", {})
         if isinstance(block_output_paths, dict):
             for target_var, block_path_str in block_output_paths.items():
+                allowed_target_vars = metadata.get("stage_c_target_vars")
+                if isinstance(allowed_target_vars, list) and allowed_target_vars:
+                    if str(target_var) not in {str(var) for var in allowed_target_vars}:
+                        continue
                 block_payload = _load_json(Path(str(block_path_str)))
                 if not isinstance(block_payload, dict):
                     continue
@@ -1593,6 +1728,12 @@ def _format_native_summary(*, title: str, rankings: dict[str, list[dict[str, obj
                 parts.append(f"beta={float(entry['uot_beta_neural']):g}")
             if entry.get("site_label") is not None:
                 parts.append(f"site={entry.get('site_label')}")
+            if entry.get("selected_top_k") is not None:
+                parts.append(f"k={entry.get('selected_top_k')}")
+            if entry.get("selected_lambda") is not None:
+                parts.append(f"lambda={float(entry.get('selected_lambda')):g}")
+            if entry.get("selected_site_total_dim") is not None:
+                parts.append(f"selected_width={entry.get('selected_site_total_dim')}")
             if entry.get("subspace_dim") is not None:
                 parts.append(f"dim={entry.get('subspace_dim')}")
             if entry.get("site_total_dim") is not None:

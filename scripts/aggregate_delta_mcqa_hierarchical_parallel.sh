@@ -41,13 +41,14 @@ COMMON_ARGS=(
   --pca-num-bands-values "${PCA_NUM_BANDS_VALUES:-8,16}"
   --pca-band-scheme "${PCA_BAND_SCHEME:-equal}"
   --pca-top-prefix-sizes "${PCA_TOP_PREFIX_SIZES:-8,16,32,64}"
-  --stage-c-top-configs-per-var "${STAGE_C_TOP_CONFIGS_PER_VAR:-3}"
+  --stage-c-top-configs-per-var "${STAGE_C_TOP_CONFIGS_PER_VAR:-1}"
   --guided-mask-names "${GUIDED_MASK_NAMES:-Selected}"
   --guided-max-epochs "${GUIDED_MAX_EPOCHS:-100}"
   --guided-min-epochs "${GUIDED_MIN_EPOCHS:-5}"
   --screen-restarts "${SCREEN_RESTARTS:-1}"
   --guided-restarts "${GUIDED_RESTARTS:-2}"
   --regular-das-subspace-dims "${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
+  --stage-c-dim-hint-scale-factors "${STAGE_C_DIM_HINT_SCALE_FACTORS:-0.5,0.75,1,1.25,1.5,2}"
 )
 
 if [[ -n "${STAGE_A_LAYER_INDICES:-}" ]]; then
@@ -55,6 +56,12 @@ if [[ -n "${STAGE_A_LAYER_INDICES:-}" ]]; then
 fi
 if [[ -n "${GUIDED_SUBSPACE_DIMS:-}" ]]; then
   COMMON_ARGS+=(--guided-subspace-dims "${GUIDED_SUBSPACE_DIMS}")
+fi
+if [[ "${ENABLE_PCA_SUPPORT_GUIDED_DAS:-0}" == "1" ]]; then
+  COMMON_ARGS+=(--enable-pca-support-guided-das)
+fi
+if [[ "${DISABLE_DIM_HINT_DAS:-0}" == "1" ]]; then
+  COMMON_ARGS+=(--disable-dim-hint-das)
 fi
 if [[ -n "${FULL_DAS_OUTPUTS:-}" ]]; then
   IFS=',' read -r -a FULL_DAS_OUTPUT_ARRAY <<< "${FULL_DAS_OUTPUTS}"

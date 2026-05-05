@@ -45,6 +45,10 @@ echo "[submit-delta-hpar-c] stage_b_layer_indices=${STAGE_B_LAYER_INDICES:-}"
 echo "[submit-delta-hpar-c] uot_beta_neurals=${UOT_BETA_NEURALS:-0.03,0.1,0.3,1,3}"
 echo "[submit-delta-hpar-c] regular_das_subspace_dims=${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
 echo "[submit-delta-hpar-c] guided_subspace_dims=${GUIDED_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
+echo "[submit-delta-hpar-c] stage_c_top_configs_per_var=${STAGE_C_TOP_CONFIGS_PER_VAR:-1}"
+echo "[submit-delta-hpar-c] stage_c_dim_hint_scale_factors=${STAGE_C_DIM_HINT_SCALE_FACTORS:-0.5,0.75,1,1.25,1.5,2}"
+echo "[submit-delta-hpar-c] enable_pca_support_guided_das=${ENABLE_PCA_SUPPORT_GUIDED_DAS:-0}"
+echo "[submit-delta-hpar-c] disable_dim_hint_das=${DISABLE_DIM_HINT_DAS:-0}"
 echo "[submit-delta-hpar-c] hf_home=${HF_HOME}"
 echo "[submit-delta-hpar-c] split_seed=${SPLIT_SEED}"
 
@@ -78,13 +82,14 @@ COMMON_ARGS=(
   --pca-num-bands-values "${PCA_NUM_BANDS_VALUES:-8,16}"
   --pca-band-scheme "${PCA_BAND_SCHEME:-equal}"
   --pca-top-prefix-sizes "${PCA_TOP_PREFIX_SIZES:-8,16,32,64}"
-  --stage-c-top-configs-per-var "${STAGE_C_TOP_CONFIGS_PER_VAR:-3}"
+  --stage-c-top-configs-per-var "${STAGE_C_TOP_CONFIGS_PER_VAR:-1}"
   --guided-mask-names "${GUIDED_MASK_NAMES:-Selected}"
   --guided-max-epochs "${GUIDED_MAX_EPOCHS:-100}"
   --guided-min-epochs "${GUIDED_MIN_EPOCHS:-5}"
   --screen-restarts "${SCREEN_RESTARTS:-1}"
   --guided-restarts "${GUIDED_RESTARTS:-2}"
   --regular-das-subspace-dims "${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
+  --stage-c-dim-hint-scale-factors "${STAGE_C_DIM_HINT_SCALE_FACTORS:-0.5,0.75,1,1.25,1.5,2}"
 )
 
 if [[ -n "${STAGE_A_LAYER_INDICES:-}" ]]; then
@@ -92,6 +97,12 @@ if [[ -n "${STAGE_A_LAYER_INDICES:-}" ]]; then
 fi
 if [[ -n "${GUIDED_SUBSPACE_DIMS:-}" ]]; then
   COMMON_ARGS+=(--guided-subspace-dims "${GUIDED_SUBSPACE_DIMS}")
+fi
+if [[ "${ENABLE_PCA_SUPPORT_GUIDED_DAS:-0}" == "1" ]]; then
+  COMMON_ARGS+=(--enable-pca-support-guided-das)
+fi
+if [[ "${DISABLE_DIM_HINT_DAS:-0}" == "1" ]]; then
+  COMMON_ARGS+=(--disable-dim-hint-das)
 fi
 
 python mcqa_delta_hierarchical_parallel.py aggregate-stage-b "${COMMON_ARGS[@]}"
@@ -101,6 +112,8 @@ ROOT="${RESULTS_ROOT}/${TIMESTAMP}_mcqa_hierarchical_sweep"
 STAGE_C_NATIVE_TASK_FILE="${ROOT}/stage_c_native_tasks.json"
 STAGE_C_TASK_FILE="${ROOT}/stage_c_pca_tasks.json"
 STAGE_C_A_ONLY_TASK_FILE="${ROOT}/stage_c_a_only_tasks.json"
+STAGE_C_NATIVE_DIM_TASK_FILE="${ROOT}/stage_c_native_dim_tasks.json"
+STAGE_C_PCA_DIM_TASK_FILE="${ROOT}/stage_c_pca_dim_tasks.json"
 STAGE_C_NATIVE_TASKS="$(
   python - "${STAGE_C_NATIVE_TASK_FILE}" <<'PY'
 import json
@@ -131,8 +144,28 @@ payload = json.loads(path.read_text())
 print(len(payload.get("tasks", [])))
 PY
 )"
+STAGE_C_NATIVE_DIM_TASKS="$(
+  python - "${STAGE_C_NATIVE_DIM_TASK_FILE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text())
+print(len(payload.get("tasks", [])))
+PY
+)"
+STAGE_C_PCA_DIM_TASKS="$(
+  python - "${STAGE_C_PCA_DIM_TASK_FILE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text())
+print(len(payload.get("tasks", [])))
+PY
+)"
 
-if [[ "${STAGE_C_NATIVE_TASKS}" -le 0 && "${STAGE_C_TASKS}" -le 0 && "${STAGE_C_A_ONLY_TASKS}" -le 0 ]]; then
+if [[ "${STAGE_C_NATIVE_TASKS}" -le 0 && "${STAGE_C_TASKS}" -le 0 && "${STAGE_C_A_ONLY_TASKS}" -le 0 && "${STAGE_C_NATIVE_DIM_TASKS}" -le 0 && "${STAGE_C_PCA_DIM_TASKS}" -le 0 ]]; then
   echo "[submit-delta-hpar-c] no Stage C tasks"
   exit 0
 fi
@@ -159,6 +192,8 @@ submit_array() {
 
 submit_array "${STAGE_C_A_ONLY_TASK_FILE}" "${STAGE_C_A_ONLY_TASKS}" "mcqa-hpar-c-a"
 submit_array "${STAGE_C_NATIVE_TASK_FILE}" "${STAGE_C_NATIVE_TASKS}" "mcqa-hpar-c-native"
+submit_array "${STAGE_C_NATIVE_DIM_TASK_FILE}" "${STAGE_C_NATIVE_DIM_TASKS}" "mcqa-hpar-c-native-dim"
+submit_array "${STAGE_C_PCA_DIM_TASK_FILE}" "${STAGE_C_PCA_DIM_TASKS}" "mcqa-hpar-c-pca-dim"
 submit_array "${STAGE_C_TASK_FILE}" "${STAGE_C_TASKS}" "mcqa-hpar-c-pca"
 
 echo "[submit-delta-hpar-c] task plan: ${ROOT}/stage_c_task_plan.txt"

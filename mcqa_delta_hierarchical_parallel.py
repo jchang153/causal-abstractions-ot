@@ -31,6 +31,7 @@ from mcqa_delta_hierarchical_sweep import (
     _normalize_args,
     _normalize_num_bands_values,
     _select_stage_c_configs,
+    _select_stage_c_dim_hint_configs,
     _site_catalog_tag,
     _stage_a_output_path,
     _stage_b_slug,
@@ -919,6 +920,13 @@ def _task_metadata_by_payload_path(tasks: Iterable[dict[str, object]]) -> dict[s
             "layer_selection_top_layers_per_var": task.get("layer_selection_top_layers_per_var"),
             "layer_selection_neighbor_radius": task.get("layer_selection_neighbor_radius"),
             "layer_selection_max_layers_per_var": task.get("layer_selection_max_layers_per_var"),
+            "dim_hint_source": task.get("dim_hint_source"),
+            "dim_hint_effective_dim": task.get("dim_hint_effective_dim"),
+            "dim_hint_subspace_dims": task.get("dim_hint_subspace_dims"),
+            "stage_b_selected_top_k": task.get("stage_b_selected_top_k"),
+            "stage_b_selected_lambda": task.get("stage_b_selected_lambda"),
+            "stage_b_selected_site_total_dim": task.get("stage_b_selected_site_total_dim"),
+            "stage_c_target_vars": task.get("stage_c_target_vars"),
         }
         for payload_path in task.get("payload_paths", []):
             path = Path(str(payload_path))
@@ -1061,10 +1069,27 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
         rankings=stage_b_rankings,
         top_configs_per_var=int(args.stage_c_top_configs_per_var),
     )
+    selected_native_dim_configs: list[dict[str, object]] = []
+    selected_pca_dim_configs: list[dict[str, object]] = []
+    if bool(normalized["enable_dim_hint_das"]):
+        selected_native_dim_configs = _select_stage_c_dim_hint_configs(
+            rankings=native_rankings,
+            source="native",
+            top_configs_per_var=1,
+            scale_factors=normalized["dim_hint_scale_factors"],
+        )
+        selected_pca_dim_configs = _select_stage_c_dim_hint_configs(
+            rankings=stage_b_rankings,
+            source="pca",
+            top_configs_per_var=1,
+            scale_factors=normalized["dim_hint_scale_factors"],
+        )
     pca_manifest = _load_task_manifest(sweep_root / "stage_b_pca_tasks.json")
     pca_lookup = _pca_task_lookup(pca_manifest["tasks"])
     stage_c_native_tasks: list[dict[str, object]] = []
     stage_c_tasks: list[dict[str, object]] = []
+    stage_c_native_dim_tasks: list[dict[str, object]] = []
+    stage_c_pca_dim_tasks: list[dict[str, object]] = []
     a_only_tasks: list[dict[str, object]] = []
     selection_specs = _stage_b_selection_specs(args=args, normalized=normalized)
 
@@ -1125,7 +1150,7 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
             stage_timestamp=stage_timestamp,
             layer=int(layer),
             resolution=int(resolution),
-            target_vars=tuple(str(target_var) for target_var in normalized["target_vars"]),
+            target_vars=tuple(str(target_var) for target_var in target_vars),
         )
         task_normalized = dict(normalized)
         task_normalized["native_block_resolutions"] = (int(resolution),)
@@ -1163,67 +1188,174 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
             }
         )
 
-    for (layer_selection_method, transport_method, token_position_id, basis_source_mode, site_menu, num_bands), layers in selected_groups.items():
-        for layer in layers:
-            key = (
-                str(layer_selection_method),
-                str(transport_method),
-                str(token_position_id),
-                str(basis_source_mode),
-                str(site_menu),
-                int(num_bands),
-                int(layer),
-            )
-            stage_b_task = pca_lookup.get(key)
-            if stage_b_task is None:
-                raise RuntimeError(f"Could not find Stage B PCA task for Stage C key={key}")
-            stage_timestamp = str(stage_b_task["stage_timestamp"])
-            expected_outputs = _expected_pca_guided_outputs(
-                args=args,
-                normalized=normalized,
-                stage_timestamp=stage_timestamp,
-                token_position_id=str(token_position_id),
-                basis_source_mode=str(basis_source_mode),
-                site_menu=str(site_menu),
-                num_bands=int(num_bands),
-                layer=int(layer),
-            )
-            stage_c_tasks.append(
-                {
-                    "task_id": f"stage_c_{stage_b_task['task_id']}",
-                    "category": "stage_c_guided_das",
-                    "layer_selection_method": str(layer_selection_method),
-                    "layer_selection_top_layers_per_var": stage_b_task.get("layer_selection_top_layers_per_var"),
-                    "layer_selection_neighbor_radius": stage_b_task.get("layer_selection_neighbor_radius"),
-                    "layer_selection_max_layers_per_var": stage_b_task.get("layer_selection_max_layers_per_var"),
-                    "selected_layers": stage_b_task.get("selected_layers", []),
-                    "transport_method": str(transport_method),
-                    "token_position_id": str(token_position_id),
-                    "basis_source_mode": str(basis_source_mode),
-                    "site_menu": str(site_menu),
-                    "num_bands": int(num_bands),
-                    "layer": int(layer),
-                    "stage_timestamp": stage_timestamp,
-                    "command": list(
-                        _build_stage_b_or_c_command(
-                            args=args,
-                            normalized=normalized,
-                            stage_timestamp=stage_timestamp,
-                            token_position_id=str(token_position_id),
-                            layers=(int(layer),),
-                            basis_source_mode=str(basis_source_mode),
-                            site_menu=str(site_menu),
-                            num_bands=int(num_bands),
-                            guided_das=True,
-                            transport_method=str(transport_method),
-                        )
-                    ),
-                    "expected_outputs": expected_outputs,
-                    "payload_paths": [expected_outputs[0]],
-                }
-            )
+    for entry in selected_native_dim_configs:
+        target_var = str(entry["variable"])
+        token_position_id = str(entry.get("token_position_id", "last_token"))
+        layer = int(entry["layer"])
+        resolution = int(entry["resolution"])
+        effective_dim = int(entry["dim_hint_effective_dim"])
+        dim_values = tuple(int(dim) for dim in entry["dim_hint_subspace_dims"])
+        var_slug = "ap" if target_var == "answer_pointer" else "at" if target_var == "answer_token" else target_var.replace("_", "-")
+        stage_timestamp = (
+            f"{str(normalized['results_timestamp'])}_stageC_native_dim_{var_slug}_"
+            f"{token_position_id}_L{layer:02d}_res{resolution}_d{effective_dim}"
+        )
+        output_path = _stage_a_output_path(results_root=args.results_root, stage_timestamp=stage_timestamp)
+        stage_c_native_dim_tasks.append(
+            {
+                "task_id": f"stage_c_native_dim_{var_slug}_{token_position_id}_L{layer:02d}_res{resolution}_d{effective_dim}",
+                "category": "stage_c_native_dim_hint_das",
+                "layer_selection_method": str(entry.get("layer_selection_method", "custom")),
+                "layer_selection_top_layers_per_var": entry.get("layer_selection_top_layers_per_var"),
+                "layer_selection_neighbor_radius": entry.get("layer_selection_neighbor_radius"),
+                "layer_selection_max_layers_per_var": entry.get("layer_selection_max_layers_per_var"),
+                "selected_layers": [layer],
+                "transport_method": "das",
+                "token_position_id": token_position_id,
+                "layer": layer,
+                "resolution": "full",
+                "stage_b_resolution": resolution,
+                "target_var": target_var,
+                "dim_hint_source": "native",
+                "dim_hint_effective_dim": effective_dim,
+                "dim_hint_subspace_dims": [int(dim) for dim in dim_values],
+                "stage_b_selected_top_k": entry.get("selected_top_k"),
+                "stage_b_selected_lambda": entry.get("selected_lambda"),
+                "stage_b_selected_site_total_dim": entry.get("selected_site_total_dim"),
+                "stage_timestamp": stage_timestamp,
+                "command": list(
+                    _build_stage_c_a_only_command(
+                        args=args,
+                        normalized=normalized,
+                        stage_timestamp=stage_timestamp,
+                        token_position_id=token_position_id,
+                        layers=(layer,),
+                        target_vars=(target_var,),
+                        das_subspace_dims=dim_values,
+                    )
+                ),
+                "expected_outputs": [str(output_path)],
+                "payload_paths": [str(output_path)],
+            }
+        )
+
+    for entry in selected_pca_dim_configs:
+        target_var = str(entry["variable"])
+        token_position_id = str(entry.get("token_position_id", "last_token"))
+        layer = int(entry["layer"])
+        effective_dim = int(entry["dim_hint_effective_dim"])
+        dim_values = tuple(int(dim) for dim in entry["dim_hint_subspace_dims"])
+        var_slug = "ap" if target_var == "answer_pointer" else "at" if target_var == "answer_token" else target_var.replace("_", "-")
+        stage_timestamp = (
+            f"{str(normalized['results_timestamp'])}_stageC_pca_dim_{var_slug}_"
+            f"{token_position_id}_L{layer:02d}_d{effective_dim}"
+        )
+        output_path = _stage_a_output_path(results_root=args.results_root, stage_timestamp=stage_timestamp)
+        stage_c_pca_dim_tasks.append(
+            {
+                "task_id": f"stage_c_pca_dim_{var_slug}_{token_position_id}_L{layer:02d}_d{effective_dim}",
+                "category": "stage_c_pca_dim_hint_das",
+                "layer_selection_method": str(entry.get("layer_selection_method", "custom")),
+                "layer_selection_top_layers_per_var": entry.get("layer_selection_top_layers_per_var"),
+                "layer_selection_neighbor_radius": entry.get("layer_selection_neighbor_radius"),
+                "layer_selection_max_layers_per_var": entry.get("layer_selection_max_layers_per_var"),
+                "selected_layers": [layer],
+                "transport_method": "das",
+                "token_position_id": token_position_id,
+                "basis_source_mode": str(entry.get("basis_source_mode")),
+                "site_menu": str(entry.get("site_menu")),
+                "num_bands": int(entry.get("num_bands")),
+                "layer": layer,
+                "resolution": "full",
+                "target_var": target_var,
+                "dim_hint_source": "pca",
+                "dim_hint_effective_dim": effective_dim,
+                "dim_hint_subspace_dims": [int(dim) for dim in dim_values],
+                "stage_b_selected_top_k": entry.get("selected_top_k"),
+                "stage_b_selected_lambda": entry.get("selected_lambda"),
+                "stage_b_selected_site_total_dim": entry.get("selected_site_total_dim"),
+                "stage_timestamp": stage_timestamp,
+                "command": list(
+                    _build_stage_c_a_only_command(
+                        args=args,
+                        normalized=normalized,
+                        stage_timestamp=stage_timestamp,
+                        token_position_id=token_position_id,
+                        layers=(layer,),
+                        target_vars=(target_var,),
+                        das_subspace_dims=dim_values,
+                    )
+                ),
+                "expected_outputs": [str(output_path)],
+                "payload_paths": [str(output_path)],
+            }
+        )
+
+    if bool(normalized["enable_pca_support_guided_das"]):
+        for (layer_selection_method, transport_method, token_position_id, basis_source_mode, site_menu, num_bands), layers in selected_groups.items():
+            for layer in layers:
+                key = (
+                    str(layer_selection_method),
+                    str(transport_method),
+                    str(token_position_id),
+                    str(basis_source_mode),
+                    str(site_menu),
+                    int(num_bands),
+                    int(layer),
+                )
+                stage_b_task = pca_lookup.get(key)
+                if stage_b_task is None:
+                    raise RuntimeError(f"Could not find Stage B PCA task for Stage C key={key}")
+                stage_timestamp = str(stage_b_task["stage_timestamp"])
+                expected_outputs = _expected_pca_guided_outputs(
+                    args=args,
+                    normalized=normalized,
+                    stage_timestamp=stage_timestamp,
+                    token_position_id=str(token_position_id),
+                    basis_source_mode=str(basis_source_mode),
+                    site_menu=str(site_menu),
+                    num_bands=int(num_bands),
+                    layer=int(layer),
+                )
+                stage_c_tasks.append(
+                    {
+                        "task_id": f"stage_c_{stage_b_task['task_id']}",
+                        "category": "stage_c_guided_das",
+                        "layer_selection_method": str(layer_selection_method),
+                        "layer_selection_top_layers_per_var": stage_b_task.get("layer_selection_top_layers_per_var"),
+                        "layer_selection_neighbor_radius": stage_b_task.get("layer_selection_neighbor_radius"),
+                        "layer_selection_max_layers_per_var": stage_b_task.get("layer_selection_max_layers_per_var"),
+                        "selected_layers": stage_b_task.get("selected_layers", []),
+                        "transport_method": str(transport_method),
+                        "token_position_id": str(token_position_id),
+                        "basis_source_mode": str(basis_source_mode),
+                        "site_menu": str(site_menu),
+                        "num_bands": int(num_bands),
+                        "layer": int(layer),
+                        "stage_timestamp": stage_timestamp,
+                        "command": list(
+                            _build_stage_b_or_c_command(
+                                args=args,
+                                normalized=normalized,
+                                stage_timestamp=stage_timestamp,
+                                token_position_id=str(token_position_id),
+                                layers=(int(layer),),
+                                basis_source_mode=str(basis_source_mode),
+                                site_menu=str(site_menu),
+                                num_bands=int(num_bands),
+                                guided_das=True,
+                                transport_method=str(transport_method),
+                            )
+                        ),
+                        "expected_outputs": expected_outputs,
+                        "payload_paths": [expected_outputs[0]],
+                    }
+                )
+
     _write_task_manifest(sweep_root / "stage_c_native_tasks.json", kind="stage_c_native_tasks", tasks=stage_c_native_tasks)
     _write_task_manifest(sweep_root / "stage_c_pca_tasks.json", kind="stage_c_pca_tasks", tasks=stage_c_tasks)
+    _write_task_manifest(sweep_root / "stage_c_native_dim_tasks.json", kind="stage_c_native_dim_tasks", tasks=stage_c_native_dim_tasks)
+    _write_task_manifest(sweep_root / "stage_c_pca_dim_tasks.json", kind="stage_c_pca_dim_tasks", tasks=stage_c_pca_dim_tasks)
     _write_task_manifest(sweep_root / "stage_c_a_only_tasks.json", kind="stage_c_a_only_tasks", tasks=a_only_tasks)
     _write_text(
         sweep_root / "stage_c_task_plan.txt",
@@ -1234,11 +1366,17 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
                 + ",".join(f"{spec.name}(top={spec.top_layers_per_var},r={spec.neighbor_radius},max={spec.max_layers_per_var})" for spec in selection_specs),
                 f"stage_c_native_tasks: {len(stage_c_native_tasks)}",
                 f"stage_c_pca_tasks: {len(stage_c_tasks)}",
+                f"stage_c_native_dim_tasks: {len(stage_c_native_dim_tasks)}",
+                f"stage_c_pca_dim_tasks: {len(stage_c_pca_dim_tasks)}",
                 f"stage_c_a_only_tasks: {len(a_only_tasks)}",
                 "",
                 *[f"{task['task_id']} -> {task['stage_timestamp']}" for task in a_only_tasks],
                 "",
                 *[f"{task['task_id']} -> {task['stage_timestamp']}" for task in stage_c_native_tasks],
+                "",
+                *[f"{task['task_id']} -> {task['stage_timestamp']}" for task in stage_c_native_dim_tasks],
+                "",
+                *[f"{task['task_id']} -> {task['stage_timestamp']}" for task in stage_c_pca_dim_tasks],
                 "",
                 *[f"{task['task_id']} -> {task['stage_timestamp']}" for task in stage_c_tasks],
             ]
@@ -1246,7 +1384,9 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
     )
     print(
         f"[parallel-plan-stage-c] wrote {len(stage_c_native_tasks)} native Stage C tasks, "
-        f"{len(stage_c_tasks)} PCA Stage C tasks, and {len(a_only_tasks)} A-only tasks to {sweep_root}"
+        f"{len(stage_c_tasks)} PCA support Stage C tasks, "
+        f"{len(stage_c_native_dim_tasks)} native dim tasks, {len(stage_c_pca_dim_tasks)} PCA dim tasks, "
+        f"and {len(a_only_tasks)} A-only tasks to {sweep_root}"
     )
 
 
@@ -1255,6 +1395,8 @@ def aggregate_stage_c(args: argparse.Namespace, *, strict: bool = True) -> None:
     sweep_root = _sweep_root(args, normalized)
     native_task_manifest_path = sweep_root / "stage_c_native_tasks.json"
     task_manifest_path = sweep_root / "stage_c_pca_tasks.json"
+    native_dim_manifest_path = sweep_root / "stage_c_native_dim_tasks.json"
+    pca_dim_manifest_path = sweep_root / "stage_c_pca_dim_tasks.json"
     a_only_manifest_path = sweep_root / "stage_c_a_only_tasks.json"
     if not _stage_output_is_valid(task_manifest_path):
         if strict:
@@ -1282,6 +1424,32 @@ def aggregate_stage_c(args: argparse.Namespace, *, strict: bool = True) -> None:
     )
     _write_json(sweep_root / "stage_c_guided_rankings.json", stage_c_rankings)
     _write_text(sweep_root / "stage_c_guided_rankings.txt", _format_stage_c_summary(rankings=stage_c_rankings))
+    native_dim_payload_paths: list[Path] = []
+    if _stage_output_is_valid(native_dim_manifest_path):
+        native_dim_manifest = _load_task_manifest(native_dim_manifest_path)
+        native_dim_payload_paths = _valid_payload_paths_from_tasks(native_dim_manifest["tasks"], strict=strict)
+        native_dim_rankings = _extract_a_only_rankings(
+            payload_paths=native_dim_payload_paths,
+            metadata_by_payload_path=_task_metadata_by_payload_path(native_dim_manifest["tasks"]),
+        )
+        _write_json(sweep_root / "stage_c_native_dim_rankings.json", native_dim_rankings)
+        _write_text(
+            sweep_root / "stage_c_native_dim_rankings.txt",
+            _format_native_summary(title="MCQA Hierarchical Stage C Native Dim-Hinted DAS Ranking", rankings=native_dim_rankings),
+        )
+    pca_dim_payload_paths: list[Path] = []
+    if _stage_output_is_valid(pca_dim_manifest_path):
+        pca_dim_manifest = _load_task_manifest(pca_dim_manifest_path)
+        pca_dim_payload_paths = _valid_payload_paths_from_tasks(pca_dim_manifest["tasks"], strict=strict)
+        pca_dim_rankings = _extract_a_only_rankings(
+            payload_paths=pca_dim_payload_paths,
+            metadata_by_payload_path=_task_metadata_by_payload_path(pca_dim_manifest["tasks"]),
+        )
+        _write_json(sweep_root / "stage_c_pca_dim_rankings.json", pca_dim_rankings)
+        _write_text(
+            sweep_root / "stage_c_pca_dim_rankings.txt",
+            _format_native_summary(title="MCQA Hierarchical Stage C PCA Dim-Hinted DAS Ranking", rankings=pca_dim_rankings),
+        )
     a_only_payload_paths: list[Path] = []
     if _stage_output_is_valid(a_only_manifest_path):
         a_only_manifest = _load_task_manifest(a_only_manifest_path)
@@ -1297,7 +1465,8 @@ def aggregate_stage_c(args: argparse.Namespace, *, strict: bool = True) -> None:
         )
     print(
         f"[parallel-aggregate-stage-c] aggregated {len(native_stage_c_payload_paths)} native Stage C payloads, "
-        f"{len(stage_c_payload_paths)} PCA Stage C payloads "
+        f"{len(stage_c_payload_paths)} PCA support Stage C payloads, "
+        f"{len(native_dim_payload_paths)} native dim payloads, {len(pca_dim_payload_paths)} PCA dim payloads, "
         f"and {len(a_only_payload_paths)} A-only payloads"
     )
 
@@ -1326,8 +1495,10 @@ def aggregate_final(args: argparse.Namespace, *, strict: bool = True) -> None:
         "stage_a_last_token_layer_rankings.txt",
         "stage_b_native_rankings.txt",
         "stage_c_native_guided_rankings.txt",
+        "stage_c_native_dim_rankings.txt",
         "stage_c_a_only_rankings.txt",
         "stage_b_pca_rankings.txt",
+        "stage_c_pca_dim_rankings.txt",
         "stage_c_guided_rankings.txt",
     ):
         path = sweep_root / filename
