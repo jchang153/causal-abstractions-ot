@@ -547,7 +547,12 @@ def _evaluate_stage_a_config(
         payload["results"] = [
             {
                 "selection_score": float(record["selection_score"]),
-                "exact_acc": float(record["exact_acc"]),
+                "exact_acc": float(
+                    record.get(
+                        "selection_exact_acc",
+                        record.get("calibration_exact_acc", 0.0),
+                    )
+                ),
                 "site_label": str(record["site_label"]),
                 "layer": int(record["layer"]),
                 "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
