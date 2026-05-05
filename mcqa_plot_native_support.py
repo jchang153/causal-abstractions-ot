@@ -12,8 +12,10 @@ from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparis
 from mcqa_experiment.data import canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
+    adjust_runtime_for_cached_signatures,
     load_prepared_alignment_artifacts,
     prepare_alignment_artifacts,
+    resolve_recorded_artifact_prepare_seconds,
     save_prepared_alignment_artifacts,
 )
 from mcqa_experiment.reporting import write_text_report
@@ -394,6 +396,10 @@ def main() -> None:
                     f"across transport_target_vars={list(transport_target_vars)} and epsilons={list(float(e) for e in ot_epsilons)}"
                 )
             _synchronize_if_cuda(device)
+            artifact_prepare_recorded_seconds = resolve_recorded_artifact_prepare_seconds(
+                prepared_artifacts,
+                artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+            )
 
             ot_compare_payloads: list[dict[str, object]] = []
             ot_localization_start = perf_counter()
@@ -476,6 +482,12 @@ def main() -> None:
                     support_by_var[str(target_var)] = support_summary
             support_extract_seconds = float(perf_counter() - support_start)
             width_total_seconds = float(perf_counter() - width_start)
+            effective_width_total_seconds = adjust_runtime_for_cached_signatures(
+                wall_runtime_seconds=width_total_seconds,
+                artifact_prepare_load_seconds=artifact_prepare_load_seconds,
+                artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+                artifact_prepare_recorded_seconds=artifact_prepare_recorded_seconds,
+            )
 
             support_path = layer_dir / (
                 f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
@@ -539,6 +551,8 @@ def main() -> None:
                 ],
                 "summary_path": str(summary_path),
                 "context_timing_seconds": context_timing_seconds,
+                "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
+                "signature_prepare_runtime_seconds": float(artifact_prepare_recorded_seconds),
                 "timing_seconds": {
                     "t_model_load": float(context_timing_seconds.get("t_model_load", 0.0)),
                     "t_data_load": float(context_timing_seconds.get("t_data_load", 0.0)),
@@ -547,13 +561,17 @@ def main() -> None:
                     "t_context_total_wall": float(context_timing_seconds.get("t_context_total_wall", 0.0)),
                     "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
                     "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
+                    "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
+                    "t_signature_prepare": float(artifact_prepare_recorded_seconds),
                     "t_stageB_native_ot_localization": float(ot_localization_seconds),
                     "t_support_extract": float(support_extract_seconds),
                     "t_native_width_total_wall": float(width_total_seconds),
+                    "t_native_width_total_effective": float(effective_width_total_seconds),
                 },
                 "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)),
-                "localization_runtime_seconds": float(width_total_seconds),
-                "runtime_seconds": float(width_total_seconds),
+                "wall_runtime_seconds": float(width_total_seconds),
+                "localization_runtime_seconds": float(effective_width_total_seconds),
+                "runtime_seconds": float(effective_width_total_seconds),
             }
             write_json(payload_path, payload)
             all_payloads.append(payload)

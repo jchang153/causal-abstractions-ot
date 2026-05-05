@@ -31,6 +31,28 @@ def _as_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _signature_setup_seconds_from_payload(payload: dict[str, object]) -> float:
+    direct = _as_float(payload.get("signature_prepare_runtime_seconds"))
+    if direct > 0.0:
+        return direct
+    recorded = _as_float(payload.get("artifact_prepare_recorded_seconds"))
+    if recorded > 0.0:
+        return recorded
+    timing_seconds = payload.get("timing_seconds", {})
+    if isinstance(timing_seconds, dict):
+        timed_direct = _as_float(timing_seconds.get("t_signature_prepare"))
+        if timed_direct > 0.0:
+            return timed_direct
+        timed_recorded = _as_float(timing_seconds.get("t_artifact_prepare_recorded"))
+        if timed_recorded > 0.0:
+            return timed_recorded
+        return (
+            _as_float(timing_seconds.get("t_artifact_prepare_load"))
+            + _as_float(timing_seconds.get("t_artifact_prepare_create"))
+        )
+    return 0.0
+
+
 def _first_entry(rankings: dict[str, object], target_var: str) -> dict[str, object] | None:
     entries = rankings.get(target_var)
     if not isinstance(entries, list) or not entries:
@@ -214,13 +236,7 @@ def _native_selected_width_epsilon_runtime(
             continue
         layer = int(payload.get("layer", -1))
         native_resolution = int(payload.get("native_resolution", payload.get("atomic_width", -1)))
-        timing_seconds = payload.get("timing_seconds", {})
-        signature_setup_seconds = 0.0
-        if isinstance(timing_seconds, dict):
-            signature_setup_seconds = (
-                _as_float(timing_seconds.get("t_artifact_prepare_load"))
-                + _as_float(timing_seconds.get("t_artifact_prepare_create"))
-            )
+        signature_setup_seconds = _signature_setup_seconds_from_payload(payload)
         for ot_path_str in payload.get("ot_output_paths", []):
             compare_payload = _load_json(Path(str(ot_path_str)))
             if not isinstance(compare_payload, dict):
@@ -297,14 +313,16 @@ def _pca_selected_config_epsilon_runtime(
         site_menu = str(payload.get("site_menu"))
         num_bands = int(payload.get("num_bands", -1))
         timing_seconds = payload.get("timing_seconds", {})
-        config_setup_seconds = 0.0
-        if isinstance(timing_seconds, dict):
+        config_setup_seconds = (
+            _as_float(payload.get("pca_fit_runtime_seconds"))
+            + _as_float(payload.get("pca_site_build_runtime_seconds"))
+        )
+        if config_setup_seconds <= 0.0 and isinstance(timing_seconds, dict):
             config_setup_seconds = (
                 _as_float(timing_seconds.get("t_stageB_pca_fit"))
                 + _as_float(timing_seconds.get("t_stageB_pca_site_build"))
-                + _as_float(timing_seconds.get("t_artifact_prepare_load"))
-                + _as_float(timing_seconds.get("t_artifact_prepare_create"))
             )
+        config_setup_seconds += _signature_setup_seconds_from_payload(payload)
         for ot_path_str in payload.get("ot_output_paths", []):
             compare_payload = _load_json(Path(str(ot_path_str)))
             if not isinstance(compare_payload, dict):

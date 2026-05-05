@@ -12,9 +12,11 @@ from mcqa_experiment.data import canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
     _evaluate_single_site_intervention,
+    adjust_runtime_for_cached_signatures,
     load_prepared_alignment_artifacts,
     normalize_transport_rows,
     prepare_alignment_artifacts,
+    resolve_recorded_artifact_prepare_seconds,
     save_prepared_alignment_artifacts,
     solve_uot_transport,
 )
@@ -951,6 +953,10 @@ def main() -> None:
             f"loaded_from_disk={bool(prepared_artifacts.get('loaded_from_disk', False))}"
         )
     _synchronize_if_cuda(device)
+    artifact_prepare_recorded_seconds = resolve_recorded_artifact_prepare_seconds(
+        prepared_artifacts,
+        artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+    )
     variable_signatures_by_var = {
         str(target_var): build_variable_signature(
             banks_by_split["train"][str(target_var)],
@@ -1020,7 +1026,10 @@ def main() -> None:
     ot_localization_seconds = float(perf_counter() - ot_localization_start)
 
     signature_prepare_runtime_seconds = float(
-        prepared_artifacts.get("prepare_runtime_seconds", artifact_prepare_create_seconds)
+        resolve_recorded_artifact_prepare_seconds(
+            prepared_artifacts,
+            artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+        )
     )
     print(
         "[stageA] selecting one shared PLOT(layer) UOT coupling by averaging the "
@@ -1063,6 +1072,12 @@ def main() -> None:
     )
     support_extract_seconds = float(perf_counter() - support_start)
     total_seconds = float(perf_counter() - stage_start)
+    effective_total_seconds = adjust_runtime_for_cached_signatures(
+        wall_runtime_seconds=total_seconds,
+        artifact_prepare_load_seconds=artifact_prepare_load_seconds,
+        artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+        artifact_prepare_recorded_seconds=artifact_prepare_recorded_seconds,
+    )
     rankings_by_var = _rank_layers_from_target_row(
         selected_method_by_var=method_by_var,
         runtime_seconds=float(selected_config.get("runtime_with_signatures_seconds", total_seconds)),
@@ -1116,6 +1131,8 @@ def main() -> None:
             ],
             "summary_path": str(summary_path),
             "context_timing_seconds": context_timing_seconds,
+            "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
+            "signature_prepare_runtime_seconds": float(signature_prepare_runtime_seconds),
             "timing_seconds": {
                 "t_model_load": float(context_timing_seconds.get("t_model_load", 0.0)),
                 "t_data_load": float(context_timing_seconds.get("t_data_load", 0.0)),
@@ -1124,13 +1141,16 @@ def main() -> None:
                 "t_context_total_wall": float(context_timing_seconds.get("t_context_total_wall", 0.0)),
                 "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
                 "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
+                "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
+                "t_signature_prepare": float(signature_prepare_runtime_seconds),
                 "t_stageA_ot_localization": float(ot_localization_seconds),
                 "t_support_extract": float(support_extract_seconds),
                 "t_stage_total_wall": float(total_seconds),
             },
             "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)),
-            "localization_runtime_seconds": float(total_seconds),
-            "runtime_seconds": float(total_seconds),
+            "wall_runtime_seconds": float(total_seconds),
+            "localization_runtime_seconds": float(effective_total_seconds),
+            "runtime_seconds": float(effective_total_seconds),
         },
     )
     print(f"Wrote PLOT layer payload to {payload_path}")

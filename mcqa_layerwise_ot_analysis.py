@@ -19,9 +19,11 @@ from mcqa_experiment.data import canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
     _evaluate_single_site_intervention,
+    adjust_runtime_for_cached_signatures,
     load_prepared_alignment_artifacts,
     normalize_transport_rows,
     prepare_alignment_artifacts,
+    resolve_recorded_artifact_prepare_seconds,
     save_prepared_alignment_artifacts,
     solve_ot_transport,
     solve_uot_transport,
@@ -698,6 +700,7 @@ def _summarize_transport_runs(
     calibration_family_weights: tuple[float, ...],
     intervention_strength: float,
     row_top_k: int,
+    signature_prepare_runtime_seconds: float,
 ) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
     progress = tqdm(total=len(transport_runs), desc="Shortlist calibration sweep", leave=True) if tqdm is not None else None
@@ -779,7 +782,13 @@ def _summarize_transport_runs(
         run_summary["shortlist_union_size"] = int(len(shortlist_union_layers))
         run_summary["per_var_calibration_runtime_seconds"] = per_var_runtime_by_var
         run_summary["shortlist_calibration_runtime_seconds"] = float(sum(per_var_runtime_by_var.values()))
+        run_summary["signature_prepare_runtime_seconds"] = float(signature_prepare_runtime_seconds)
         run_summary["transport_solve_runtime_seconds"] = float(run_payload.get("transport_meta", {}).get("runtime_seconds", run_payload.get("runtime_seconds", 0.0)))
+        run_summary["runtime_with_signatures_seconds"] = float(
+            signature_prepare_runtime_seconds
+            + float(run_summary.get("transport_solve_runtime_seconds", 0.0))
+            + float(run_summary.get("shortlist_calibration_runtime_seconds", 0.0))
+        )
         run_summary["mean_selected_calibration_score"] = (
             float(sum(selected_scores) / len(selected_scores)) if selected_scores else 0.0
         )
@@ -796,7 +805,7 @@ def _summarize_transport_runs(
             f"[layerwise] config_eval_done {config_label} "
             f"transport_runtime={float(run_summary.get('transport_solve_runtime_seconds', 0.0)):.2f}s "
             f"shortlist_runtime={float(run_summary.get('shortlist_calibration_runtime_seconds', 0.0)):.2f}s "
-            f"total_config_runtime={float(run_summary.get('transport_solve_runtime_seconds', 0.0)) + float(run_summary.get('shortlist_calibration_runtime_seconds', 0.0)):.2f}s "
+            f"total_config_runtime={float(run_summary.get('runtime_with_signatures_seconds', 0.0)):.2f}s "
             f"avg_cal_score={float(run_summary.get('mean_selected_calibration_score', 0.0)):.4f} "
             f"chosen_layers={chosen_layers}"
         )
@@ -827,6 +836,7 @@ def _format_transport_summary(transport_summaries: list[dict[str, object]]) -> l
                     f"avg_cal_exact={float(run_summary.get('mean_selected_calibration_exact_acc', 0.0)):.4f}",
                     f"transport_runtime={float(run_summary.get('transport_solve_runtime_seconds', 0.0)):.2f}s",
                     f"shortlist_runtime={float(run_summary.get('shortlist_calibration_runtime_seconds', 0.0)):.2f}s",
+                    f"total_runtime={float(run_summary.get('runtime_with_signatures_seconds', 0.0)):.2f}s",
                     f"shortlist_union_layers={run_summary.get('shortlist_union_layers', [])}",
                 ]
             )
@@ -916,8 +926,7 @@ def _format_summary(
                 f"row_top_k={int(row_top_k)}",
                 f"avg_cal_score={float(best_summary.get('mean_selected_calibration_score', 0.0)):.4f}",
                 f"avg_cal_exact={float(best_summary.get('mean_selected_calibration_exact_acc', 0.0)):.4f}",
-                f"transport_runtime={float(best_summary.get('transport_solve_runtime_seconds', 0.0)):.2f}s",
-                f"shortlist_runtime={float(best_summary.get('shortlist_calibration_runtime_seconds', 0.0)):.2f}s",
+                f"total_runtime={float(best_summary.get('runtime_with_signatures_seconds', 0.0)):.2f}s",
                 f"shortlist_union_layers={best_summary.get('shortlist_union_layers', [])}",
             ]
         )
@@ -1057,6 +1066,11 @@ def main() -> None:
             f"loaded_from_disk={bool(prepared_artifacts.get('loaded_from_disk', False))}"
         )
     _synchronize_if_cuda(device)
+    artifact_prepare_recorded_seconds = resolve_recorded_artifact_prepare_seconds(
+        prepared_artifacts,
+        artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+    )
+    signature_prepare_runtime_seconds = float(artifact_prepare_recorded_seconds)
 
     transport_root = sweep_root / "transport"
     transport_runs: list[dict[str, object]] = []
@@ -1087,6 +1101,7 @@ def main() -> None:
             calibration_family_weights=calibration_family_weights,
             intervention_strength=intervention_strength,
             row_top_k=row_top_k,
+            signature_prepare_runtime_seconds=signature_prepare_runtime_seconds,
         )
 
     summary_text = _format_summary(
@@ -1098,6 +1113,13 @@ def main() -> None:
     summary_path = sweep_root / "layerwise_ot_summary.txt"
     payload_path = sweep_root / "layerwise_ot_results.json"
     best_transport_summary = _best_transport_summary(transport_summaries)
+    total_wall_seconds = float(perf_counter() - overall_start)
+    effective_total_seconds = adjust_runtime_for_cached_signatures(
+        wall_runtime_seconds=total_wall_seconds,
+        artifact_prepare_load_seconds=artifact_prepare_load_seconds,
+        artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+        artifact_prepare_recorded_seconds=artifact_prepare_recorded_seconds,
+    )
     write_text_report(summary_path, summary_text)
     write_json(
         payload_path,
@@ -1115,6 +1137,8 @@ def main() -> None:
             "single_layer_lambdas": [float(value) for value in single_layer_lambdas],
             "site_labels": [site.label for site in sites],
             "context_timing_seconds": context_timing_seconds,
+            "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
+            "signature_prepare_runtime_seconds": float(signature_prepare_runtime_seconds),
             "timing_seconds": {
                 "t_model_load": float(context_timing_seconds.get("t_model_load", 0.0)),
                 "t_data_load": float(context_timing_seconds.get("t_data_load", 0.0)),
@@ -1123,9 +1147,14 @@ def main() -> None:
                 "t_context_total_wall": float(context_timing_seconds.get("t_context_total_wall", 0.0)),
                 "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
                 "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
-                "t_total_wall": float(perf_counter() - overall_start),
+                "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
+                "t_signature_prepare": float(signature_prepare_runtime_seconds),
+                "t_total_wall": float(total_wall_seconds),
+                "t_total_effective": float(effective_total_seconds),
             },
             "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)),
+            "wall_runtime_seconds": float(total_wall_seconds),
+            "runtime_seconds": float(effective_total_seconds),
             "transport_runs": transport_runs,
             "transport_summaries": transport_summaries,
             "best_transport_summary": best_transport_summary,

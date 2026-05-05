@@ -304,6 +304,36 @@ def save_prepared_alignment_artifacts(
     )
 
 
+def resolve_recorded_artifact_prepare_seconds(
+    prepared_artifacts: dict[str, object] | None,
+    *,
+    artifact_prepare_create_seconds: float = 0.0,
+) -> float:
+    """Return the original signature-build runtime associated with an artifact."""
+    if isinstance(prepared_artifacts, dict):
+        recorded = float(prepared_artifacts.get("prepare_runtime_seconds", 0.0))
+        if recorded > 0.0:
+            return recorded
+    return float(artifact_prepare_create_seconds)
+
+
+def adjust_runtime_for_cached_signatures(
+    *,
+    wall_runtime_seconds: float,
+    artifact_prepare_load_seconds: float = 0.0,
+    artifact_prepare_create_seconds: float = 0.0,
+    artifact_prepare_recorded_seconds: float = 0.0,
+) -> float:
+    """Replace cache-load/create wall time with the artifact's recorded build time."""
+    adjusted = (
+        float(wall_runtime_seconds)
+        - float(artifact_prepare_load_seconds)
+        - float(artifact_prepare_create_seconds)
+        + float(artifact_prepare_recorded_seconds)
+    )
+    return float(max(adjusted, 0.0))
+
+
 def prepare_alignment_artifacts(
     *,
     model,
@@ -1019,8 +1049,11 @@ def run_alignment_pipeline(
                 f"loaded_from_disk={bool(prepared_artifacts.get('loaded_from_disk', False))}"
             )
     artifact_cache_hit = bool(prepared_artifacts.get("loaded_from_disk", False))
-    artifact_prepare_recorded_seconds = float(prepared_artifacts.get("prepare_runtime_seconds", 0.0))
     artifact_prepare_create_seconds = float(signature_prepare_wall_seconds)
+    artifact_prepare_recorded_seconds = resolve_recorded_artifact_prepare_seconds(
+        prepared_artifacts,
+        artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+    )
     signature_prepare_runtime_seconds = float(signature_prepare_wall_seconds)
     site_signatures_by_var = prepared_artifacts["site_signatures_by_var"]
     variable_signature_start = perf_counter()
@@ -1155,6 +1188,7 @@ def run_alignment_pipeline(
         "artifact_prepare_load_seconds": float(artifact_prepare_load_seconds),
         "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
         "signature_prepare_runtime_seconds": float(signature_prepare_runtime_seconds),
+        "recorded_signature_prepare_runtime_seconds": float(artifact_prepare_recorded_seconds),
         "wall_runtime_seconds": float(total_wall_seconds),
         "runtime_seconds": float(total_wall_seconds),
         "localization_runtime_seconds": float(localization_runtime_seconds),
@@ -1163,6 +1197,8 @@ def run_alignment_pipeline(
             "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
             "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
             "t_signature_prepare": float(signature_prepare_runtime_seconds),
+            "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
+            "t_recorded_signature_prepare": float(artifact_prepare_recorded_seconds),
             "t_variable_signature_build": float(variable_signature_seconds),
             "t_transport_solve": float(transport_solve_seconds),
             "t_handle_calibration": float(calibration_select_seconds),

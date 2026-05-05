@@ -13,8 +13,10 @@ from mcqa_experiment.das import DASConfig, run_das_pipeline
 from mcqa_experiment.data import COUNTERFACTUAL_FAMILIES, canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
+    adjust_runtime_for_cached_signatures,
     load_prepared_alignment_artifacts,
     prepare_alignment_artifacts,
+    resolve_recorded_artifact_prepare_seconds,
     run_alignment_pipeline,
     save_prepared_alignment_artifacts,
 )
@@ -1003,6 +1005,25 @@ def main() -> None:
             ot_compare_payloads.append(compare_payload)
         _synchronize_if_cuda(device)
         ot_fit_cal_seconds = float(perf_counter() - ot_fit_cal_start)
+        artifact_prepare_recorded_seconds = resolve_recorded_artifact_prepare_seconds(
+            prepared_artifacts,
+            artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+        )
+        if artifact_prepare_recorded_seconds <= 0.0:
+            for compare_payload in ot_compare_payloads:
+                if not isinstance(compare_payload, dict):
+                    continue
+                method_payloads = compare_payload.get("method_payloads", {})
+                if not isinstance(method_payloads, dict):
+                    continue
+                for method_payload in method_payloads.get("ot", []):
+                    if not isinstance(method_payload, dict):
+                        continue
+                    artifact_prepare_recorded_seconds = max(
+                        artifact_prepare_recorded_seconds,
+                        float(method_payload.get("artifact_prepare_recorded_seconds", 0.0)),
+                        float(method_payload.get("recorded_signature_prepare_runtime_seconds", 0.0)),
+                    )
 
         support_start = perf_counter()
         support_by_var = extract_ordered_site_support(
@@ -1089,13 +1110,19 @@ def main() -> None:
         _synchronize_if_cuda(device)
         das_guided_seconds = float(perf_counter() - das_guided_start)
         layer_total_seconds = float(perf_counter() - layer_start)
-        localization_runtime_seconds = float(
+        localization_wall_runtime_seconds = float(
             pca_fit_seconds
             + site_build_seconds
             + artifact_prepare_load_seconds
             + artifact_prepare_create_seconds
             + ot_fit_cal_seconds
             + support_extract_seconds
+        )
+        localization_runtime_seconds = adjust_runtime_for_cached_signatures(
+            wall_runtime_seconds=localization_wall_runtime_seconds,
+            artifact_prepare_load_seconds=artifact_prepare_load_seconds,
+            artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+            artifact_prepare_recorded_seconds=artifact_prepare_recorded_seconds,
         )
 
         layer_summary_path = layer_dir / (
@@ -1140,6 +1167,8 @@ def main() -> None:
             "basis_path": str(basis_path),
             "basis": basis.to_payload(),
             "fit_prompt_record_count": 0 if prompt_records is None else len(prompt_records),
+            "pca_fit_runtime_seconds": float(pca_fit_seconds),
+            "pca_site_build_runtime_seconds": float(site_build_seconds),
             "site_labels": [site.label for site in pca_sites],
             "site_metrics": site_metrics,
             "support_score_slack": float(args.support_score_slack),
@@ -1151,8 +1180,11 @@ def main() -> None:
             "guided_subspace_dims": None if guided_subspace_dims is None else [int(dim) for dim in guided_subspace_dims],
             "guided_das_enabled": bool(args.guided_das),
             "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)) if prepared_artifacts else False,
+            "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
+            "signature_prepare_runtime_seconds": float(artifact_prepare_recorded_seconds),
             "localization_runtime_seconds": float(localization_runtime_seconds),
             "runtime_seconds": float(localization_runtime_seconds),
+            "wall_runtime_seconds": float(localization_wall_runtime_seconds),
             "context_timing_seconds": context_timing_seconds,
             "timing_seconds": {
                 "t_model_load": float(context_timing_seconds.get("t_model_load", 0.0)),
@@ -1164,10 +1196,12 @@ def main() -> None:
                 "t_stageB_pca_site_build": float(site_build_seconds),
                 "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
                 "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
+                "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
+                "t_signature_prepare": float(artifact_prepare_recorded_seconds),
                 "t_stageB_pca_ot_fit_cal": float(ot_fit_cal_seconds),
                 "t_support_extract": float(support_extract_seconds),
                 "t_stageB_pca_localization": float(localization_runtime_seconds),
-                "t_layer_total_wall": float(localization_runtime_seconds),
+                "t_layer_total_wall": float(localization_wall_runtime_seconds),
                 "t_stage_total_wall_so_far": float(perf_counter() - stage_start),
             },
             "screen_output_paths": {
