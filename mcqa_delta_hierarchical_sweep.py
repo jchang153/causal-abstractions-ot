@@ -305,7 +305,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stage-a-ot-lambdas",
         default=None,
-        help="Comma-separated Stage A-only lambdas for the row-argmax layer evaluations. Defaults to --ot-lambdas.",
+        help="Deprecated compatibility flag. Stage A now uses a fixed full-strength intervention and ignores lambda sweeps.",
     )
     parser.add_argument("--ot-top-k-values", default="1,2,4")
     parser.add_argument("--ot-lambdas", default="0.5,1,2,4")
@@ -365,11 +365,6 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     stage_a_uot_beta_neurals = _parse_csv_floats(args.stage_a_uot_beta_neurals) or DEFAULT_STAGE_A_UOT_BETA_NEURALS
     ot_top_k_values = _parse_csv_ints(args.ot_top_k_values) or DEFAULT_OT_TOP_K_VALUES
     ot_lambdas = _parse_csv_floats(args.ot_lambdas) or DEFAULT_OT_LAMBDAS
-    stage_a_ot_lambdas = (
-        _parse_csv_floats(args.stage_a_ot_lambdas)
-        if args.stage_a_ot_lambdas is not None
-        else None
-    ) or ot_lambdas
     calibration_family_weights = _parse_csv_floats(args.calibration_family_weights) or DEFAULT_CALIBRATION_FAMILY_WEIGHTS
     guided_mask_names = _parse_csv_strings(args.guided_mask_names) or DEFAULT_GUIDED_MASK_NAMES
     guided_subspace_dims = None
@@ -398,7 +393,6 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "ot_epsilons": tuple(float(epsilon) for epsilon in ot_epsilons),
         "stage_a_uot_beta_neurals": tuple(float(beta) for beta in stage_a_uot_beta_neurals),
         "stage_a_row_top_k": max(1, int(args.stage_a_row_top_k)),
-        "stage_a_ot_lambdas": tuple(float(value) for value in stage_a_ot_lambdas),
         "ot_top_k_values": tuple(int(value) for value in ot_top_k_values),
         "ot_lambdas": tuple(float(value) for value in ot_lambdas),
         "calibration_family_weights": tuple(float(weight) for weight in calibration_family_weights),
@@ -451,11 +445,6 @@ def _build_stage_a_command(
         ),
         "--stage-a-row-top-k",
         str(int(normalized["stage_a_row_top_k"])),
-        "--ot-lambdas",
-        ",".join(
-            str(value).rstrip("0").rstrip(".") if "." in str(value) else str(value)
-            for value in normalized["stage_a_ot_lambdas"]
-        ),
         "--calibration-family-weights",
         ",".join(
             str(weight).rstrip("0").rstrip(".") if "." in str(weight) else str(weight)
@@ -1604,7 +1593,6 @@ def _write_status(
             "stage_a_layer_indices": list(normalized["stage_a_layer_indices"]),
             "stage_a_uot_beta_neurals": list(normalized["stage_a_uot_beta_neurals"]),
             "stage_a_row_top_k": int(normalized["stage_a_row_top_k"]),
-            "stage_a_ot_lambdas": list(normalized["stage_a_ot_lambdas"]),
             "stage_b_top_layers_per_var": int(args.stage_b_top_layers_per_var),
             "stage_b_neighbor_radius": int(args.stage_b_neighbor_radius),
             "stage_b_max_layers_per_var": int(args.stage_b_max_layers_per_var),

@@ -82,7 +82,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
     parser.add_argument("--ot-epsilons", help="Comma-separated UOT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--uot-beta-neurals", help="Comma-separated UOT beta_neural values. Default: 0.1,0.3,1,3")
-    parser.add_argument("--ot-lambdas", help="Comma-separated Stage A intervention strengths. Default: 1")
+    parser.add_argument(
+        "--ot-lambdas",
+        help="Deprecated compatibility flag. Stage A now uses a fixed full-strength intervention and ignores lambda sweeps.",
+    )
     parser.add_argument(
         "--stage-a-row-top-k",
         type=int,
@@ -338,7 +341,6 @@ def _evaluate_stage_a_config(
     device,
     batch_size: int,
     signature_mode: str,
-    lambda_values: tuple[float, ...],
     calibration_family_weights: tuple[float, ...],
     row_top_k: int,
 ) -> dict[str, object]:
@@ -387,161 +389,134 @@ def _evaluate_stage_a_config(
             }
             break
 
-    best_lambda_result: dict[str, object] | None = None
-    lambda_sweep: list[dict[str, object]] = []
     evaluation_sweep_runtime_seconds = 0.0
-    for strength in lambda_values:
-        per_var_records: dict[str, dict[str, object]] = {}
-        for target_var in target_vars:
-            row_info = row_info_by_var.get(str(target_var))
-            if not isinstance(row_info, dict):
-                continue
-            payload = row_info["payload"]
-            row_ranking = row_info["row_ranking"]
-            shortlisted_entries = row_info["shortlisted_entries"]
-            candidate_records: list[dict[str, object]] = []
-            for shortlisted_entry in shortlisted_entries:
-                candidate_site = shortlisted_entry["site"]
-                direct_eval_payload = _evaluate_fixed_single_layer(
-                    model=model,
-                    tokenizer=tokenizer,
-                    calibration_bank=banks_by_split["calibration"][str(target_var)],
-                    holdout_bank=banks_by_split["test"][str(target_var)],
-                    site=candidate_site,
-                    site_index=int(shortlisted_entry["site_index"]),
-                    device=device,
-                    batch_size=int(batch_size),
-                    strength=float(strength),
-                    calibration_family_weights=calibration_family_weights,
-                )
-                evaluation_sweep_runtime_seconds += float(direct_eval_payload.get("runtime_seconds", 0.0))
-                result = direct_eval_payload.get("results", [{}])[0]
-                calibration_result = direct_eval_payload.get("selected_calibration_result", result)
-                calibration_score = float(
-                    direct_eval_payload.get(
-                        "calibration_score",
-                        calibration_result.get("selection_score", calibration_result.get("exact_acc", 0.0)),
-                    )
-                )
-                candidate_records.append(
-                    {
-                        "rank_index": int(shortlisted_entry["rank_index"]),
-                        "site_index": int(shortlisted_entry["site_index"]),
-                        "site": candidate_site,
-                        "site_label": str(shortlisted_entry["site_label"]),
-                        "layer": int(shortlisted_entry["layer"]),
-                        "transport_mass": float(shortlisted_entry["transport_mass"]),
-                        "runtime_seconds": float(direct_eval_payload.get("runtime_seconds", 0.0)),
-                        "exact_acc": float(result.get("exact_acc", 0.0)),
-                        "calibration_score": float(calibration_score),
-                        "calibration_exact_acc": float(calibration_result.get("exact_acc", 0.0)),
-                        "payload": direct_eval_payload,
-                    }
-                )
-            best_candidate = max(
-                candidate_records,
-                key=lambda record: (
-                    float(record.get("calibration_score", 0.0)),
-                    float(record.get("exact_acc", 0.0)),
-                    float(record.get("transport_mass", 0.0)),
-                    -int(record.get("rank_index", 10**9)),
-                ),
+    per_var_records: dict[str, dict[str, object]] = {}
+    for target_var in target_vars:
+        row_info = row_info_by_var.get(str(target_var))
+        if not isinstance(row_info, dict):
+            continue
+        payload = row_info["payload"]
+        row_ranking = row_info["row_ranking"]
+        shortlisted_entries = row_info["shortlisted_entries"]
+        candidate_records: list[dict[str, object]] = []
+        for shortlisted_entry in shortlisted_entries:
+            candidate_site = shortlisted_entry["site"]
+            direct_eval_payload = _evaluate_fixed_single_layer(
+                model=model,
+                tokenizer=tokenizer,
+                calibration_bank=banks_by_split["calibration"][str(target_var)],
+                holdout_bank=banks_by_split["test"][str(target_var)],
+                site=candidate_site,
+                site_index=int(shortlisted_entry["site_index"]),
+                device=device,
+                batch_size=int(batch_size),
+                strength=float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
+                calibration_family_weights=calibration_family_weights,
             )
-            direct_eval_payload = best_candidate["payload"]
+            evaluation_sweep_runtime_seconds += float(direct_eval_payload.get("runtime_seconds", 0.0))
             result = direct_eval_payload.get("results", [{}])[0]
-            calibration_score = float(best_candidate["calibration_score"])
-            record = {
-                "method": str(payload.get("method", row_info["method_name"])),
-                "variable": str(target_var),
-                "exact_acc": float(result.get("exact_acc", 0.0)),
-                "selection_score": float(calibration_score),
-                "site_label": str(result.get("site_label", best_candidate["site"].label)),
-                "layer": int(result.get("layer", best_candidate["site"].layer)),
-                "epsilon": float(epsilon),
-                "uot_beta_neural": None
-                if payload.get("uot_beta_neural", compare_beta) is None
-                else float(payload.get("uot_beta_neural", compare_beta)),
-                "lambda": float(strength),
-                "candidate_site_labels": [str(entry["site_label"]) for entry in shortlisted_entries],
-                "candidate_layers": [int(entry["layer"]) for entry in shortlisted_entries],
-                "coupling_argmax_site_label": str(shortlisted_entries[0]["site_label"]),
-                "coupling_argmax_layer": int(shortlisted_entries[0]["layer"]),
-                "coupling_top_site_labels": [str(entry.get("site_label", "")) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
-                "coupling_top_layers": [int(entry.get("layer", -1)) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
-                "selection_basis": "best_calibrated_single_site_within_coupling_topk_shared_lambda_sweep",
-                "selected_candidate_rank": int(best_candidate["rank_index"]),
-                "selected_candidate_transport_mass": float(best_candidate["transport_mass"]),
-                "candidate_records": [
-                    {
-                        "rank_index": int(candidate["rank_index"]),
-                        "site_index": int(candidate["site_index"]),
-                        "site_label": str(candidate["site_label"]),
-                        "layer": int(candidate["layer"]),
-                        "transport_mass": float(candidate["transport_mass"]),
-                        "calibration_score": float(candidate["calibration_score"]),
-                        "calibration_exact_acc": float(candidate["calibration_exact_acc"]),
-                        "exact_acc": float(candidate["exact_acc"]),
-                        "runtime_seconds": float(candidate["runtime_seconds"]),
-                    }
-                    for candidate in candidate_records
-                ],
-                "target_row_ranking": row_ranking,
-                "runtime_seconds": float(sum(candidate["runtime_seconds"] for candidate in candidate_records)),
-                "payload": direct_eval_payload,
-            }
-            per_var_records[str(target_var)] = record
-
-        calibration_scores = [
-            float(record.get("selection_score", 0.0))
-            for target_var in target_vars
-            for record in [per_var_records.get(str(target_var))]
-            if isinstance(record, dict)
-        ]
-        exact_scores = [
-            float(record.get("exact_acc", 0.0))
-            for target_var in target_vars
-            for record in [per_var_records.get(str(target_var))]
-            if isinstance(record, dict)
-        ]
-        lambda_result = {
-            "method": "uot",
-            "epsilon": float(epsilon),
-            "uot_beta_neural": None if compare_beta is None else float(compare_beta),
-            "lambda": float(strength),
-            "per_var_records": per_var_records,
-            "mean_calibration_score": float(sum(calibration_scores) / len(calibration_scores)) if calibration_scores else 0.0,
-            "mean_exact_acc": float(sum(exact_scores) / len(exact_scores)) if exact_scores else 0.0,
-            "evaluation_runtime_seconds": float(
-                sum(
-                    float(record.get("runtime_seconds", 0.0))
-                    for record in per_var_records.values()
-                    if isinstance(record, dict)
+            calibration_result = direct_eval_payload.get("selected_calibration_result", result)
+            calibration_score = float(
+                direct_eval_payload.get(
+                    "calibration_score",
+                    calibration_result.get("selection_score", calibration_result.get("exact_acc", 0.0)),
                 )
+            )
+            candidate_records.append(
+                {
+                    "rank_index": int(shortlisted_entry["rank_index"]),
+                    "site_index": int(shortlisted_entry["site_index"]),
+                    "site": candidate_site,
+                    "site_label": str(shortlisted_entry["site_label"]),
+                    "layer": int(shortlisted_entry["layer"]),
+                    "transport_mass": float(shortlisted_entry["transport_mass"]),
+                    "runtime_seconds": float(direct_eval_payload.get("runtime_seconds", 0.0)),
+                    "exact_acc": float(result.get("exact_acc", 0.0)),
+                    "calibration_score": float(calibration_score),
+                    "calibration_exact_acc": float(calibration_result.get("exact_acc", 0.0)),
+                    "payload": direct_eval_payload,
+                }
+            )
+        best_candidate = max(
+            candidate_records,
+            key=lambda record: (
+                float(record.get("calibration_score", 0.0)),
+                float(record.get("exact_acc", 0.0)),
+                float(record.get("transport_mass", 0.0)),
+                -int(record.get("rank_index", 10**9)),
             ),
+        )
+        direct_eval_payload = best_candidate["payload"]
+        result = direct_eval_payload.get("results", [{}])[0]
+        calibration_score = float(best_candidate["calibration_score"])
+        record = {
+            "method": str(payload.get("method", row_info["method_name"])),
+            "variable": str(target_var),
+            "exact_acc": float(result.get("exact_acc", 0.0)),
+            "selection_score": float(calibration_score),
+            "site_label": str(result.get("site_label", best_candidate["site"].label)),
+            "layer": int(result.get("layer", best_candidate["site"].layer)),
+            "epsilon": float(epsilon),
+            "uot_beta_neural": None
+            if payload.get("uot_beta_neural", compare_beta) is None
+            else float(payload.get("uot_beta_neural", compare_beta)),
+            "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
+            "candidate_site_labels": [str(entry["site_label"]) for entry in shortlisted_entries],
+            "candidate_layers": [int(entry["layer"]) for entry in shortlisted_entries],
+            "coupling_argmax_site_label": str(shortlisted_entries[0]["site_label"]),
+            "coupling_argmax_layer": int(shortlisted_entries[0]["layer"]),
+            "coupling_top_site_labels": [str(entry.get("site_label", "")) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
+            "coupling_top_layers": [int(entry.get("layer", -1)) for entry in row_ranking[:DEFAULT_DISPLAY_TOP_LAYER_COUNT]],
+            "selection_basis": "best_calibrated_single_site_within_coupling_topk",
+            "selected_candidate_rank": int(best_candidate["rank_index"]),
+            "selected_candidate_transport_mass": float(best_candidate["transport_mass"]),
+            "candidate_records": [
+                {
+                    "rank_index": int(candidate["rank_index"]),
+                    "site_index": int(candidate["site_index"]),
+                    "site_label": str(candidate["site_label"]),
+                    "layer": int(candidate["layer"]),
+                    "transport_mass": float(candidate["transport_mass"]),
+                    "calibration_score": float(candidate["calibration_score"]),
+                    "calibration_exact_acc": float(candidate["calibration_exact_acc"]),
+                    "exact_acc": float(candidate["exact_acc"]),
+                    "runtime_seconds": float(candidate["runtime_seconds"]),
+                }
+                for candidate in candidate_records
+            ],
+            "target_row_ranking": row_ranking,
+            "runtime_seconds": float(sum(candidate["runtime_seconds"] for candidate in candidate_records)),
+            "payload": direct_eval_payload,
         }
-        lambda_sweep.append(lambda_result)
-        if best_lambda_result is None or (
-            float(lambda_result["mean_calibration_score"]),
-            float(lambda_result["mean_exact_acc"]),
-        ) > (
-            float(best_lambda_result["mean_calibration_score"]),
-            float(best_lambda_result["mean_exact_acc"]),
-        ):
-            best_lambda_result = lambda_result
+        per_var_records[str(target_var)] = record
 
-    if best_lambda_result is None:
+    calibration_scores = [
+        float(record.get("selection_score", 0.0))
+        for target_var in target_vars
+        for record in [per_var_records.get(str(target_var))]
+        if isinstance(record, dict)
+    ]
+    exact_scores = [
+        float(record.get("exact_acc", 0.0))
+        for target_var in target_vars
+        for record in [per_var_records.get(str(target_var))]
+        if isinstance(record, dict)
+    ]
+
+    if not per_var_records:
         return {
             "method": "uot",
             "epsilon": float(epsilon),
             "uot_beta_neural": None if compare_beta is None else float(compare_beta),
-            "lambda": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
+            "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
             "per_var_records": {},
             "mean_calibration_score": 0.0,
             "mean_exact_acc": 0.0,
-            "lambda_sweep": [],
             "evaluation_sweep_runtime_seconds": 0.0,
+            "row_top_k": int(row_top_k),
         }
-    for target_var, record in best_lambda_result.get("per_var_records", {}).items():
+
+    for target_var, record in per_var_records.items():
         row_info = row_info_by_var.get(str(target_var))
         if not isinstance(row_info, dict):
             continue
@@ -552,16 +527,22 @@ def _evaluate_stage_a_config(
                 "exact_acc": float(record["exact_acc"]),
                 "site_label": str(record["site_label"]),
                 "layer": int(record["layer"]),
-                "lambda": float(record["lambda"]),
+                "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
                 "runtime_seconds": float(record.get("runtime_seconds", 0.0)),
                 "variable": str(target_var),
             }
         ]
-    best_lambda_result = dict(best_lambda_result)
-    best_lambda_result["lambda_sweep"] = lambda_sweep
-    best_lambda_result["evaluation_sweep_runtime_seconds"] = float(evaluation_sweep_runtime_seconds)
-    best_lambda_result["row_top_k"] = int(row_top_k)
-    return best_lambda_result
+    return {
+        "method": "uot",
+        "epsilon": float(epsilon),
+        "uot_beta_neural": None if compare_beta is None else float(compare_beta),
+        "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
+        "per_var_records": per_var_records,
+        "mean_calibration_score": float(sum(calibration_scores) / len(calibration_scores)) if calibration_scores else 0.0,
+        "mean_exact_acc": float(sum(exact_scores) / len(exact_scores)) if exact_scores else 0.0,
+        "evaluation_sweep_runtime_seconds": float(evaluation_sweep_runtime_seconds),
+        "row_top_k": int(row_top_k),
+    }
 
 
 def _format_stage_a_config_line(
@@ -595,7 +576,6 @@ def _format_stage_a_config_line(
             f"beta_neural={float(candidate_config.get('uot_beta_neural')):g} "
             if candidate_config.get("uot_beta_neural") is not None else ""
         )
-        + f"lambda={float(candidate_config.get('lambda', DEFAULT_STAGE_A_INTERVENTION_STRENGTH)):g} "
         + f"row_top_k={int(candidate_config.get('row_top_k', DEFAULT_STAGE_A_ROW_TOP_K))} "
         + f"layers={chosen_layers} "
         + f"cal={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in calibration_scores.items())}}} "
@@ -616,7 +596,6 @@ def _select_joint_layer_config(
     device,
     batch_size: int,
     signature_mode: str,
-    lambda_values: tuple[float, ...],
     calibration_family_weights: tuple[float, ...],
     signature_prepare_runtime_seconds: float,
     row_top_k: int,
@@ -632,7 +611,6 @@ def _select_joint_layer_config(
             device=device,
             batch_size=batch_size,
             signature_mode=signature_mode,
-            lambda_values=lambda_values,
             calibration_family_weights=calibration_family_weights,
             row_top_k=row_top_k,
         )
@@ -735,7 +713,7 @@ def _format_summary(
                     f"beta_n={float(selected_config.get('uot_beta_neural')):g}"
                     if selected_config.get("uot_beta_neural") is not None else "beta_n=NA"
                 ),
-                f"lambda={float(selected_config.get('lambda', DEFAULT_STAGE_A_INTERVENTION_STRENGTH)):g}",
+                f"strength={float(selected_config.get('intervention_strength', DEFAULT_STAGE_A_INTERVENTION_STRENGTH)):g}",
                 f"row_top_k={int(selected_config.get('row_top_k', DEFAULT_STAGE_A_ROW_TOP_K))}",
                 f"layers={chosen_layers}",
                 f"calibration_by_var={calibration_scores}",
@@ -807,7 +785,6 @@ def main() -> None:
 
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
     uot_beta_neurals = tuple(_parse_csv_floats(args.uot_beta_neurals) or list(DEFAULT_UOT_BETA_NEURALS))
-    ot_lambdas = tuple(_parse_csv_floats(args.ot_lambdas) or list(DEFAULT_OT_LAMBDAS))
     stage_a_row_top_k = max(1, int(args.stage_a_row_top_k))
     calibration_family_weights = tuple(
         _parse_csv_floats(args.calibration_family_weights) or list(DEFAULT_CALIBRATION_FAMILY_WEIGHTS)
@@ -879,7 +856,6 @@ def main() -> None:
     print(
         f"[stageA] running joint layer UOT epsilon_sweep={list(ot_epsilons)} "
         f"beta_neural_sweep={list(uot_beta_neurals)} "
-        f"lambda_sweep={list(ot_lambdas)} "
         f"row_top_k={int(stage_a_row_top_k)}"
     )
     for epsilon in ot_epsilons:
@@ -936,7 +912,7 @@ def main() -> None:
     )
     print(
         "[stageA] selecting one shared PLOT(layer) UOT coupling by averaging the "
-        "argmax-layer calibration accuracies across abstract variables"
+        "best shortlisted-layer calibration accuracies across abstract variables"
     )
     selected_config = _select_joint_layer_config(
         model=model,
@@ -947,7 +923,6 @@ def main() -> None:
         device=device,
         batch_size=int(args.batch_size),
         signature_mode=str(args.signature_mode),
-        lambda_values=ot_lambdas,
         calibration_family_weights=calibration_family_weights,
         signature_prepare_runtime_seconds=signature_prepare_runtime_seconds,
         row_top_k=stage_a_row_top_k,
@@ -994,7 +969,7 @@ def main() -> None:
             "signature_mode": str(args.signature_mode),
             "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
             "uot_beta_neurals": [float(beta_neural) for beta_neural in uot_beta_neurals],
-            "ot_lambdas": [float(strength) for strength in ot_lambdas],
+            "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
             "stage_a_row_top_k": int(stage_a_row_top_k),
             "support_score_slack": float(args.support_score_slack),
             "calibration_metric": DEFAULT_CALIBRATION_METRIC,

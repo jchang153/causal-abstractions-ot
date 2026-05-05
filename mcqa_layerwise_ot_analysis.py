@@ -44,6 +44,7 @@ DEFAULT_UOT_BETA_NEURALS = (0.1, 0.3, 1.0, 3.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_SINGLE_LAYER_LAMBDAS = (1.0,)
+DEFAULT_ROW_TOP_K = 6
 DEFAULT_COMPARE_TOP_K = 3
 
 
@@ -98,8 +99,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ot-epsilons", help="Comma-separated OT/UOT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--uot-beta-neurals", help="Comma-separated neural-side UOT penalties. Default: 0.1,0.3,1,3")
-    parser.add_argument("--ot-top-k-values", help="Comma-separated OT/UOT top-k calibration grid.")
-    parser.add_argument("--ot-lambdas", help="Comma-separated OT/UOT lambda calibration grid.")
+    parser.add_argument(
+        "--row-top-k",
+        type=int,
+        default=DEFAULT_ROW_TOP_K,
+        help="Per transport row, shortlist the top-k layers by row mass, then pick the best calibrated layer. Default: 6",
+    )
+    parser.add_argument(
+        "--ot-top-k-values",
+        help="Deprecated compatibility flag. Layer selection no longer calibrates transport rows over top-k handles.",
+    )
+    parser.add_argument(
+        "--ot-lambdas",
+        help="Deprecated compatibility flag. Layer selection no longer calibrates transport rows over lambda handles.",
+    )
     parser.add_argument(
         "--single-layer-lambdas",
         help="Single fixed intervention strength for per-layer single-site evaluation. Default: 1.0",
@@ -464,6 +477,51 @@ def _single_layer_entry_by_layer(entries: list[dict[str, object]]) -> dict[int, 
     }
 
 
+def _select_best_shortlisted_single_layer(
+    *,
+    ranking: list[dict[str, object]],
+    single_layer_lookup: dict[int, dict[str, object]],
+    row_top_k: int,
+) -> tuple[list[dict[str, object]], dict[str, object] | None]:
+    shortlisted_candidates: list[dict[str, object]] = []
+    for rank_index, ranking_entry in enumerate(ranking[: max(1, int(row_top_k))]):
+        layer = int(ranking_entry["layer"])
+        single_layer_entry = single_layer_lookup.get(layer)
+        if not isinstance(single_layer_entry, dict):
+            continue
+        shortlisted_candidates.append(
+            {
+                "rank_index": int(rank_index),
+                "layer": int(layer),
+                "site_label": str(ranking_entry.get("site_label", single_layer_entry.get("site_label", ""))),
+                "transport_mass": float(ranking_entry.get("transport_mass", 0.0)),
+                "calibration_score": float(single_layer_entry.get("calibration_score", 0.0)),
+                "calibration_exact_acc": float(single_layer_entry.get("calibration_exact_acc", 0.0)),
+                "test_exact_acc": float(single_layer_entry.get("test_exact_acc", 0.0)),
+                "intervention_strength": float(
+                    single_layer_entry.get(
+                        "intervention_strength",
+                        single_layer_entry.get("selected_lambda", 0.0),
+                    )
+                ),
+                "output_path": single_layer_entry.get("output_path"),
+            }
+        )
+    if not shortlisted_candidates:
+        return [], None
+    best_candidate = max(
+        shortlisted_candidates,
+        key=lambda entry: (
+            float(entry.get("calibration_score", 0.0)),
+            float(entry.get("calibration_exact_acc", 0.0)),
+            float(entry.get("test_exact_acc", 0.0)),
+            float(entry.get("transport_mass", 0.0)),
+            -int(entry.get("rank_index", 10**9)),
+        ),
+    )
+    return shortlisted_candidates, best_candidate
+
+
 def _run_transport_sweeps(
     *,
     model,
@@ -473,8 +531,6 @@ def _run_transport_sweeps(
     device,
     batch_size: int,
     signature_mode: str,
-    top_k_values: tuple[int, ...],
-    lambda_values: tuple[float, ...],
     prepared_artifacts: dict[str, object],
     output_root: Path,
     methods: tuple[str, ...],
@@ -519,14 +575,12 @@ def _run_transport_sweeps(
                 epsilon=float(epsilon),
                 uot_beta_neural=1.0 if beta_neural is None else float(beta_neural),
                 signature_mode=str(signature_mode),
-                top_k_values=top_k_values,
-                lambda_values=lambda_values,
-                selection_verbose=True,
+                top_k_values=(1,),
+                lambda_values=(1.0,),
+                selection_verbose=False,
                 source_target_vars=target_vars,
                 calibration_metric=DEFAULT_CALIBRATION_METRIC,
                 calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                top_k_values_by_var={str(target_var): top_k_values for target_var in target_vars},
-                lambda_values_by_var={str(target_var): lambda_values for target_var in target_vars},
             )
             if method == "ot":
                 transport, transport_meta = solve_ot_transport(
@@ -557,7 +611,7 @@ def _run_transport_sweeps(
                     "target_transport": target_transport.tolist(),
                     "target_normalized_transport": target_normalized_transport.tolist(),
                     "transport_meta": dict(transport_meta),
-                    "selection_basis": "coupling_row_argmax_then_fixed_strength_single_layer_lookup",
+                    "selection_basis": "coupling_row_topk_then_best_calibrated_single_layer_lookup",
                 }
             payload = {
                 "kind": "mcqa_layerwise_transport_analysis_run_transport_only",
@@ -565,7 +619,7 @@ def _run_transport_sweeps(
                 "ot_epsilon": float(epsilon),
                 "uot_beta_neural": None if beta_neural is None else float(beta_neural),
                 "target_vars": list(target_vars),
-                "selection_basis": "coupling_row_argmax_then_fixed_strength_single_layer_lookup",
+                "selection_basis": "coupling_row_topk_then_best_calibrated_single_layer_lookup",
                 "transport_meta": dict(transport_meta),
                 "by_var": per_var_payloads,
             }
@@ -580,6 +634,7 @@ def _summarize_transport_runs(
     transport_runs: list[dict[str, object]],
     single_layer_by_var: dict[str, list[dict[str, object]]],
     sites,
+    row_top_k: int,
 ) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
     for run_payload in transport_runs:
@@ -600,7 +655,12 @@ def _summarize_transport_runs(
             ranking = _target_row_ranking(payload, sites=sites)
             argmax_entry = ranking[0] if ranking else None
             single_layer_lookup = _single_layer_entry_by_layer(single_layer_by_var.get(str(target_var), []))
-            selected_single_layer = (
+            shortlisted_candidates, selected_shortlist_candidate = _select_best_shortlisted_single_layer(
+                ranking=ranking,
+                single_layer_lookup=single_layer_lookup,
+                row_top_k=row_top_k,
+            )
+            argmax_single_layer = (
                 single_layer_lookup.get(int(argmax_entry["layer"]))
                 if isinstance(argmax_entry, dict) and "layer" in argmax_entry else None
             )
@@ -623,17 +683,27 @@ def _summarize_transport_runs(
                     }
                     for entry in ranking[:10]
                 ],
-                "selected_coupling_layer": None if not isinstance(argmax_entry, dict) else int(argmax_entry["layer"]),
-                "selected_coupling_site_label": None if not isinstance(argmax_entry, dict) else str(argmax_entry.get("site_label")),
-                "selected_coupling_transport_mass": 0.0 if not isinstance(argmax_entry, dict) else float(argmax_entry.get("transport_mass", 0.0)),
-                "selected_coupling_layer_test_exact_acc": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("test_exact_acc", 0.0)),
-                "selected_coupling_layer_calibration_exact_acc": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("calibration_exact_acc", 0.0)),
-                "selected_coupling_layer_calibration_score": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("calibration_score", 0.0)),
-                "selected_coupling_layer_lambda": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("selected_lambda", 0.0)),
-                "selected_coupling_layer_output_path": None if not isinstance(selected_single_layer, dict) else str(selected_single_layer.get("output_path", "")),
-                "selected_transport_method_test_exact_acc": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("test_exact_acc", 0.0)),
-                "selected_transport_method_calibration_exact_acc": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("calibration_exact_acc", 0.0)),
-                "selected_transport_method_calibration_score": 0.0 if not isinstance(selected_single_layer, dict) else float(selected_single_layer.get("calibration_score", 0.0)),
+                "row_top_k": int(row_top_k),
+                "coupling_argmax_layer": None if not isinstance(argmax_entry, dict) else int(argmax_entry["layer"]),
+                "coupling_argmax_site_label": None if not isinstance(argmax_entry, dict) else str(argmax_entry.get("site_label")),
+                "coupling_argmax_transport_mass": 0.0 if not isinstance(argmax_entry, dict) else float(argmax_entry.get("transport_mass", 0.0)),
+                "coupling_argmax_layer_test_exact_acc": 0.0 if not isinstance(argmax_single_layer, dict) else float(argmax_single_layer.get("test_exact_acc", 0.0)),
+                "coupling_argmax_layer_calibration_exact_acc": 0.0 if not isinstance(argmax_single_layer, dict) else float(argmax_single_layer.get("calibration_exact_acc", 0.0)),
+                "coupling_argmax_layer_calibration_score": 0.0 if not isinstance(argmax_single_layer, dict) else float(argmax_single_layer.get("calibration_score", 0.0)),
+                "shortlisted_candidates": shortlisted_candidates,
+                "selected_shortlist_layer": None if not isinstance(selected_shortlist_candidate, dict) else int(selected_shortlist_candidate["layer"]),
+                "selected_shortlist_site_label": None if not isinstance(selected_shortlist_candidate, dict) else str(selected_shortlist_candidate.get("site_label")),
+                "selected_shortlist_rank": None if not isinstance(selected_shortlist_candidate, dict) else int(selected_shortlist_candidate.get("rank_index", 0)) + 1,
+                "selected_shortlist_transport_mass": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("transport_mass", 0.0)),
+                "selected_shortlist_layer_test_exact_acc": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("test_exact_acc", 0.0)),
+                "selected_shortlist_layer_calibration_exact_acc": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("calibration_exact_acc", 0.0)),
+                "selected_shortlist_layer_calibration_score": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("calibration_score", 0.0)),
+                "selected_shortlist_layer_strength": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("intervention_strength", 0.0)),
+                "selected_shortlist_layer_output_path": None if not isinstance(selected_shortlist_candidate, dict) else str(selected_shortlist_candidate.get("output_path", "")),
+                "selected_transport_method_test_exact_acc": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("test_exact_acc", 0.0)),
+                "selected_transport_method_calibration_exact_acc": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("calibration_exact_acc", 0.0)),
+                "selected_transport_method_calibration_score": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("calibration_score", 0.0)),
+                "selection_basis": "coupling_row_topk_then_best_calibrated_single_layer_lookup",
                 "matched_mass": float(payload.get("transport_meta", {}).get("matched_mass", 1.0)),
                 "transport_meta": dict(payload.get("transport_meta", {})),
                 "calibration_ranking_comparison": calibration_compare,
@@ -736,11 +806,30 @@ def _format_transport_summary(transport_summaries: list[dict[str, object]]) -> l
             lines.append(
                 f"    coupling_top5={[item.get('layer') for item in top_layers[:5]]} "
                 f"matched_mass={float(entry.get('matched_mass', 1.0)):.4f} "
-                f"selected_layer={entry.get('selected_coupling_layer')} "
-                f"strength={float(entry.get('selected_coupling_layer_lambda', 0.0)):g} "
-                f"cal={float(entry.get('selected_coupling_layer_calibration_exact_acc', 0.0)):.4f} "
-                f"test={float(entry.get('selected_coupling_layer_test_exact_acc', 0.0)):.4f}"
+                f"argmax_layer={entry.get('coupling_argmax_layer')} "
+                f"selected_layer={entry.get('selected_shortlist_layer')} "
+                f"selected_rank={entry.get('selected_shortlist_rank')} "
+                f"strength={float(entry.get('selected_shortlist_layer_strength', 0.0)):g} "
+                f"cal={float(entry.get('selected_shortlist_layer_calibration_exact_acc', 0.0)):.4f} "
+                f"test={float(entry.get('selected_shortlist_layer_test_exact_acc', 0.0)):.4f}"
             )
+            shortlisted_candidates = entry.get("shortlisted_candidates", [])
+            if isinstance(shortlisted_candidates, list) and shortlisted_candidates:
+                lines.append(
+                    "    shortlisted_topk="
+                    + str(
+                        [
+                            {
+                                "layer": int(candidate.get("layer", -1)),
+                                "rank": int(candidate.get("rank_index", 0)) + 1,
+                                "mass": round(float(candidate.get("transport_mass", 0.0)), 4),
+                                "cal": round(float(candidate.get("calibration_exact_acc", 0.0)), 4),
+                                "test": round(float(candidate.get("test_exact_acc", 0.0)), 4),
+                            }
+                            for candidate in shortlisted_candidates
+                        ]
+                    )
+                )
             for label in ("calibration_ranking_comparison", "test_ranking_comparison"):
                 compare = entry.get(label, {})
                 if not isinstance(compare, dict):
@@ -770,6 +859,7 @@ def _format_summary(
     *,
     token_position_id: str,
     layers: tuple[int, ...],
+    row_top_k: int,
     single_layer_by_var: dict[str, list[dict[str, object]]],
     single_layer_rankings_by_var: dict[str, dict[str, list[dict[str, object]]]],
     transport_summaries: list[dict[str, object]],
@@ -780,7 +870,11 @@ def _format_summary(
         f"layers: {list(int(layer) for layer in layers)}",
         "",
         "This analysis compares joint 26-layer coupling rankings against per-layer single-site intervention accuracies.",
-        "Reported method accuracy uses the argmax layer from each target-variable coupling row, evaluated as a fixed-strength single-site intervention.",
+        (
+            f"Reported method accuracy does not calibrate transport rows themselves. For each target-variable row, "
+            f"it shortlists the top {int(row_top_k)} layers by row mass, then selects the best calibrated "
+            "fixed-strength single-layer intervention within that shortlist."
+        ),
         "",
     ]
     lines.extend(_format_single_layer_summary(single_layer_by_var, single_layer_rankings_by_var))
@@ -828,8 +922,7 @@ def main() -> None:
         methods = ()
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
     uot_beta_neurals = tuple(_parse_csv_floats(args.uot_beta_neurals) or list(DEFAULT_UOT_BETA_NEURALS))
-    ot_top_k_values = tuple(_parse_csv_ints(args.ot_top_k_values) or list(DEFAULT_OT_TOP_K_VALUES))
-    ot_lambdas = tuple(_parse_csv_floats(args.ot_lambdas) or list(DEFAULT_OT_LAMBDAS))
+    row_top_k = max(1, int(args.row_top_k))
     single_layer_lambdas = tuple(_parse_csv_floats(args.single_layer_lambdas) or list(DEFAULT_SINGLE_LAYER_LAMBDAS))
     if len(single_layer_lambdas) != 1:
         raise ValueError(
@@ -839,7 +932,7 @@ def main() -> None:
 
     print(
         f"[layerwise] start token_position={str(args.token_position_id)} "
-        f"layers={len(sites)} methods={list(methods)}"
+        f"layers={len(sites)} methods={list(methods)} row_top_k={int(row_top_k)}"
     )
 
     train_banks = {target_var: banks_by_split["train"][target_var] for target_var in target_vars}
@@ -873,14 +966,12 @@ def main() -> None:
                 batch_size=int(args.batch_size),
                 epsilon=float(ot_epsilons[0]),
                 signature_mode=str(args.signature_mode),
-                top_k_values=ot_top_k_values,
-                lambda_values=ot_lambdas,
-                selection_verbose=True,
+                top_k_values=(1,),
+                lambda_values=(1.0,),
+                selection_verbose=False,
                 source_target_vars=target_vars,
                 calibration_metric=DEFAULT_CALIBRATION_METRIC,
                 calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
-                lambda_values_by_var={target_var: ot_lambdas for target_var in target_vars},
             ),
         )
         artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
@@ -930,8 +1021,6 @@ def main() -> None:
             device=device,
             batch_size=int(args.batch_size),
             signature_mode=str(args.signature_mode),
-            top_k_values=ot_top_k_values,
-            lambda_values=ot_lambdas,
             prepared_artifacts=prepared_artifacts,
             output_root=transport_root,
             methods=methods,
@@ -942,11 +1031,13 @@ def main() -> None:
             transport_runs=transport_runs,
             single_layer_by_var=single_layer_by_var,
             sites=sites,
+            row_top_k=row_top_k,
         )
 
     summary_text = _format_summary(
         token_position_id=str(args.token_position_id),
         layers=resolved_layers,
+        row_top_k=row_top_k,
         single_layer_by_var=single_layer_by_var,
         single_layer_rankings_by_var=single_layer_rankings_by_var,
         transport_summaries=transport_summaries,
@@ -965,8 +1056,7 @@ def main() -> None:
             "methods": list(methods),
             "ot_epsilons": [float(value) for value in ot_epsilons],
             "uot_beta_neurals": [float(value) for value in uot_beta_neurals],
-            "ot_top_k_values": [int(value) for value in ot_top_k_values],
-            "ot_lambdas": [float(value) for value in ot_lambdas],
+            "row_top_k": int(row_top_k),
             "single_layer_lambdas": [float(value) for value in single_layer_lambdas],
             "single_layer_results_path": None if reused_single_layer_results_path is None else str(reused_single_layer_results_path),
             "site_labels": [site.label for site in sites],

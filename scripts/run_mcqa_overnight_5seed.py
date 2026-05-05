@@ -73,12 +73,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ot-epsilons", default="0.5,1,2")
     parser.add_argument("--stage-a-uot-beta-neurals", default="0.03,0.3,1")
     parser.add_argument("--stage-a-row-top-k", type=int, default=6)
-    parser.add_argument("--stage-a-ot-lambdas", default="0.5,1,2")
+    parser.add_argument(
+        "--stage-a-ot-lambdas",
+        default="0.5,1,2",
+        help="Deprecated compatibility flag. Stage A now uses a fixed full-strength intervention and ignores lambda sweeps.",
+    )
     parser.add_argument("--ot-top-k-values", default="1,2,4")
     parser.add_argument(
         "--ot-lambdas",
         default="0.5,1,2,4",
-        help="Downstream Stage B OT lambdas. Stage A uses --stage-a-ot-lambdas instead.",
+        help="Downstream Stage B OT lambdas.",
     )
     parser.add_argument("--calibration-metric", default="family_weighted_macro_exact_acc")
     parser.add_argument("--calibration-family-weights", default="1,1.5,2")
@@ -134,7 +138,6 @@ def main() -> None:
             "ot_epsilons": str(args.ot_epsilons),
             "uot_beta_neurals": str(args.stage_a_uot_beta_neurals),
             "row_top_k": int(args.stage_a_row_top_k),
-            "ot_lambdas": str(args.stage_a_ot_lambdas),
         },
         "downstream_ot_grid": {
             "ot_top_k_values": str(args.ot_top_k_values),
@@ -198,8 +201,6 @@ def main() -> None:
             str(args.stage_a_uot_beta_neurals),
             "--stage-a-row-top-k",
             str(int(args.stage_a_row_top_k)),
-            "--stage-a-ot-lambdas",
-            str(args.stage_a_ot_lambdas),
             "--ot-top-k-values",
             str(args.ot_top_k_values),
             "--ot-lambdas",
