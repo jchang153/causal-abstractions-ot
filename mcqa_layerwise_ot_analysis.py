@@ -18,10 +18,10 @@ import mcqa_run as base_run
 from mcqa_experiment.data import canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
+    _evaluate_single_site_intervention,
     load_prepared_alignment_artifacts,
     normalize_transport_rows,
     prepare_alignment_artifacts,
-    run_bruteforce_site_pipeline,
     save_prepared_alignment_artifacts,
     solve_ot_transport,
     solve_uot_transport,
@@ -77,7 +77,7 @@ def _parse_csv_floats(value: str | None) -> list[float] | None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Standalone MCQA layerwise OT/UOT analysis with whole-layer sites and per-layer brute-force comparisons."
+        description="Standalone MCQA layerwise OT/UOT analysis with whole-layer sites and top-k shortlisted layer calibration."
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--model-name", default="google/gemma-2-2b")
@@ -95,7 +95,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-transport",
         action="store_true",
-        help="Only run the full-strength single-layer brute-force sweep; skip OT/UOT transport analysis.",
+        help="Skip OT/UOT transport analysis.",
     )
     parser.add_argument("--ot-epsilons", help="Comma-separated OT/UOT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--uot-beta-neurals", help="Comma-separated neural-side UOT penalties. Default: 0.1,0.3,1,3")
@@ -119,10 +119,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--single-layer-results-path",
-        help=(
-            "Optional path to a prior layerwise_ot_results.json file whose fixed-strength brute-force "
-            "single-layer results should be reused instead of recomputed."
-        ),
+        help="Deprecated compatibility flag. Layerwise selection no longer precomputes all brute-force layers.",
+    )
+    parser.add_argument(
+        "--calibration-family-weights",
+        help="Comma-separated family weights in answerPosition,randomLetter,answerPosition_randomLetter order. Default: 1,1,1",
     )
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument("--results-root", default="results")
@@ -192,6 +193,25 @@ def _load_single_layer_results_payload(path: Path) -> tuple[dict[str, list[dict[
     else:
         normalized_rankings_by_var = _build_single_layer_rankings(normalized_single_layer_by_var)
     return normalized_single_layer_by_var, normalized_rankings_by_var
+
+
+def _stage_a_calibration_score(
+    *,
+    result: dict[str, object],
+    calibration_family_weights: tuple[float, ...],
+) -> float:
+    exact_acc = float(result.get("exact_acc", 0.0))
+    family_exact_accs = result.get("family_exact_accs", {})
+    if not isinstance(family_exact_accs, dict):
+        return exact_acc
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for family_name, weight in zip(DEFAULT_COUNTERFACTUAL_NAMES, calibration_family_weights):
+        if family_name not in family_exact_accs:
+            continue
+        weighted_sum += float(weight) * float(family_exact_accs[family_name])
+        total_weight += float(weight)
+    return exact_acc if total_weight <= 0.0 else float(weighted_sum / total_weight)
 
 
 def _format_strength_tag(value: float) -> str:
@@ -299,88 +319,45 @@ def _ranking_comparison(
     }
 
 
-def _evaluate_all_layers(
+def _evaluate_single_layer_calibration(
     *,
     model,
     tokenizer,
-    banks_by_split: dict[str, dict[str, object]],
-    sites,
+    calibration_bank,
+    site,
+    site_index: int,
     device,
     batch_size: int,
-    signature_mode: str,
-    lambda_values: tuple[float, ...],
-    output_root: Path,
-) -> dict[str, list[dict[str, object]]]:
-    results_by_var: dict[str, list[dict[str, object]]] = {}
-    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
-    fixed_strength = float(lambda_values[0])
-    strength_tag = _format_strength_tag(fixed_strength)
-    for target_var in target_vars:
-        entries: list[dict[str, object]] = []
-        site_iterator = sites
-        if tqdm is not None:
-            site_iterator = tqdm(
-                sites,
-                desc=f"Single-layer eval ({target_var})",
-                leave=False,
-            )
-        print(
-            f"[single-layer] target={target_var} evaluating {len(sites)} whole-layer sites "
-            f"with fixed intervention strength={fixed_strength:g}"
-        )
-        for site in site_iterator:
-            output_path = (
-                output_root
-                / target_var
-                / f"strength_{strength_tag}"
-                / f"layer_{int(site.layer):02d}.json"
-            )
-            payload = _load_existing_payload(output_path)
-            if payload is None:
-                payload = run_bruteforce_site_pipeline(
-                    model=model,
-                    calibration_bank=banks_by_split["calibration"][str(target_var)],
-                    holdout_bank=banks_by_split["test"][str(target_var)],
-                    sites=[site],
-                    device=device,
-                    tokenizer=tokenizer,
-                    config=OTConfig(
-                        method="bruteforce",
-                        batch_size=int(batch_size),
-                        epsilon=1.0,
-                        signature_mode=str(signature_mode),
-                        top_k_values=(1,),
-                        lambda_values=lambda_values,
-                        selection_verbose=False,
-                        source_target_vars=target_vars,
-                        calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                        calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                        lambda_values_by_var={str(target_var): lambda_values},
-                    ),
-                )
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                write_json(output_path, payload)
-            result = payload.get("results", [{}])[0]
-            calibration_result = payload.get("selected_calibration_result", {})
-            selected_hyperparameters = dict(payload.get("selected_hyperparameters", {}))
-            entries.append(
-                {
-                    "layer": int(site.layer),
-                    "site_label": site.label,
-                    "calibration_exact_acc": float(
-                        result.get("calibration_exact_acc", calibration_result.get("exact_acc", 0.0))
-                    ),
-                    "calibration_score": float(
-                        result.get("selection_score", calibration_result.get("exact_acc", 0.0))
-                    ),
-                    "test_exact_acc": float(result.get("exact_acc", 0.0)),
-                    "selected_lambda": fixed_strength,
-                    "intervention_strength": fixed_strength,
-                    "output_path": str(output_path),
-                }
-            )
-        results_by_var[str(target_var)] = sorted(entries, key=lambda entry: int(entry["layer"]))
-    return results_by_var
+    strength: float,
+    calibration_family_weights: tuple[float, ...],
+) -> dict[str, object]:
+    eval_start = perf_counter()
+    calibration_result, _ = _evaluate_single_site_intervention(
+        model=model,
+        bank=calibration_bank,
+        site=site,
+        site_index=int(site_index),
+        strength=float(strength),
+        batch_size=int(batch_size),
+        device=device,
+        tokenizer=tokenizer,
+        include_details=False,
+    )
+    runtime_seconds = float(perf_counter() - eval_start)
+    calibration_score = _stage_a_calibration_score(
+        result=calibration_result,
+        calibration_family_weights=calibration_family_weights,
+    )
+    return {
+        "target_var": str(calibration_bank.target_var),
+        "layer": int(site.layer),
+        "site_label": str(site.label),
+        "intervention_strength": float(strength),
+        "calibration_score": float(calibration_score),
+        "calibration_exact_acc": float(calibration_result.get("exact_acc", 0.0)),
+        "runtime_seconds": float(runtime_seconds),
+        "calibration_result": dict(calibration_result),
+    }
 
 
 def _rank_single_layer_entries(
@@ -477,34 +454,93 @@ def _single_layer_entry_by_layer(entries: list[dict[str, object]]) -> dict[int, 
     }
 
 
+def _evaluate_shortlisted_layer_calibrations(
+    *,
+    model,
+    tokenizer,
+    banks_by_split: dict[str, dict[str, object]],
+    sites,
+    device,
+    batch_size: int,
+    calibration_family_weights: tuple[float, ...],
+    intervention_strength: float,
+    target_var: str,
+    ranking: list[dict[str, object]],
+    row_top_k: int,
+    candidate_cache: dict[tuple[str, int], dict[str, object]],
+) -> tuple[list[dict[str, object]], dict[str, object] | None, float]:
+    shortlisted_entries = ranking[: max(1, int(row_top_k))]
+    evaluated_candidates: list[dict[str, object]] = []
+    calibration_runtime_seconds = 0.0
+    for rank_index, ranking_entry in enumerate(shortlisted_entries):
+        site_index = int(ranking_entry.get("site_index", -1))
+        if not (0 <= site_index < len(sites)):
+            continue
+        site = sites[site_index]
+        cache_key = (str(target_var), int(site.layer))
+        cached = candidate_cache.get(cache_key)
+        if not isinstance(cached, dict):
+            cached = _evaluate_single_layer_calibration(
+                model=model,
+                tokenizer=tokenizer,
+                calibration_bank=banks_by_split["calibration"][str(target_var)],
+                site=site,
+                site_index=site_index,
+                device=device,
+                batch_size=int(batch_size),
+                strength=float(intervention_strength),
+                calibration_family_weights=calibration_family_weights,
+            )
+            candidate_cache[cache_key] = dict(cached)
+        evaluated_candidate = {
+            "rank_index": int(rank_index),
+            "site_index": int(site_index),
+            "layer": int(site.layer),
+            "site_label": str(site.label),
+            "transport_mass": float(ranking_entry.get("transport_mass", 0.0)),
+            "calibration_score": float(cached.get("calibration_score", 0.0)),
+            "calibration_exact_acc": float(cached.get("calibration_exact_acc", 0.0)),
+            "intervention_strength": float(cached.get("intervention_strength", intervention_strength)),
+            "runtime_seconds": float(cached.get("runtime_seconds", 0.0)),
+        }
+        evaluated_candidates.append(evaluated_candidate)
+        calibration_runtime_seconds += float(evaluated_candidate["runtime_seconds"])
+    candidate_lookup = _single_layer_entry_by_layer(evaluated_candidates)
+    shortlisted_candidates, best_candidate = _select_best_shortlisted_single_layer(
+        ranking=ranking,
+        candidate_lookup=candidate_lookup,
+        row_top_k=row_top_k,
+    )
+    return shortlisted_candidates, best_candidate, float(calibration_runtime_seconds)
+
+
 def _select_best_shortlisted_single_layer(
     *,
     ranking: list[dict[str, object]],
-    single_layer_lookup: dict[int, dict[str, object]],
+    candidate_lookup: dict[int, dict[str, object]],
     row_top_k: int,
 ) -> tuple[list[dict[str, object]], dict[str, object] | None]:
     shortlisted_candidates: list[dict[str, object]] = []
     for rank_index, ranking_entry in enumerate(ranking[: max(1, int(row_top_k))]):
         layer = int(ranking_entry["layer"])
-        single_layer_entry = single_layer_lookup.get(layer)
-        if not isinstance(single_layer_entry, dict):
+        candidate_entry = candidate_lookup.get(layer)
+        if not isinstance(candidate_entry, dict):
             continue
         shortlisted_candidates.append(
             {
                 "rank_index": int(rank_index),
                 "layer": int(layer),
-                "site_label": str(ranking_entry.get("site_label", single_layer_entry.get("site_label", ""))),
+                "site_label": str(ranking_entry.get("site_label", candidate_entry.get("site_label", ""))),
                 "transport_mass": float(ranking_entry.get("transport_mass", 0.0)),
-                "calibration_score": float(single_layer_entry.get("calibration_score", 0.0)),
-                "calibration_exact_acc": float(single_layer_entry.get("calibration_exact_acc", 0.0)),
-                "test_exact_acc": float(single_layer_entry.get("test_exact_acc", 0.0)),
+                "calibration_score": float(candidate_entry.get("calibration_score", 0.0)),
+                "calibration_exact_acc": float(candidate_entry.get("calibration_exact_acc", 0.0)),
                 "intervention_strength": float(
-                    single_layer_entry.get(
+                    candidate_entry.get(
                         "intervention_strength",
-                        single_layer_entry.get("selected_lambda", 0.0),
+                        candidate_entry.get("selected_lambda", 0.0),
                     )
                 ),
-                "output_path": single_layer_entry.get("output_path"),
+                "runtime_seconds": float(candidate_entry.get("runtime_seconds", 0.0)),
             }
         )
     if not shortlisted_candidates:
@@ -514,7 +550,6 @@ def _select_best_shortlisted_single_layer(
         key=lambda entry: (
             float(entry.get("calibration_score", 0.0)),
             float(entry.get("calibration_exact_acc", 0.0)),
-            float(entry.get("test_exact_acc", 0.0)),
             float(entry.get("transport_mass", 0.0)),
             -int(entry.get("rank_index", 10**9)),
         ),
@@ -582,6 +617,7 @@ def _run_transport_sweeps(
                 calibration_metric=DEFAULT_CALIBRATION_METRIC,
                 calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
             )
+            solve_start = perf_counter()
             if method == "ot":
                 transport, transport_meta = solve_ot_transport(
                     variable_signatures_by_var,
@@ -596,6 +632,7 @@ def _run_transport_sweeps(
                 )
             else:
                 raise ValueError(f"Unsupported transport method {method}")
+            transport_runtime_seconds = float(perf_counter() - solve_start)
             normalized_transport = normalize_transport_rows(transport)
             per_var_payloads: dict[str, dict[str, object]] = {}
             for target_row_index, target_var in enumerate(target_vars):
@@ -611,6 +648,7 @@ def _run_transport_sweeps(
                     "target_transport": target_transport.tolist(),
                     "target_normalized_transport": target_normalized_transport.tolist(),
                     "transport_meta": dict(transport_meta),
+                    "runtime_seconds": float(transport_runtime_seconds),
                     "selection_basis": "coupling_row_topk_then_best_calibrated_single_layer_lookup",
                 }
             payload = {
@@ -621,6 +659,7 @@ def _run_transport_sweeps(
                 "target_vars": list(target_vars),
                 "selection_basis": "coupling_row_topk_then_best_calibrated_single_layer_lookup",
                 "transport_meta": dict(transport_meta),
+                "runtime_seconds": float(transport_runtime_seconds),
                 "by_var": per_var_payloads,
             }
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -632,11 +671,18 @@ def _run_transport_sweeps(
 def _summarize_transport_runs(
     *,
     transport_runs: list[dict[str, object]],
-    single_layer_by_var: dict[str, list[dict[str, object]]],
+    model,
+    tokenizer,
+    banks_by_split: dict[str, dict[str, object]],
     sites,
+    device,
+    batch_size: int,
+    calibration_family_weights: tuple[float, ...],
+    intervention_strength: float,
     row_top_k: int,
 ) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
+    candidate_cache: dict[tuple[str, int], dict[str, object]] = {}
     for run_payload in transport_runs:
         method = str(run_payload.get("method"))
         epsilon = float(run_payload.get("ot_epsilon", 0.0))
@@ -648,32 +694,39 @@ def _summarize_transport_runs(
             "uot_beta_neural": None if beta_neural is None else float(beta_neural),
             "by_var": {},
         }
+        shortlist_union_layers: set[int] = set()
+        per_var_runtime_by_var: dict[str, float] = {}
+        selected_scores: list[float] = []
+        selected_exact_accs: list[float] = []
         for target_var in DEFAULT_TARGET_VARS:
             payload = by_var.get(str(target_var)) if isinstance(by_var, dict) else None
             if not isinstance(payload, dict):
                 continue
             ranking = _target_row_ranking(payload, sites=sites)
             argmax_entry = ranking[0] if ranking else None
-            single_layer_lookup = _single_layer_entry_by_layer(single_layer_by_var.get(str(target_var), []))
-            shortlisted_candidates, selected_shortlist_candidate = _select_best_shortlisted_single_layer(
+            shortlisted_candidates, selected_shortlist_candidate, calibration_runtime_seconds = _evaluate_shortlisted_layer_calibrations(
+                model=model,
+                tokenizer=tokenizer,
+                banks_by_split=banks_by_split,
+                sites=sites,
+                device=device,
+                batch_size=int(batch_size),
+                calibration_family_weights=calibration_family_weights,
+                intervention_strength=float(intervention_strength),
+                target_var=str(target_var),
                 ranking=ranking,
-                single_layer_lookup=single_layer_lookup,
                 row_top_k=row_top_k,
+                candidate_cache=candidate_cache,
             )
-            argmax_single_layer = (
-                single_layer_lookup.get(int(argmax_entry["layer"]))
-                if isinstance(argmax_entry, dict) and "layer" in argmax_entry else None
+            shortlist_union_layers.update(
+                int(candidate.get("layer", -1))
+                for candidate in shortlisted_candidates
+                if int(candidate.get("layer", -1)) >= 0
             )
-            calibration_compare = _ranking_comparison(
-                coupling_ranking=ranking,
-                actual_entries=single_layer_by_var.get(str(target_var), []),
-                actual_metric_key="calibration_exact_acc",
-            )
-            test_compare = _ranking_comparison(
-                coupling_ranking=ranking,
-                actual_entries=single_layer_by_var.get(str(target_var), []),
-                actual_metric_key="test_exact_acc",
-            )
+            per_var_runtime_by_var[str(target_var)] = float(calibration_runtime_seconds)
+            if isinstance(selected_shortlist_candidate, dict):
+                selected_scores.append(float(selected_shortlist_candidate.get("calibration_score", 0.0)))
+                selected_exact_accs.append(float(selected_shortlist_candidate.get("calibration_exact_acc", 0.0)))
             run_summary["by_var"][str(target_var)] = {
                 "coupling_top_layers": [
                     {
@@ -687,102 +740,34 @@ def _summarize_transport_runs(
                 "coupling_argmax_layer": None if not isinstance(argmax_entry, dict) else int(argmax_entry["layer"]),
                 "coupling_argmax_site_label": None if not isinstance(argmax_entry, dict) else str(argmax_entry.get("site_label")),
                 "coupling_argmax_transport_mass": 0.0 if not isinstance(argmax_entry, dict) else float(argmax_entry.get("transport_mass", 0.0)),
-                "coupling_argmax_layer_test_exact_acc": 0.0 if not isinstance(argmax_single_layer, dict) else float(argmax_single_layer.get("test_exact_acc", 0.0)),
-                "coupling_argmax_layer_calibration_exact_acc": 0.0 if not isinstance(argmax_single_layer, dict) else float(argmax_single_layer.get("calibration_exact_acc", 0.0)),
-                "coupling_argmax_layer_calibration_score": 0.0 if not isinstance(argmax_single_layer, dict) else float(argmax_single_layer.get("calibration_score", 0.0)),
                 "shortlisted_candidates": shortlisted_candidates,
                 "selected_shortlist_layer": None if not isinstance(selected_shortlist_candidate, dict) else int(selected_shortlist_candidate["layer"]),
                 "selected_shortlist_site_label": None if not isinstance(selected_shortlist_candidate, dict) else str(selected_shortlist_candidate.get("site_label")),
                 "selected_shortlist_rank": None if not isinstance(selected_shortlist_candidate, dict) else int(selected_shortlist_candidate.get("rank_index", 0)) + 1,
                 "selected_shortlist_transport_mass": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("transport_mass", 0.0)),
-                "selected_shortlist_layer_test_exact_acc": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("test_exact_acc", 0.0)),
                 "selected_shortlist_layer_calibration_exact_acc": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("calibration_exact_acc", 0.0)),
                 "selected_shortlist_layer_calibration_score": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("calibration_score", 0.0)),
                 "selected_shortlist_layer_strength": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("intervention_strength", 0.0)),
-                "selected_shortlist_layer_output_path": None if not isinstance(selected_shortlist_candidate, dict) else str(selected_shortlist_candidate.get("output_path", "")),
-                "selected_transport_method_test_exact_acc": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("test_exact_acc", 0.0)),
                 "selected_transport_method_calibration_exact_acc": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("calibration_exact_acc", 0.0)),
                 "selected_transport_method_calibration_score": 0.0 if not isinstance(selected_shortlist_candidate, dict) else float(selected_shortlist_candidate.get("calibration_score", 0.0)),
                 "selection_basis": "coupling_row_topk_then_best_calibrated_single_layer_lookup",
+                "calibration_runtime_seconds": float(calibration_runtime_seconds),
                 "matched_mass": float(payload.get("transport_meta", {}).get("matched_mass", 1.0)),
                 "transport_meta": dict(payload.get("transport_meta", {})),
-                "calibration_ranking_comparison": calibration_compare,
-                "test_ranking_comparison": test_compare,
             }
+        run_summary["shortlist_union_layers"] = sorted(int(layer) for layer in shortlist_union_layers)
+        run_summary["shortlist_union_size"] = int(len(shortlist_union_layers))
+        run_summary["per_var_calibration_runtime_seconds"] = per_var_runtime_by_var
+        run_summary["shortlist_calibration_runtime_seconds"] = float(sum(per_var_runtime_by_var.values()))
+        run_summary["transport_solve_runtime_seconds"] = float(run_payload.get("transport_meta", {}).get("runtime_seconds", run_payload.get("runtime_seconds", 0.0)))
+        run_summary["mean_selected_calibration_score"] = (
+            float(sum(selected_scores) / len(selected_scores)) if selected_scores else 0.0
+        )
+        run_summary["mean_selected_calibration_exact_acc"] = (
+            float(sum(selected_exact_accs) / len(selected_exact_accs)) if selected_exact_accs else 0.0
+        )
         summaries.append(run_summary)
     return summaries
-
-
-def _format_single_layer_summary(
-    single_layer_by_var: dict[str, list[dict[str, object]]],
-    single_layer_rankings_by_var: dict[str, dict[str, list[dict[str, object]]]],
-) -> list[str]:
-    lines: list[str] = []
-    for target_var in DEFAULT_TARGET_VARS:
-        entries = single_layer_by_var.get(str(target_var), [])
-        lines.append(f"[single-layer {target_var}]")
-        by_test = single_layer_rankings_by_var.get(str(target_var), {}).get("by_test", [])
-        by_calibration = single_layer_rankings_by_var.get(str(target_var), {}).get("by_calibration", [])
-        if entries and by_test:
-            best_test = by_test[0]
-            lines.append(
-                "  best_by_test: "
-                + " ".join(
-                    [
-                        f"layer={int(best_test['layer'])}",
-                        f"cal={float(best_test.get('calibration_exact_acc', 0.0)):.4f}",
-                        f"test={float(best_test.get('test_exact_acc', 0.0)):.4f}",
-                        f"strength={float(best_test.get('intervention_strength', 0.0)):g}",
-                        f"site={best_test.get('site_label')}",
-                    ]
-                )
-            )
-        if entries and by_calibration:
-            best_calibration = by_calibration[0]
-            lines.append(
-                "  best_by_calibration: "
-                + " ".join(
-                    [
-                        f"layer={int(best_calibration['layer'])}",
-                        f"cal={float(best_calibration.get('calibration_exact_acc', 0.0)):.4f}",
-                        f"test={float(best_calibration.get('test_exact_acc', 0.0)):.4f}",
-                        f"strength={float(best_calibration.get('intervention_strength', 0.0)):g}",
-                        f"site={best_calibration.get('site_label')}",
-                    ]
-                )
-            )
-        lines.append("  full_test_ranking:")
-        for entry in by_test:
-            lines.append(
-                "    "
-                + " ".join(
-                    [
-                        f"rank={int(entry['rank'])}",
-                        f"layer={int(entry['layer'])}",
-                        f"test={float(entry.get('test_exact_acc', 0.0)):.4f}",
-                        f"cal={float(entry.get('calibration_exact_acc', 0.0)):.4f}",
-                        f"strength={float(entry.get('intervention_strength', 0.0)):g}",
-                        f"site={entry.get('site_label')}",
-                    ]
-                )
-            )
-        lines.append("  full_calibration_ranking:")
-        for entry in by_calibration:
-            lines.append(
-                "    "
-                + " ".join(
-                    [
-                        f"rank={int(entry['rank'])}",
-                        f"layer={int(entry['layer'])}",
-                        f"cal={float(entry.get('calibration_exact_acc', 0.0)):.4f}",
-                        f"test={float(entry.get('test_exact_acc', 0.0)):.4f}",
-                        f"strength={float(entry.get('intervention_strength', 0.0)):g}",
-                        f"site={entry.get('site_label')}",
-                    ]
-                )
-            )
-        lines.append("")
-    return lines
 
 
 def _format_transport_summary(transport_summaries: list[dict[str, object]]) -> list[str]:
@@ -796,6 +781,18 @@ def _format_transport_summary(transport_summaries: list[dict[str, object]]) -> l
             header += f" beta_n={float(beta_neural):g}"
         header += "]"
         lines.append(header)
+        lines.append(
+            "  "
+            + " ".join(
+                [
+                    f"avg_cal_score={float(run_summary.get('mean_selected_calibration_score', 0.0)):.4f}",
+                    f"avg_cal_exact={float(run_summary.get('mean_selected_calibration_exact_acc', 0.0)):.4f}",
+                    f"transport_runtime={float(run_summary.get('transport_solve_runtime_seconds', 0.0)):.2f}s",
+                    f"shortlist_runtime={float(run_summary.get('shortlist_calibration_runtime_seconds', 0.0)):.2f}s",
+                    f"shortlist_union_layers={run_summary.get('shortlist_union_layers', [])}",
+                ]
+            )
+        )
         by_var = run_summary.get("by_var", {})
         for target_var in DEFAULT_TARGET_VARS:
             entry = by_var.get(str(target_var)) if isinstance(by_var, dict) else None
@@ -810,8 +807,9 @@ def _format_transport_summary(transport_summaries: list[dict[str, object]]) -> l
                 f"selected_layer={entry.get('selected_shortlist_layer')} "
                 f"selected_rank={entry.get('selected_shortlist_rank')} "
                 f"strength={float(entry.get('selected_shortlist_layer_strength', 0.0)):g} "
-                f"cal={float(entry.get('selected_shortlist_layer_calibration_exact_acc', 0.0)):.4f} "
-                f"test={float(entry.get('selected_shortlist_layer_test_exact_acc', 0.0)):.4f}"
+                f"cal_score={float(entry.get('selected_shortlist_layer_calibration_score', 0.0)):.4f} "
+                f"cal_exact={float(entry.get('selected_shortlist_layer_calibration_exact_acc', 0.0)):.4f} "
+                f"row_runtime={float(entry.get('calibration_runtime_seconds', 0.0)):.2f}s"
             )
             shortlisted_candidates = entry.get("shortlisted_candidates", [])
             if isinstance(shortlisted_candidates, list) and shortlisted_candidates:
@@ -823,31 +821,10 @@ def _format_transport_summary(transport_summaries: list[dict[str, object]]) -> l
                                 "layer": int(candidate.get("layer", -1)),
                                 "rank": int(candidate.get("rank_index", 0)) + 1,
                                 "mass": round(float(candidate.get("transport_mass", 0.0)), 4),
+                                "cal_score": round(float(candidate.get("calibration_score", 0.0)), 4),
                                 "cal": round(float(candidate.get("calibration_exact_acc", 0.0)), 4),
-                                "test": round(float(candidate.get("test_exact_acc", 0.0)), 4),
                             }
                             for candidate in shortlisted_candidates
-                        ]
-                    )
-                )
-            for label in ("calibration_ranking_comparison", "test_ranking_comparison"):
-                compare = entry.get(label, {})
-                if not isinstance(compare, dict):
-                    continue
-                metric_name = "calibration" if label.startswith("calibration") else "test"
-                lines.append(
-                    "    "
-                    + f"{metric_name}: "
-                    + " ".join(
-                        [
-                            f"best_actual={compare.get('best_actual_layer')}",
-                            f"best_actual_rank_in_coupling={compare.get('best_actual_layer_coupling_rank')}",
-                            f"top1_match={compare.get('top1_match')}",
-                            f"top3_overlap={compare.get('top_overlap_count')}/{DEFAULT_COMPARE_TOP_K}",
-                            f"spearman={float(compare.get('spearman_rank_correlation')):.4f}"
-                            if compare.get("spearman_rank_correlation") is not None else "spearman=None",
-                            f"mean_abs_rank_err={float(compare.get('mean_absolute_rank_error')):.4f}"
-                            if compare.get("mean_absolute_rank_error") is not None else "mean_abs_rank_err=None",
                         ]
                     )
                 )
@@ -855,13 +832,23 @@ def _format_transport_summary(transport_summaries: list[dict[str, object]]) -> l
     return lines
 
 
+def _best_transport_summary(transport_summaries: list[dict[str, object]]) -> dict[str, object] | None:
+    if not transport_summaries:
+        return None
+    return max(
+        transport_summaries,
+        key=lambda summary: (
+            float(summary.get("mean_selected_calibration_score", 0.0)),
+            float(summary.get("mean_selected_calibration_exact_acc", 0.0)),
+        ),
+    )
+
+
 def _format_summary(
     *,
     token_position_id: str,
     layers: tuple[int, ...],
     row_top_k: int,
-    single_layer_by_var: dict[str, list[dict[str, object]]],
-    single_layer_rankings_by_var: dict[str, dict[str, list[dict[str, object]]]],
     transport_summaries: list[dict[str, object]],
 ) -> str:
     lines = [
@@ -877,7 +864,37 @@ def _format_summary(
         ),
         "",
     ]
-    lines.extend(_format_single_layer_summary(single_layer_by_var, single_layer_rankings_by_var))
+    best_summary = _best_transport_summary(transport_summaries)
+    if isinstance(best_summary, dict):
+        lines.extend(
+            [
+                "[best_selected_coupling]",
+                f"method={best_summary.get('method')}",
+                f"eps={float(best_summary.get('ot_epsilon', 0.0)):g}",
+                (
+                    f"beta_n={float(best_summary.get('uot_beta_neural')):g}"
+                    if best_summary.get("uot_beta_neural") is not None else "beta_n=NA"
+                ),
+                f"row_top_k={int(row_top_k)}",
+                f"avg_cal_score={float(best_summary.get('mean_selected_calibration_score', 0.0)):.4f}",
+                f"avg_cal_exact={float(best_summary.get('mean_selected_calibration_exact_acc', 0.0)):.4f}",
+                f"transport_runtime={float(best_summary.get('transport_solve_runtime_seconds', 0.0)):.2f}s",
+                f"shortlist_runtime={float(best_summary.get('shortlist_calibration_runtime_seconds', 0.0)):.2f}s",
+                f"shortlist_union_layers={best_summary.get('shortlist_union_layers', [])}",
+            ]
+        )
+        by_var = best_summary.get("by_var", {})
+        for target_var in DEFAULT_TARGET_VARS:
+            entry = by_var.get(str(target_var)) if isinstance(by_var, dict) else None
+            if not isinstance(entry, dict):
+                continue
+            lines.append(
+                f"{target_var}: chosen_layer={entry.get('selected_shortlist_layer')} "
+                f"argmax_layer={entry.get('coupling_argmax_layer')} "
+                f"cal_score={float(entry.get('selected_shortlist_layer_calibration_score', 0.0)):.4f} "
+                f"cal_exact={float(entry.get('selected_shortlist_layer_calibration_exact_acc', 0.0)):.4f}"
+            )
+        lines.append("")
     lines.extend(_format_transport_summary(transport_summaries))
     return "\n".join(lines)
 
@@ -923,16 +940,31 @@ def main() -> None:
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
     uot_beta_neurals = tuple(_parse_csv_floats(args.uot_beta_neurals) or list(DEFAULT_UOT_BETA_NEURALS))
     row_top_k = max(1, int(args.row_top_k))
+    calibration_family_weights = tuple(
+        _parse_csv_floats(args.calibration_family_weights) or list(DEFAULT_CALIBRATION_FAMILY_WEIGHTS)
+    )
     single_layer_lambdas = tuple(_parse_csv_floats(args.single_layer_lambdas) or list(DEFAULT_SINGLE_LAYER_LAMBDAS))
     if len(single_layer_lambdas) != 1:
         raise ValueError(
-            "Single-layer brute-force evaluation now uses one fixed intervention strength. "
+            "Shortlisted layer evaluation uses one fixed intervention strength. "
             f"Received {list(single_layer_lambdas)}"
+        )
+    intervention_strength = float(single_layer_lambdas[0])
+    if intervention_strength != 1.0:
+        print(
+            f"[layerwise] warning fixed shortlisted-layer intervention strength is {intervention_strength:g}; "
+            "the intended Stage A compatibility setting is 1.0"
+        )
+    if args.single_layer_results_path:
+        print(
+            "[layerwise] ignoring deprecated --single-layer-results-path; "
+            "this run evaluates only shortlisted layers per coupling"
         )
 
     print(
         f"[layerwise] start token_position={str(args.token_position_id)} "
-        f"layers={len(sites)} methods={list(methods)} row_top_k={int(row_top_k)}"
+        f"layers={len(sites)} methods={list(methods)} row_top_k={int(row_top_k)} "
+        f"intervention_strength={intervention_strength:g}"
     )
 
     train_banks = {target_var: banks_by_split["train"][target_var] for target_var in target_vars}
@@ -971,7 +1003,7 @@ def main() -> None:
                 selection_verbose=False,
                 source_target_vars=target_vars,
                 calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
+                calibration_family_weights=calibration_family_weights,
             ),
         )
         artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
@@ -989,27 +1021,6 @@ def main() -> None:
     _synchronize_if_cuda(device)
 
     transport_root = sweep_root / "transport"
-    reused_single_layer_results_path = None
-    if args.single_layer_results_path:
-        reused_single_layer_results_path = Path(str(args.single_layer_results_path))
-        print(f"[layerwise] reusing single-layer brute-force results from {reused_single_layer_results_path}")
-        single_layer_by_var, single_layer_rankings_by_var = _load_single_layer_results_payload(
-            reused_single_layer_results_path
-        )
-    else:
-        single_layer_root = sweep_root / "single_layer"
-        single_layer_by_var = _evaluate_all_layers(
-            model=model,
-            tokenizer=tokenizer,
-            banks_by_split=banks_by_split,
-            sites=sites,
-            device=device,
-            batch_size=int(args.batch_size),
-            signature_mode=str(args.signature_mode),
-            lambda_values=single_layer_lambdas,
-            output_root=single_layer_root,
-        )
-        single_layer_rankings_by_var = _build_single_layer_rankings(single_layer_by_var)
     transport_runs: list[dict[str, object]] = []
     transport_summaries: list[dict[str, object]] = []
     if methods:
@@ -1029,8 +1040,14 @@ def main() -> None:
         )
         transport_summaries = _summarize_transport_runs(
             transport_runs=transport_runs,
-            single_layer_by_var=single_layer_by_var,
+            model=model,
+            tokenizer=tokenizer,
+            banks_by_split=banks_by_split,
             sites=sites,
+            device=device,
+            batch_size=int(args.batch_size),
+            calibration_family_weights=calibration_family_weights,
+            intervention_strength=intervention_strength,
             row_top_k=row_top_k,
         )
 
@@ -1038,12 +1055,11 @@ def main() -> None:
         token_position_id=str(args.token_position_id),
         layers=resolved_layers,
         row_top_k=row_top_k,
-        single_layer_by_var=single_layer_by_var,
-        single_layer_rankings_by_var=single_layer_rankings_by_var,
         transport_summaries=transport_summaries,
     )
     summary_path = sweep_root / "layerwise_ot_summary.txt"
     payload_path = sweep_root / "layerwise_ot_results.json"
+    best_transport_summary = _best_transport_summary(transport_summaries)
     write_text_report(summary_path, summary_text)
     write_json(
         payload_path,
@@ -1057,8 +1073,8 @@ def main() -> None:
             "ot_epsilons": [float(value) for value in ot_epsilons],
             "uot_beta_neurals": [float(value) for value in uot_beta_neurals],
             "row_top_k": int(row_top_k),
+            "calibration_family_weights": [float(value) for value in calibration_family_weights],
             "single_layer_lambdas": [float(value) for value in single_layer_lambdas],
-            "single_layer_results_path": None if reused_single_layer_results_path is None else str(reused_single_layer_results_path),
             "site_labels": [site.label for site in sites],
             "context_timing_seconds": context_timing_seconds,
             "timing_seconds": {
@@ -1072,14 +1088,36 @@ def main() -> None:
                 "t_total_wall": float(perf_counter() - overall_start),
             },
             "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)),
-            "single_layer_by_var": single_layer_by_var,
-            "single_layer_rankings_by_var": single_layer_rankings_by_var,
             "transport_runs": transport_runs,
             "transport_summaries": transport_summaries,
+            "best_transport_summary": best_transport_summary,
             "data": data_metadata,
             "summary_path": str(summary_path),
         },
     )
+    if isinstance(best_transport_summary, dict):
+        chosen_layers = {
+            str(target_var): int(entry.get("selected_shortlist_layer", -1))
+            for target_var in DEFAULT_TARGET_VARS
+            for entry in [best_transport_summary.get("by_var", {}).get(str(target_var))]
+            if isinstance(entry, dict)
+        }
+        print(
+            "[layerwise] best_selected_coupling "
+            + " ".join(
+                [
+                    f"method={best_transport_summary.get('method')}",
+                    f"epsilon={float(best_transport_summary.get('ot_epsilon', 0.0)):g}",
+                    (
+                        f"beta_n={float(best_transport_summary.get('uot_beta_neural')):g}"
+                        if best_transport_summary.get("uot_beta_neural") is not None else "beta_n=NA"
+                    ),
+                    f"avg_cal_score={float(best_transport_summary.get('mean_selected_calibration_score', 0.0)):.4f}",
+                    f"avg_cal_exact={float(best_transport_summary.get('mean_selected_calibration_exact_acc', 0.0)):.4f}",
+                    f"chosen_layers={chosen_layers}",
+                ]
+            )
+        )
     print(f"Wrote layerwise OT analysis payload to {payload_path}")
     print(f"Wrote layerwise OT analysis summary to {summary_path}")
 
