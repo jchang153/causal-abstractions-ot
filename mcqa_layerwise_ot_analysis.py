@@ -467,7 +467,6 @@ def _evaluate_shortlisted_layer_calibrations(
     target_var: str,
     ranking: list[dict[str, object]],
     row_top_k: int,
-    candidate_cache: dict[tuple[str, int], dict[str, object]],
 ) -> tuple[list[dict[str, object]], dict[str, object] | None, float]:
     shortlisted_entries = ranking[: max(1, int(row_top_k))]
     evaluated_candidates: list[dict[str, object]] = []
@@ -477,21 +476,17 @@ def _evaluate_shortlisted_layer_calibrations(
         if not (0 <= site_index < len(sites)):
             continue
         site = sites[site_index]
-        cache_key = (str(target_var), int(site.layer))
-        cached = candidate_cache.get(cache_key)
-        if not isinstance(cached, dict):
-            cached = _evaluate_single_layer_calibration(
-                model=model,
-                tokenizer=tokenizer,
-                calibration_bank=banks_by_split["calibration"][str(target_var)],
-                site=site,
-                site_index=site_index,
-                device=device,
-                batch_size=int(batch_size),
-                strength=float(intervention_strength),
-                calibration_family_weights=calibration_family_weights,
-            )
-            candidate_cache[cache_key] = dict(cached)
+        cached = _evaluate_single_layer_calibration(
+            model=model,
+            tokenizer=tokenizer,
+            calibration_bank=banks_by_split["calibration"][str(target_var)],
+            site=site,
+            site_index=site_index,
+            device=device,
+            batch_size=int(batch_size),
+            strength=float(intervention_strength),
+            calibration_family_weights=calibration_family_weights,
+        )
         evaluated_candidate = {
             "rank_index": int(rank_index),
             "site_index": int(site_index),
@@ -682,7 +677,6 @@ def _summarize_transport_runs(
     row_top_k: int,
 ) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
-    candidate_cache: dict[tuple[str, int], dict[str, object]] = {}
     for run_payload in transport_runs:
         method = str(run_payload.get("method"))
         epsilon = float(run_payload.get("ot_epsilon", 0.0))
@@ -716,7 +710,6 @@ def _summarize_transport_runs(
                 target_var=str(target_var),
                 ranking=ranking,
                 row_top_k=row_top_k,
-                candidate_cache=candidate_cache,
             )
             shortlist_union_layers.update(
                 int(candidate.get("layer", -1))
