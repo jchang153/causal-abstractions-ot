@@ -446,6 +446,15 @@ def _transport_output_name(config: dict[str, object]) -> str:
     return f"uot_eps-{epsilon:g}_betan-{float(config['uot_beta_neural']):g}_transport_only.json"
 
 
+def _transport_config_label(config: dict[str, object]) -> str:
+    method = str(config.get("method", "unknown")).upper()
+    epsilon = float(config.get("ot_epsilon", 0.0))
+    beta_neural = config.get("uot_beta_neural")
+    if beta_neural is None:
+        return f"{method} eps={epsilon:g}"
+    return f"{method} eps={epsilon:g} beta_n={float(beta_neural):g}"
+
+
 def _single_layer_entry_by_layer(entries: list[dict[str, object]]) -> dict[int, dict[str, object]]:
     return {
         int(entry["layer"]): entry
@@ -585,15 +594,17 @@ def _run_transport_sweeps(
         str(target_var): tensor
         for target_var, tensor in prepared_artifacts["site_signatures_by_var"].items()
     }
-    iterator = configs
-    if tqdm is not None:
-        iterator = tqdm(configs, desc="Transport sweeps", leave=False)
-    for transport_config in iterator:
+    progress = tqdm(total=len(configs), desc="Transport config sweep", leave=True) if tqdm is not None else None
+    for config_index, transport_config in enumerate(configs, start=1):
         method = str(transport_config["method"])
         epsilon = float(transport_config["ot_epsilon"])
         beta_neural = transport_config.get("uot_beta_neural")
+        config_label = _transport_config_label(transport_config)
+        if progress is not None:
+            progress.set_description(f"Transport {config_index}/{len(configs)} {config_label}")
         output_path = output_root / _transport_output_name(transport_config)
         payload = _load_existing_payload(output_path)
+        print(f"[layerwise] transport_config_start {config_label}")
         if payload is None:
             print(
                 f"[layerwise] transport-only method={method} epsilon={epsilon:g}"
@@ -659,7 +670,19 @@ def _run_transport_sweeps(
             }
             output_path.parent.mkdir(parents=True, exist_ok=True)
             write_json(output_path, payload)
+            payload_source = "computed"
+        else:
+            payload_source = "cache"
+        print(
+            f"[layerwise] transport_config_done {config_label} "
+            f"transport_runtime={float(payload.get('runtime_seconds', 0.0)):.2f}s "
+            f"source={payload_source}"
+        )
         runs.append(payload)
+        if progress is not None:
+            progress.update(1)
+    if progress is not None:
+        progress.close()
     return runs
 
 
@@ -677,10 +700,14 @@ def _summarize_transport_runs(
     row_top_k: int,
 ) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
-    for run_payload in transport_runs:
+    progress = tqdm(total=len(transport_runs), desc="Shortlist calibration sweep", leave=True) if tqdm is not None else None
+    for config_index, run_payload in enumerate(transport_runs, start=1):
         method = str(run_payload.get("method"))
         epsilon = float(run_payload.get("ot_epsilon", 0.0))
         beta_neural = run_payload.get("uot_beta_neural")
+        config_label = _transport_config_label(run_payload)
+        if progress is not None:
+            progress.set_description(f"Shortlist {config_index}/{len(transport_runs)} {config_label}")
         by_var = run_payload.get("by_var", {})
         run_summary: dict[str, object] = {
             "method": method,
@@ -759,7 +786,25 @@ def _summarize_transport_runs(
         run_summary["mean_selected_calibration_exact_acc"] = (
             float(sum(selected_exact_accs) / len(selected_exact_accs)) if selected_exact_accs else 0.0
         )
+        chosen_layers = {
+            str(target_var): int(entry.get("selected_shortlist_layer", -1))
+            for target_var in DEFAULT_TARGET_VARS
+            for entry in [run_summary.get("by_var", {}).get(str(target_var))]
+            if isinstance(entry, dict)
+        }
+        print(
+            f"[layerwise] config_eval_done {config_label} "
+            f"transport_runtime={float(run_summary.get('transport_solve_runtime_seconds', 0.0)):.2f}s "
+            f"shortlist_runtime={float(run_summary.get('shortlist_calibration_runtime_seconds', 0.0)):.2f}s "
+            f"total_config_runtime={float(run_summary.get('transport_solve_runtime_seconds', 0.0)) + float(run_summary.get('shortlist_calibration_runtime_seconds', 0.0)):.2f}s "
+            f"avg_cal_score={float(run_summary.get('mean_selected_calibration_score', 0.0)):.4f} "
+            f"chosen_layers={chosen_layers}"
+        )
         summaries.append(run_summary)
+        if progress is not None:
+            progress.update(1)
+    if progress is not None:
+        progress.close()
     return summaries
 
 
