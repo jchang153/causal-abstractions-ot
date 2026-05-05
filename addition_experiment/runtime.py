@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -64,7 +66,20 @@ def to_serializable(value: Any) -> Any:
 
 def write_json(path: str | Path, payload: Any) -> None:
     """Write a JSON payload with stable formatting."""
+    path = Path(path)
     ensure_parent_dir(path)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(to_serializable(payload), handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    fd, tmp_path_str = tempfile.mkstemp(
+        dir=str(path.expanduser().resolve().parent),
+        prefix=f".{path.name}.tmp.",
+        suffix=".json",
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_path_str)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(to_serializable(payload), handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()

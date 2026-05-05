@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+import tempfile
 from time import perf_counter
 
 import numpy as np
@@ -234,7 +236,18 @@ def load_prepared_alignment_artifacts(
     path = Path(cache_path)
     if not path.exists():
         return None
-    payload = torch.load(path, map_location="cpu")
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except (RuntimeError, OSError, EOFError) as exc:
+        print(
+            f"[ot] warning: failed to load cached alignment artifacts from {path}; "
+            f"treating as cache miss ({exc})"
+        )
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
     if not isinstance(payload, dict):
         return None
     cached_spec = payload.get("cache_spec")
@@ -285,23 +298,55 @@ def save_prepared_alignment_artifacts(
     """Persist reusable MCQA signature artifacts for future epsilon sweeps and reruns."""
     path = Path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "cache_spec": cache_spec,
-            "prepare_runtime_seconds": float(prepared_artifacts.get("prepare_runtime_seconds", 0.0)),
-            "base_logits_by_var": {
-                target_var: tensor.detach().cpu()
-                for target_var, tensor in prepared_artifacts["base_logits_by_var"].items()
-            },
-            "site_signatures_by_var": {
-                target_var: tensor.detach().cpu()
-                for target_var, tensor in prepared_artifacts["site_signatures_by_var"].items()
-            },
-            "saved_with": "mcqa_signature_cache_v2",
-            "saved_spec_json": json.dumps(cache_spec, sort_keys=True),
+    payload = {
+        "cache_spec": cache_spec,
+        "prepare_runtime_seconds": float(prepared_artifacts.get("prepare_runtime_seconds", 0.0)),
+        "base_logits_by_var": {
+            target_var: tensor.detach().cpu()
+            for target_var, tensor in prepared_artifacts["base_logits_by_var"].items()
         },
-        path,
+        "site_signatures_by_var": {
+            target_var: tensor.detach().cpu()
+            for target_var, tensor in prepared_artifacts["site_signatures_by_var"].items()
+        },
+        "saved_with": "mcqa_signature_cache_v2",
+        "saved_spec_json": json.dumps(cache_spec, sort_keys=True),
+    }
+    fd, tmp_path_str = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.tmp.",
+        suffix=".pt",
     )
+    os.close(fd)
+    tmp_path = Path(tmp_path_str)
+    try:
+        try:
+            torch.save(payload, tmp_path)
+        except RuntimeError:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            try:
+                torch.save(payload, tmp_path, _use_new_zipfile_serialization=False)
+            except RuntimeError as exc:
+                if "no space left on device" in str(exc).lower():
+                    print(
+                        f"[ot] warning: unable to cache alignment artifacts at {path} due to no space left on device; "
+                        "continuing without saving the cache file"
+                    )
+                    return
+                raise
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        if "no space left on device" in str(exc).lower():
+            print(
+                f"[ot] warning: unable to cache alignment artifacts at {path} due to no space left on device; "
+                "continuing without saving the cache file"
+            )
+            return
+        raise
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def resolve_recorded_artifact_prepare_seconds(
