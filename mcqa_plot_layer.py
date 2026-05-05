@@ -269,12 +269,11 @@ def _stage_a_calibration_score(
     return exact_acc if total_weight <= 0.0 else float(weighted_sum / total_weight)
 
 
-def _evaluate_fixed_single_layer(
+def _evaluate_fixed_single_layer_calibration_only(
     *,
     model,
     tokenizer,
     calibration_bank,
-    holdout_bank,
     site,
     site_index: int,
     device,
@@ -294,6 +293,38 @@ def _evaluate_fixed_single_layer(
         tokenizer=tokenizer,
         include_details=True,
     )
+    calibration_result = _sanitize_stage_a_eval_result(calibration_result)
+    calibration_score = _stage_a_calibration_score(
+        result=calibration_result,
+        calibration_family_weights=calibration_family_weights,
+    )
+    runtime_seconds = float(perf_counter() - eval_start)
+    return {
+        "target_var": str(calibration_bank.target_var),
+        "selected_site_label": str(site.label),
+        "selected_layer": int(site.layer),
+        "intervention_strength": float(strength),
+        "runtime_seconds": float(runtime_seconds),
+        "calibration_score": float(calibration_score),
+        "selected_calibration_result": calibration_result,
+        "selected_calibration_ranking": calibration_ranking,
+    }
+
+
+def _evaluate_fixed_single_layer_holdout_only(
+    *,
+    model,
+    tokenizer,
+    holdout_bank,
+    site,
+    site_index: int,
+    device,
+    batch_size: int,
+    strength: float,
+    calibration_score: float,
+    calibration_exact_acc: float,
+) -> dict[str, object]:
+    eval_start = perf_counter()
     holdout_result, holdout_ranking = _evaluate_single_site_intervention(
         model=model,
         bank=holdout_bank,
@@ -305,27 +336,19 @@ def _evaluate_fixed_single_layer(
         tokenizer=tokenizer,
         include_details=True,
     )
-    calibration_result = _sanitize_stage_a_eval_result(calibration_result)
     holdout_result = _sanitize_stage_a_eval_result(holdout_result)
-    calibration_score = _stage_a_calibration_score(
-        result=calibration_result,
-        calibration_family_weights=calibration_family_weights,
-    )
     runtime_seconds = float(perf_counter() - eval_start)
     holdout_result["method"] = "single_layer_full_swap"
     holdout_result["selection_score"] = float(calibration_score)
-    holdout_result["selection_exact_acc"] = float(calibration_result.get("exact_acc", 0.0))
-    holdout_result["calibration_exact_acc"] = float(calibration_result.get("exact_acc", 0.0))
+    holdout_result["selection_exact_acc"] = float(calibration_exact_acc)
+    holdout_result["calibration_exact_acc"] = float(calibration_exact_acc)
     holdout_result["lambda"] = float(strength)
     return {
         "target_var": str(holdout_bank.target_var),
         "selected_site_label": str(site.label),
         "selected_layer": int(site.layer),
-        "lambda": float(strength),
+        "intervention_strength": float(strength),
         "runtime_seconds": float(runtime_seconds),
-        "calibration_score": float(calibration_score),
-        "selected_calibration_result": calibration_result,
-        "selected_calibration_ranking": calibration_ranking,
         "ranking": holdout_ranking,
         "results": [holdout_result],
     }
@@ -389,7 +412,7 @@ def _evaluate_stage_a_config(
             }
             break
 
-    evaluation_sweep_runtime_seconds = 0.0
+    calibration_sweep_runtime_seconds = 0.0
     per_var_records: dict[str, dict[str, object]] = {}
     for target_var in target_vars:
         row_info = row_info_by_var.get(str(target_var))
@@ -401,11 +424,10 @@ def _evaluate_stage_a_config(
         candidate_records: list[dict[str, object]] = []
         for shortlisted_entry in shortlisted_entries:
             candidate_site = shortlisted_entry["site"]
-            direct_eval_payload = _evaluate_fixed_single_layer(
+            calibration_eval_payload = _evaluate_fixed_single_layer_calibration_only(
                 model=model,
                 tokenizer=tokenizer,
                 calibration_bank=banks_by_split["calibration"][str(target_var)],
-                holdout_bank=banks_by_split["test"][str(target_var)],
                 site=candidate_site,
                 site_index=int(shortlisted_entry["site_index"]),
                 device=device,
@@ -413,11 +435,10 @@ def _evaluate_stage_a_config(
                 strength=float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
                 calibration_family_weights=calibration_family_weights,
             )
-            evaluation_sweep_runtime_seconds += float(direct_eval_payload.get("runtime_seconds", 0.0))
-            result = direct_eval_payload.get("results", [{}])[0]
-            calibration_result = direct_eval_payload.get("selected_calibration_result", result)
+            calibration_sweep_runtime_seconds += float(calibration_eval_payload.get("runtime_seconds", 0.0))
+            calibration_result = calibration_eval_payload.get("selected_calibration_result", {})
             calibration_score = float(
-                direct_eval_payload.get(
+                calibration_eval_payload.get(
                     "calibration_score",
                     calibration_result.get("selection_score", calibration_result.get("exact_acc", 0.0)),
                 )
@@ -430,32 +451,31 @@ def _evaluate_stage_a_config(
                     "site_label": str(shortlisted_entry["site_label"]),
                     "layer": int(shortlisted_entry["layer"]),
                     "transport_mass": float(shortlisted_entry["transport_mass"]),
-                    "runtime_seconds": float(direct_eval_payload.get("runtime_seconds", 0.0)),
-                    "exact_acc": float(result.get("exact_acc", 0.0)),
+                    "runtime_seconds": float(calibration_eval_payload.get("runtime_seconds", 0.0)),
                     "calibration_score": float(calibration_score),
                     "calibration_exact_acc": float(calibration_result.get("exact_acc", 0.0)),
-                    "payload": direct_eval_payload,
+                    "calibration_payload": calibration_eval_payload,
                 }
             )
         best_candidate = max(
             candidate_records,
             key=lambda record: (
                 float(record.get("calibration_score", 0.0)),
-                float(record.get("exact_acc", 0.0)),
+                float(record.get("calibration_exact_acc", 0.0)),
                 float(record.get("transport_mass", 0.0)),
                 -int(record.get("rank_index", 10**9)),
             ),
         )
-        direct_eval_payload = best_candidate["payload"]
-        result = direct_eval_payload.get("results", [{}])[0]
         calibration_score = float(best_candidate["calibration_score"])
         record = {
             "method": str(payload.get("method", row_info["method_name"])),
             "variable": str(target_var),
-            "exact_acc": float(result.get("exact_acc", 0.0)),
+            "exact_acc": None,
             "selection_score": float(calibration_score),
-            "site_label": str(result.get("site_label", best_candidate["site"].label)),
-            "layer": int(result.get("layer", best_candidate["site"].layer)),
+            "selection_exact_acc": float(best_candidate["calibration_exact_acc"]),
+            "calibration_exact_acc": float(best_candidate["calibration_exact_acc"]),
+            "site_label": str(best_candidate["site_label"]),
+            "layer": int(best_candidate["layer"]),
             "epsilon": float(epsilon),
             "uot_beta_neural": None
             if payload.get("uot_beta_neural", compare_beta) is None
@@ -479,14 +499,15 @@ def _evaluate_stage_a_config(
                     "transport_mass": float(candidate["transport_mass"]),
                     "calibration_score": float(candidate["calibration_score"]),
                     "calibration_exact_acc": float(candidate["calibration_exact_acc"]),
-                    "exact_acc": float(candidate["exact_acc"]),
                     "runtime_seconds": float(candidate["runtime_seconds"]),
                 }
                 for candidate in candidate_records
             ],
             "target_row_ranking": row_ranking,
             "runtime_seconds": float(sum(candidate["runtime_seconds"] for candidate in candidate_records)),
-            "payload": direct_eval_payload,
+            "holdout_runtime_seconds": 0.0,
+            "calibration_payload": best_candidate["calibration_payload"],
+            "payload": best_candidate["calibration_payload"],
         }
         per_var_records[str(target_var)] = record
 
@@ -496,8 +517,8 @@ def _evaluate_stage_a_config(
         for record in [per_var_records.get(str(target_var))]
         if isinstance(record, dict)
     ]
-    exact_scores = [
-        float(record.get("exact_acc", 0.0))
+    calibration_exact_scores = [
+        float(record.get("selection_exact_acc", record.get("calibration_exact_acc", 0.0)))
         for target_var in target_vars
         for record in [per_var_records.get(str(target_var))]
         if isinstance(record, dict)
@@ -511,8 +532,8 @@ def _evaluate_stage_a_config(
             "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
             "per_var_records": {},
             "mean_calibration_score": 0.0,
-            "mean_exact_acc": 0.0,
-            "evaluation_sweep_runtime_seconds": 0.0,
+            "mean_calibration_exact_acc": 0.0,
+            "calibration_sweep_runtime_seconds": 0.0,
             "row_top_k": int(row_top_k),
         }
 
@@ -539,8 +560,11 @@ def _evaluate_stage_a_config(
         "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
         "per_var_records": per_var_records,
         "mean_calibration_score": float(sum(calibration_scores) / len(calibration_scores)) if calibration_scores else 0.0,
-        "mean_exact_acc": float(sum(exact_scores) / len(exact_scores)) if exact_scores else 0.0,
-        "evaluation_sweep_runtime_seconds": float(evaluation_sweep_runtime_seconds),
+        "mean_calibration_exact_acc": (
+            float(sum(calibration_exact_scores) / len(calibration_exact_scores))
+            if calibration_exact_scores else 0.0
+        ),
+        "calibration_sweep_runtime_seconds": float(calibration_sweep_runtime_seconds),
         "row_top_k": int(row_top_k),
     }
 
@@ -564,8 +588,8 @@ def _format_stage_a_config_line(
         for record in [per_var_records.get(str(target_var))]
         if isinstance(record, dict)
     }
-    exact_scores = {
-        str(target_var): float(record.get("exact_acc", 0.0))
+    calibration_exact_scores = {
+        str(target_var): float(record.get("selection_exact_acc", record.get("calibration_exact_acc", 0.0)))
         for target_var in target_vars
         for record in [per_var_records.get(str(target_var))]
         if isinstance(record, dict)
@@ -579,9 +603,9 @@ def _format_stage_a_config_line(
         + f"row_top_k={int(candidate_config.get('row_top_k', DEFAULT_STAGE_A_ROW_TOP_K))} "
         + f"layers={chosen_layers} "
         + f"cal={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in calibration_scores.items())}}} "
-        + f"test={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in exact_scores.items())}}} "
+        + f"cal_exact={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in calibration_exact_scores.items())}}} "
         + f"avg_cal={float(candidate_config.get('mean_calibration_score', 0.0)):.4f} "
-        + f"avg_test={float(candidate_config.get('mean_exact_acc', 0.0)):.4f} "
+        + f"avg_cal_exact={float(candidate_config.get('mean_calibration_exact_acc', 0.0)):.4f} "
         + f"runtime_with_signatures={float(runtime_with_signatures_seconds):.2f}s"
     )
 
@@ -614,14 +638,14 @@ def _select_joint_layer_config(
             calibration_family_weights=calibration_family_weights,
             row_top_k=row_top_k,
         )
-        direct_eval_runtime_seconds = float(candidate_config.get("evaluation_sweep_runtime_seconds", 0.0))
+        shortlist_runtime_seconds = float(candidate_config.get("calibration_sweep_runtime_seconds", 0.0))
         candidate_config["signature_prepare_runtime_seconds"] = float(signature_prepare_runtime_seconds)
         candidate_config["transport_solve_runtime_seconds"] = float(compare_payload.get("runtime_seconds", 0.0))
-        candidate_config["direct_eval_runtime_seconds"] = float(direct_eval_runtime_seconds)
+        candidate_config["direct_eval_runtime_seconds"] = float(shortlist_runtime_seconds)
         candidate_config["runtime_with_signatures_seconds"] = float(
             signature_prepare_runtime_seconds
             + float(compare_payload.get("runtime_seconds", 0.0))
-            + direct_eval_runtime_seconds
+            + shortlist_runtime_seconds
         )
         for record in candidate_config.get("per_var_records", {}).values():
             if isinstance(record, dict):
@@ -634,15 +658,79 @@ def _select_joint_layer_config(
         )
         if best_config is None or (
             float(candidate_config["mean_calibration_score"]),
-            float(candidate_config["mean_exact_acc"]),
+            float(candidate_config.get("mean_calibration_exact_acc", 0.0)),
         ) > (
             float(best_config["mean_calibration_score"]),
-            float(best_config["mean_exact_acc"]),
+            float(best_config.get("mean_calibration_exact_acc", 0.0)),
         ):
             best_config = candidate_config
     if best_config is None:
         return {}
     return dict(best_config)
+
+
+def _evaluate_selected_stage_a_holdout(
+    *,
+    model,
+    tokenizer,
+    banks_by_split: dict[str, dict[str, object]],
+    sites,
+    device,
+    batch_size: int,
+    selected_config: dict[str, object],
+) -> dict[str, object]:
+    if not isinstance(selected_config, dict):
+        return {}
+    per_var_records = selected_config.get("per_var_records", {})
+    if not isinstance(per_var_records, dict):
+        return dict(selected_config)
+    updated = dict(selected_config)
+    updated_records: dict[str, dict[str, object]] = {}
+    holdout_exact_scores: list[float] = []
+    total_holdout_runtime_seconds = 0.0
+    for target_var, record in per_var_records.items():
+        if not isinstance(record, dict):
+            continue
+        site_label = str(record.get("site_label", ""))
+        matching_site_index = next(
+            (
+                site_index
+                for site_index, site in enumerate(sites)
+                if str(site.label) == site_label
+            ),
+            None,
+        )
+        if matching_site_index is None:
+            updated_records[str(target_var)] = dict(record)
+            continue
+        holdout_eval_payload = _evaluate_fixed_single_layer_holdout_only(
+            model=model,
+            tokenizer=tokenizer,
+            holdout_bank=banks_by_split["test"][str(target_var)],
+            site=sites[int(matching_site_index)],
+            site_index=int(matching_site_index),
+            device=device,
+            batch_size=int(batch_size),
+            strength=float(record.get("intervention_strength", DEFAULT_STAGE_A_INTERVENTION_STRENGTH)),
+            calibration_score=float(record.get("selection_score", 0.0)),
+            calibration_exact_acc=float(record.get("selection_exact_acc", record.get("calibration_exact_acc", 0.0))),
+        )
+        holdout_result = holdout_eval_payload.get("results", [{}])[0]
+        updated_record = dict(record)
+        updated_record["exact_acc"] = float(holdout_result.get("exact_acc", 0.0))
+        updated_record["holdout_runtime_seconds"] = float(holdout_eval_payload.get("runtime_seconds", 0.0))
+        updated_record["payload"] = holdout_eval_payload
+        updated_record["ranking"] = holdout_eval_payload.get("ranking", [])
+        updated_records[str(target_var)] = updated_record
+        holdout_exact_scores.append(float(updated_record["exact_acc"]))
+        total_holdout_runtime_seconds += float(updated_record["holdout_runtime_seconds"])
+    updated["per_var_records"] = updated_records
+    updated["mean_exact_acc"] = (
+        float(sum(holdout_exact_scores) / len(holdout_exact_scores))
+        if holdout_exact_scores else 0.0
+    )
+    updated["holdout_eval_runtime_seconds"] = float(total_holdout_runtime_seconds)
+    return updated
 
 
 def _rank_layers_from_target_row(
@@ -653,25 +741,49 @@ def _rank_layers_from_target_row(
     rankings: dict[str, list[dict[str, object]]] = {}
     for target_var, selected in selected_method_by_var.items():
         row_ranking = [dict(entry) for entry in selected.get("target_row_ranking", []) if isinstance(entry, dict)]
-        rankings[str(target_var)] = [
-            {
-                "variable": str(target_var),
-                "layer": int(entry.get("layer", -1)),
-                "selection_score": float(entry.get("transport_mass", 0.0)),
-                "target_row_transport_mass": float(entry.get("transport_mass", 0.0)),
-                "exact_acc": float(selected.get("exact_acc", 0.0)),
-                "selection_exact_acc": float(selected.get("exact_acc", 0.0)),
-                "method_selection_score": float(selected.get("selection_score", 0.0)),
-                "method": selected.get("method"),
-                "epsilon": float(selected.get("epsilon", 0.0)),
-                "uot_beta_neural": selected.get("uot_beta_neural"),
-                "site_label": entry.get("site_label"),
-                "selected_site_label": selected.get("site_label"),
-                "runtime_seconds": float(runtime_seconds),
-                "selection_basis": "target_row_mass_from_selected_single_layer_method",
-            }
-            for entry in row_ranking
-        ]
+        selected_layer = int(selected.get("layer", -1))
+        selected_transport_mass = float(selected.get("selected_candidate_transport_mass", 0.0))
+        selected_entry = {
+            "variable": str(target_var),
+            "layer": int(selected_layer),
+            "selection_score": float(selected.get("selection_score", 0.0)),
+            "target_row_transport_mass": float(selected_transport_mass),
+            "exact_acc": float(selected.get("exact_acc", 0.0)),
+            "selection_exact_acc": float(selected.get("selection_exact_acc", 0.0)),
+            "method_selection_score": float(selected.get("selection_score", 0.0)),
+            "method": selected.get("method"),
+            "epsilon": float(selected.get("epsilon", 0.0)),
+            "uot_beta_neural": selected.get("uot_beta_neural"),
+            "site_label": selected.get("site_label"),
+            "selected_site_label": selected.get("site_label"),
+            "runtime_seconds": float(runtime_seconds),
+            "selection_basis": "selected_calibrated_single_site_within_coupling_topk",
+        }
+        seen_layers = {int(selected_layer)}
+        remaining_entries = []
+        for entry in row_ranking:
+            layer = int(entry.get("layer", -1))
+            if layer in seen_layers:
+                continue
+            remaining_entries.append(
+                {
+                    "variable": str(target_var),
+                    "layer": int(layer),
+                    "selection_score": float(entry.get("transport_mass", 0.0)),
+                    "target_row_transport_mass": float(entry.get("transport_mass", 0.0)),
+                    "exact_acc": float(selected.get("exact_acc", 0.0)),
+                    "selection_exact_acc": float(selected.get("selection_exact_acc", 0.0)),
+                    "method_selection_score": float(selected.get("selection_score", 0.0)),
+                    "method": selected.get("method"),
+                    "epsilon": float(selected.get("epsilon", 0.0)),
+                    "uot_beta_neural": selected.get("uot_beta_neural"),
+                    "site_label": entry.get("site_label"),
+                    "selected_site_label": selected.get("site_label"),
+                    "runtime_seconds": float(runtime_seconds),
+                    "selection_basis": "target_row_mass_from_selected_single_layer_method",
+                }
+            )
+        rankings[str(target_var)] = [selected_entry, *remaining_entries]
     return rankings
 
 
@@ -926,6 +1038,15 @@ def main() -> None:
         calibration_family_weights=calibration_family_weights,
         signature_prepare_runtime_seconds=signature_prepare_runtime_seconds,
         row_top_k=stage_a_row_top_k,
+    )
+    selected_config = _evaluate_selected_stage_a_holdout(
+        model=model,
+        tokenizer=tokenizer,
+        banks_by_split=banks_by_split,
+        sites=sites,
+        device=device,
+        batch_size=int(args.batch_size),
+        selected_config=selected_config,
     )
     selected_config["row_top_k"] = int(stage_a_row_top_k)
     method_by_var = {
