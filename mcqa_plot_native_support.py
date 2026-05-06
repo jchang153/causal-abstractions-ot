@@ -89,6 +89,10 @@ def _parse_layer_target_vars(value: str | None) -> dict[int, tuple[str, ...]]:
     return resolved
 
 
+def _target_file_suffix(target_var: str) -> str:
+    return f"_target-{str(target_var)}"
+
+
 def _normalize_native_resolutions(values: list[int] | tuple[int, ...], *, hidden_size: int) -> tuple[int, ...]:
     resolved = [max(1, min(int(value), int(hidden_size))) for value in values if int(value) > 0]
     if not resolved:
@@ -401,75 +405,94 @@ def main() -> None:
                 artifact_prepare_create_seconds=artifact_prepare_create_seconds,
             )
 
-            ot_compare_payloads: list[dict[str, object]] = []
-            ot_localization_start = perf_counter()
             selected_target_vars = layer_target_vars.get(int(layer), transport_target_vars)
+            unknown_target_vars = tuple(
+                str(target_var)
+                for target_var in selected_target_vars
+                if str(target_var) not in set(str(source_var) for source_var in transport_target_vars)
+            )
+            if unknown_target_vars:
+                raise ValueError(
+                    f"Layer {int(layer)} requested target vars outside transport rows: {list(unknown_target_vars)}"
+                )
             print(
                 f"[stageB native] layer={int(layer)} width={int(native_resolution)} "
-                f"calibrating target_vars={list(selected_target_vars)} from shared transport rows={list(transport_target_vars)}"
+                f"forming one target-specific coupling per target_var={list(selected_target_vars)} "
+                f"from shared transport rows={list(transport_target_vars)}"
             )
-            print(
-                f"[stageB native] sweeping OT over layer={int(layer)} width={int(native_resolution)} "
-                f"epsilons={list(float(e) for e in ot_epsilons)}"
-            )
-            for epsilon in ot_epsilons:
-                output_stem = (
-                    f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
-                    f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}_eps-{float(epsilon):g}_ot"
-                )
-                output_path = layer_dir / f"{output_stem}.json"
-                summary_path = layer_dir / f"{output_stem}.txt"
-                compare_payload = _load_existing_payload(output_path)
-                if not _compare_payload_matches_target_vars(
-                    payload=compare_payload,
-                    expected_target_vars=selected_target_vars,
-                    expected_transport_target_vars=transport_target_vars,
-                ):
-                    compare_payload = None
-                if compare_payload is None:
-                    compare_payload = run_comparison(
-                        model=model,
-                        tokenizer=tokenizer,
-                        token_positions=token_positions,
-                        banks_by_split=banks_by_split,
-                        data_metadata=data_metadata,
-                        device=device,
-                        config=CompareExperimentConfig(
-                            model_name=base_run.MODEL_NAME,
-                            output_path=output_path,
-                            summary_path=summary_path,
-                            methods=("ot",),
-                            target_vars=selected_target_vars,
-                            ot_source_target_vars=transport_target_vars,
-                            batch_size=int(args.batch_size),
-                            ot_epsilon=float(epsilon),
-                            signature_mode=str(args.signature_mode),
-                            ot_top_k_values=ot_top_k_values,
-                            ot_lambdas=ot_lambdas,
-                            calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                            calibration_family_weights=calibration_family_weights,
-                            ot_top_k_values_by_var={target_var: ot_top_k_values for target_var in transport_target_vars},
-                            ot_lambdas_by_var={target_var: ot_lambdas for target_var in transport_target_vars},
-                            resolution=int(native_resolution),
-                            layers=(int(layer),),
-                            token_position_ids=(DEFAULT_TOKEN_POSITION_ID,),
-                        ),
-                        prepared_ot_artifacts=prepared_artifacts,
-                    )
-                else:
-                    print(
-                        f"[stageB native] reusing compare payload layer={int(layer)} width={int(native_resolution)} "
-                        f"epsilon={float(epsilon):g}"
-                    )
-                ot_compare_payloads.append(compare_payload)
-            _synchronize_if_cuda(device)
-            ot_localization_seconds = float(perf_counter() - ot_localization_start)
-
-            support_start = perf_counter()
-            best_ot_by_var, best_method_payload_by_var = _best_ot_method_payloads(ot_compare_payloads)
-            support_by_var: dict[str, dict[str, object]] = {}
+            shared_width_seconds = float(perf_counter() - width_start)
             for target_var in selected_target_vars:
-                best_method_payload = best_method_payload_by_var.get(str(target_var))
+                target_var = str(target_var)
+                target_vars = (target_var,)
+                target_suffix = _target_file_suffix(target_var)
+                ot_compare_payloads: list[dict[str, object]] = []
+                ot_localization_start = perf_counter()
+                print(
+                    f"[stageB native] layer={int(layer)} width={int(native_resolution)} "
+                    f"calibrating target_var={target_var} from shared transport rows={list(transport_target_vars)}"
+                )
+                print(
+                    f"[stageB native] sweeping OT over layer={int(layer)} width={int(native_resolution)} "
+                    f"target_var={target_var} epsilons={list(float(e) for e in ot_epsilons)}"
+                )
+                for epsilon in ot_epsilons:
+                    output_stem = (
+                        f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
+                        f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}"
+                        f"{target_suffix}_eps-{float(epsilon):g}_ot"
+                    )
+                    output_path = layer_dir / f"{output_stem}.json"
+                    summary_path = layer_dir / f"{output_stem}.txt"
+                    compare_payload = _load_existing_payload(output_path)
+                    if not _compare_payload_matches_target_vars(
+                        payload=compare_payload,
+                        expected_target_vars=target_vars,
+                        expected_transport_target_vars=transport_target_vars,
+                    ):
+                        compare_payload = None
+                    if compare_payload is None:
+                        compare_payload = run_comparison(
+                            model=model,
+                            tokenizer=tokenizer,
+                            token_positions=token_positions,
+                            banks_by_split=banks_by_split,
+                            data_metadata=data_metadata,
+                            device=device,
+                            config=CompareExperimentConfig(
+                                model_name=base_run.MODEL_NAME,
+                                output_path=output_path,
+                                summary_path=summary_path,
+                                methods=("ot",),
+                                target_vars=target_vars,
+                                ot_source_target_vars=transport_target_vars,
+                                batch_size=int(args.batch_size),
+                                ot_epsilon=float(epsilon),
+                                signature_mode=str(args.signature_mode),
+                                ot_top_k_values=ot_top_k_values,
+                                ot_lambdas=ot_lambdas,
+                                calibration_metric=DEFAULT_CALIBRATION_METRIC,
+                                calibration_family_weights=calibration_family_weights,
+                                ot_top_k_values_by_var={target_var: ot_top_k_values},
+                                ot_lambdas_by_var={target_var: ot_lambdas},
+                                resolution=int(native_resolution),
+                                layers=(int(layer),),
+                                token_position_ids=(DEFAULT_TOKEN_POSITION_ID,),
+                            ),
+                            prepared_ot_artifacts=prepared_artifacts,
+                        )
+                    else:
+                        print(
+                            f"[stageB native] reusing compare payload layer={int(layer)} width={int(native_resolution)} "
+                            f"target_var={target_var} epsilon={float(epsilon):g}"
+                        )
+                    ot_compare_payloads.append(compare_payload)
+                _synchronize_if_cuda(device)
+                ot_localization_seconds = float(perf_counter() - ot_localization_start)
+
+                support_start = perf_counter()
+                best_ot_by_var, best_method_payload_by_var = _best_ot_method_payloads(ot_compare_payloads)
+                support_by_var: dict[str, dict[str, object]] = {}
+                best_method_payload = best_method_payload_by_var.get(target_var)
                 if not isinstance(best_method_payload, dict):
                     continue
                 extracted = extract_ordered_site_support(
@@ -477,112 +500,118 @@ def main() -> None:
                     sites=sites,
                     score_slack=0.0,
                 )
-                support_summary = extracted.get(str(target_var))
+                support_summary = extracted.get(target_var)
                 if isinstance(support_summary, dict):
-                    support_by_var[str(target_var)] = support_summary
-            support_extract_seconds = float(perf_counter() - support_start)
-            width_total_seconds = float(perf_counter() - width_start)
-            effective_width_total_seconds = adjust_runtime_for_cached_signatures(
-                wall_runtime_seconds=width_total_seconds,
-                artifact_prepare_load_seconds=artifact_prepare_load_seconds,
-                artifact_prepare_create_seconds=artifact_prepare_create_seconds,
-                artifact_prepare_recorded_seconds=artifact_prepare_recorded_seconds,
-            )
+                    support_by_var[target_var] = support_summary
+                support_extract_seconds = float(perf_counter() - support_start)
+                target_wall_seconds = float(shared_width_seconds + ot_localization_seconds + support_extract_seconds)
+                effective_width_total_seconds = adjust_runtime_for_cached_signatures(
+                    wall_runtime_seconds=target_wall_seconds,
+                    artifact_prepare_load_seconds=artifact_prepare_load_seconds,
+                    artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+                    artifact_prepare_recorded_seconds=artifact_prepare_recorded_seconds,
+                )
 
-            support_path = layer_dir / (
-                f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
-                f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}_support.json"
-            )
-            summary_path = layer_dir / (
-                f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
-                f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}_summary.txt"
-            )
-            payload_path = layer_dir / (
-                f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
-                f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}.json"
-            )
-            write_json(support_path, support_by_var)
-            write_text_report(
-                summary_path,
-                _format_summary(
-                    layer=int(layer),
-                    native_resolution=int(native_resolution),
-                    target_vars=selected_target_vars,
-                    transport_target_vars=transport_target_vars,
-                    support_by_var=support_by_var,
-                    best_ot_by_var=best_ot_by_var,
-                ),
-            )
-            payload = {
-                "kind": "mcqa_plot_native_support_layer",
-                "layer": int(layer),
-                "token_position_id": DEFAULT_TOKEN_POSITION_ID,
-                "signature_mode": str(args.signature_mode),
-                "native_resolution": int(native_resolution),
-                "target_vars": [str(target_var) for target_var in selected_target_vars],
-                "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
-                "native_resolutions": [int(resolution) for resolution in native_resolutions],
-                "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
-                "ot_top_k_values": [int(value) for value in ot_top_k_values],
-                "ot_lambdas": [float(value) for value in ot_lambdas],
-                "calibration_family_weights": [float(weight) for weight in calibration_family_weights],
-                "support_score_slack": float(args.support_score_slack),
-                "site_labels": [site.label for site in sites],
-                "support_path": str(support_path),
-                "support_by_var": support_by_var,
-                "support_source_by_var": {
-                    str(target_var): {
-                        "mode": "selected_best_ot_row_only",
-                        "epsilon": float(best_ot_by_var.get(str(target_var), {}).get("epsilon", 0.0)),
-                    }
-                    for target_var in selected_target_vars
-                    if str(target_var) in best_ot_by_var
-                },
-                "method_by_var": best_ot_by_var,
-                "ot_output_paths": [
-                    str(
-                        layer_dir
-                        / (
-                            f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
-                            f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}_eps-{float(epsilon):g}_ot.json"
-                        )
-                    )
-                    for epsilon in ot_epsilons
-                ],
-                "summary_path": str(summary_path),
-                "context_timing_seconds": context_timing_seconds,
-                "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
-                "signature_prepare_runtime_seconds": float(artifact_prepare_recorded_seconds),
-                "timing_seconds": {
-                    "t_model_load": float(context_timing_seconds.get("t_model_load", 0.0)),
-                    "t_data_load": float(context_timing_seconds.get("t_data_load", 0.0)),
-                    "t_bank_build": float(context_timing_seconds.get("t_bank_build", 0.0)),
-                    "t_factual_filter": float(context_timing_seconds.get("t_factual_filter", 0.0)),
-                    "t_context_total_wall": float(context_timing_seconds.get("t_context_total_wall", 0.0)),
-                    "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
-                    "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
-                    "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
-                    "t_signature_prepare": float(artifact_prepare_recorded_seconds),
-                    "t_stageB_native_ot_localization": float(ot_localization_seconds),
-                    "t_support_extract": float(support_extract_seconds),
-                    "t_native_width_total_wall": float(width_total_seconds),
-                    "t_native_width_total_effective": float(effective_width_total_seconds),
-                },
-                "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)),
-                "wall_runtime_seconds": float(width_total_seconds),
-                "localization_runtime_seconds": float(effective_width_total_seconds),
-                "runtime_seconds": float(effective_width_total_seconds),
-            }
-            write_json(payload_path, payload)
-            all_payloads.append(payload)
-            manifest_runs.append(
-                {
+                support_path = layer_dir / (
+                    f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
+                    f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}"
+                    f"{target_suffix}_support.json"
+                )
+                summary_path = layer_dir / (
+                    f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
+                    f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}"
+                    f"{target_suffix}_summary.txt"
+                )
+                payload_path = layer_dir / (
+                    f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
+                    f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}"
+                    f"{target_suffix}.json"
+                )
+                write_json(support_path, support_by_var)
+                write_text_report(
+                    summary_path,
+                    _format_summary(
+                        layer=int(layer),
+                        native_resolution=int(native_resolution),
+                        target_vars=target_vars,
+                        transport_target_vars=transport_target_vars,
+                        support_by_var=support_by_var,
+                        best_ot_by_var=best_ot_by_var,
+                    ),
+                )
+                payload = {
+                    "kind": "mcqa_plot_native_support_layer",
                     "layer": int(layer),
+                    "token_position_id": DEFAULT_TOKEN_POSITION_ID,
+                    "signature_mode": str(args.signature_mode),
                     "native_resolution": int(native_resolution),
-                    "payload_path": str(payload_path),
-                    "runtime_seconds": float(width_total_seconds),
+                    "target_vars": [target_var],
+                    "transport_target_vars": [str(source_var) for source_var in transport_target_vars],
+                    "native_resolutions": [int(resolution) for resolution in native_resolutions],
+                    "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
+                    "ot_top_k_values": [int(value) for value in ot_top_k_values],
+                    "ot_lambdas": [float(value) for value in ot_lambdas],
+                    "calibration_family_weights": [float(weight) for weight in calibration_family_weights],
+                    "support_score_slack": float(args.support_score_slack),
+                    "site_labels": [site.label for site in sites],
+                    "support_path": str(support_path),
+                    "support_by_var": support_by_var,
+                    "support_source_by_var": {
+                        target_var: {
+                            "mode": "selected_best_ot_row_only",
+                            "epsilon": float(best_ot_by_var.get(target_var, {}).get("epsilon", 0.0)),
+                        }
+                    }
+                    if target_var in best_ot_by_var
+                    else {},
+                    "method_by_var": best_ot_by_var,
+                    "ot_output_paths": [
+                        str(
+                            layer_dir
+                            / (
+                                f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
+                                f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}"
+                                f"{target_suffix}_eps-{float(epsilon):g}_ot.json"
+                            )
+                        )
+                        for epsilon in ot_epsilons
+                    ],
+                    "summary_path": str(summary_path),
+                    "context_timing_seconds": context_timing_seconds,
+                    "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
+                    "signature_prepare_runtime_seconds": float(artifact_prepare_recorded_seconds),
+                    "timing_seconds": {
+                        "t_model_load": float(context_timing_seconds.get("t_model_load", 0.0)),
+                        "t_data_load": float(context_timing_seconds.get("t_data_load", 0.0)),
+                        "t_bank_build": float(context_timing_seconds.get("t_bank_build", 0.0)),
+                        "t_factual_filter": float(context_timing_seconds.get("t_factual_filter", 0.0)),
+                        "t_context_total_wall": float(context_timing_seconds.get("t_context_total_wall", 0.0)),
+                        "t_stageB_native_shared_setup_wall": float(shared_width_seconds),
+                        "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
+                        "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
+                        "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
+                        "t_signature_prepare": float(artifact_prepare_recorded_seconds),
+                        "t_stageB_native_ot_localization": float(ot_localization_seconds),
+                        "t_support_extract": float(support_extract_seconds),
+                        "t_native_width_total_wall": float(target_wall_seconds),
+                        "t_native_width_total_effective": float(effective_width_total_seconds),
+                    },
+                    "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)),
+                    "wall_runtime_seconds": float(target_wall_seconds),
+                    "localization_runtime_seconds": float(effective_width_total_seconds),
+                    "runtime_seconds": float(effective_width_total_seconds),
                 }
-            )
+                write_json(payload_path, payload)
+                all_payloads.append(payload)
+                manifest_runs.append(
+                    {
+                        "layer": int(layer),
+                        "native_resolution": int(native_resolution),
+                        "target_var": target_var,
+                        "payload_path": str(payload_path),
+                        "runtime_seconds": float(effective_width_total_seconds),
+                    }
+                )
 
     manifest_path = sweep_root / "layer_sweep_manifest.json"
     write_json(

@@ -90,11 +90,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-b-neighbor-radius", type=int, default=0)
     parser.add_argument("--stage-b-max-layers-per-var", type=int, default=3)
     parser.add_argument("--native-resolutions", default="32,64,128,256")
-    parser.add_argument("--pca-site-menus", default="partition,mixed")
+    parser.add_argument("--pca-site-menus", default="partition")
     parser.add_argument("--pca-basis-source-modes", default="pair_bank,all_variants")
     parser.add_argument("--pca-num-bands-values", default="8,16")
     parser.add_argument("--pca-band-scheme", default="equal")
-    parser.add_argument("--pca-top-prefix-sizes", default="8,16,32,64")
     parser.add_argument("--guided-mask-names", default="Selected")
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
@@ -225,8 +224,6 @@ def main() -> None:
             str(args.pca_num_bands_values),
             "--pca-band-scheme",
             str(args.pca_band_scheme),
-            "--pca-top-prefix-sizes",
-            str(args.pca_top_prefix_sizes),
             "--guided-mask-names",
             str(args.guided_mask_names),
             "--guided-max-epochs",

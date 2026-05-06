@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import subprocess
 import sys
@@ -43,6 +42,7 @@ from mcqa_delta_hierarchical_sweep import (
     _site_catalog_tag,
     _stage_b_slug,
     _stage_output_is_valid,
+    _target_file_suffix,
     _write_json,
     _write_text,
 )
@@ -143,12 +143,12 @@ def _expected_pca_payload_path(
     site_menu: str,
     num_bands: int,
     layer: int,
+    target_var: str,
 ) -> Path:
     site_catalog_tag = _site_catalog_tag(
         site_menu=str(site_menu),
         num_bands=int(num_bands),
         band_scheme=str(args.pca_band_scheme),
-        top_prefix_sizes=normalized["pca_top_prefix_sizes"],
     )
     return (
         Path(args.results_root)
@@ -156,7 +156,8 @@ def _expected_pca_payload_path(
         / f"layer_{int(layer):02d}"
         / (
             f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
-            f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_plot_pca_support.json"
+            f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}"
+            f"{_target_file_suffix(str(target_var))}_plot_pca_support.json"
         )
     )
 
@@ -173,11 +174,15 @@ def _expected_pca_guided_outputs(
     layer: int,
     target_vars: tuple[str, ...] | None = None,
 ) -> list[str]:
+    resolved_target_vars = tuple(str(target_var) for target_var in (target_vars or normalized["target_vars"]))
+    if len(resolved_target_vars) != 1:
+        raise ValueError(f"PCA guided expected outputs require exactly one target var, got {list(resolved_target_vars)}")
+    target_var = resolved_target_vars[0]
+    target_suffix = _target_file_suffix(target_var)
     site_catalog_tag = _site_catalog_tag(
         site_menu=str(site_menu),
         num_bands=int(num_bands),
         band_scheme=str(args.pca_band_scheme),
-        top_prefix_sizes=normalized["pca_top_prefix_sizes"],
     )
     layer_dir = Path(args.results_root) / f"{stage_timestamp}_mcqa_ot_pca_focus" / f"layer_{int(layer):02d}"
     outputs = [
@@ -185,18 +190,19 @@ def _expected_pca_guided_outputs(
             layer_dir
             / (
                 f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
-                f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_plot_pca_support.json"
+                f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}"
+                f"{target_suffix}_plot_pca_support.json"
             )
         ),
         str(
             layer_dir
             / (
                 f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
-                f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_plot_das_pca_support.json"
+                f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}"
+                f"{target_suffix}_plot_das_pca_support.json"
             )
         ),
     ]
-    resolved_target_vars = tuple(str(target_var) for target_var in (target_vars or normalized["target_vars"]))
     for target_var in resolved_target_vars:
         outputs.append(
             str(
@@ -216,24 +222,25 @@ def _expected_native_payload_paths(
     normalized: dict[str, object],
     stage_timestamp: str,
     layer: int,
+    target_vars: tuple[str, ...],
     resolutions: tuple[int, ...] | None = None,
 ) -> list[str]:
     native_root = Path(args.results_root) / f"{stage_timestamp}_mcqa_plot_native_support"
     outputs = [str(native_root / "layer_sweep_manifest.json")]
-    native_widths = tuple(int(resolution) for resolution in (resolutions or normalized["native_block_resolutions"]))
-    atomic_width = native_widths[0]
-    for width in native_widths[1:]:
-        atomic_width = math.gcd(int(atomic_width), int(width))
-    outputs.append(
-        str(
-            native_root
-            / f"layer_{int(layer):02d}"
-            / (
-                f"mcqa_plot_native_support_layer-{int(layer)}_pos-last_token"
-                f"_atomic-{int(atomic_width)}_sig-{str(args.signature_mode)}.json"
+    native_widths = tuple(int(resolution) for resolution in (resolutions or normalized["native_resolutions"]))
+    for width in native_widths:
+        for target_var in target_vars:
+            outputs.append(
+                str(
+                    native_root
+                    / f"layer_{int(layer):02d}"
+                    / (
+                        f"mcqa_plot_native_support_layer-{int(layer)}_pos-last_token"
+                        f"_atomic-{int(width)}_sig-{str(args.signature_mode)}"
+                        f"{_target_file_suffix(str(target_var))}.json"
+                    )
+                )
             )
-        )
-    )
     return outputs
 
 
@@ -376,11 +383,16 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
         if str(token_position_id) == "last_token":
             for layer in selected_layers:
                 stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_native_{token_position_id}_L{int(layer):02d}"
+                target_vars = selected_target_vars_by_layer.get(
+                    int(layer),
+                    tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS),
+                )
                 expected_outputs = _expected_native_payload_paths(
                     args=args,
                     normalized=normalized,
                     stage_timestamp=stage_timestamp,
                     layer=int(layer),
+                    target_vars=target_vars,
                 )
                 native_tasks.append(
                     {
@@ -396,10 +408,7 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
                                 stage_timestamp=stage_timestamp,
                                 layers=(int(layer),),
                                 layer_target_vars={
-                                    int(layer): selected_target_vars_by_layer.get(
-                                        int(layer),
-                                        tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS),
-                                    )
+                                    int(layer): target_vars
                                 },
                             )
                         ),
@@ -410,60 +419,65 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
 
         for basis_source_mode in normalized["pca_basis_source_modes"]:
             for site_menu in normalized["pca_site_menus"]:
-                for num_bands in _normalize_num_bands_values(normalized["pca_num_bands_values"], str(site_menu)):
-                    base_slug = _stage_b_slug(
-                        token_position_id=str(token_position_id),
-                        basis_source_mode=str(basis_source_mode),
-                        site_menu=str(site_menu),
-                        num_bands=int(num_bands),
+                num_bands_values = _normalize_num_bands_values(normalized["pca_num_bands_values"], str(site_menu))
+                if not num_bands_values:
+                    continue
+                band_slug = "bands-" + "-".join(str(int(value)) for value in num_bands_values)
+                base_slug = f"{str(token_position_id)}_{str(basis_source_mode)}_{str(site_menu)}_{band_slug}"
+                stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_{base_slug}"
+                manifest_path = Path(args.results_root) / f"{stage_timestamp}_mcqa_ot_pca_focus" / "layer_sweep_manifest.json"
+                payload_paths: list[str] = []
+                expected_outputs = [str(manifest_path)]
+                for layer in selected_layers:
+                    target_vars = selected_target_vars_by_layer.get(
+                        int(layer),
+                        tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS),
                     )
-                    for layer in selected_layers:
-                        stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_{base_slug}_L{int(layer):02d}"
-                        payload_path = _expected_pca_payload_path(
-                            args=args,
-                            normalized=normalized,
-                            stage_timestamp=stage_timestamp,
-                            token_position_id=str(token_position_id),
-                            basis_source_mode=str(basis_source_mode),
-                            site_menu=str(site_menu),
-                            num_bands=int(num_bands),
-                            layer=int(layer),
-                        )
-                        manifest_path = Path(args.results_root) / f"{stage_timestamp}_mcqa_ot_pca_focus" / "layer_sweep_manifest.json"
-                        pca_tasks.append(
-                            {
-                                "task_id": f"pca_{base_slug}_L{int(layer):02d}",
-                                "category": "stage_b_pca_support",
-                                "token_position_id": str(token_position_id),
-                                "basis_source_mode": str(basis_source_mode),
-                                "site_menu": str(site_menu),
-                                "num_bands": int(num_bands),
-                                "layer": int(layer),
-                                "stage_timestamp": stage_timestamp,
-                                "command": list(
-                                    _build_stage_b_or_c_command(
-                                        args=args,
-                                        normalized=normalized,
-                                        stage_timestamp=stage_timestamp,
-                                        token_position_id=str(token_position_id),
-                                        layers=(int(layer),),
-                                        requested_target_vars=tuple(str(target_var) for target_var in normalized["target_vars"]),
-                                        layer_target_vars={
-                                            int(layer): selected_target_vars_by_layer.get(
-                                                int(layer),
-                                                tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS),
-                                            )
-                                        },
-                                        basis_source_mode=str(basis_source_mode),
-                                        site_menu=str(site_menu),
-                                        num_bands=int(num_bands),
-                                        guided_das=False,
-                                    )
-                                ),
-                                "expected_outputs": [str(manifest_path), str(payload_path)],
-                                "payload_paths": [str(payload_path)],
-                            }
-                        )
+                    for num_bands in num_bands_values:
+                        for target_var in target_vars:
+                            payload_path = _expected_pca_payload_path(
+                                args=args,
+                                normalized=normalized,
+                                stage_timestamp=stage_timestamp,
+                                token_position_id=str(token_position_id),
+                                basis_source_mode=str(basis_source_mode),
+                                site_menu=str(site_menu),
+                                num_bands=int(num_bands),
+                                layer=int(layer),
+                                target_var=str(target_var),
+                            )
+                            payload_paths.append(str(payload_path))
+                            expected_outputs.append(str(payload_path))
+                pca_tasks.append(
+                    {
+                        "task_id": f"pca_{base_slug}",
+                        "category": "stage_b_pca_support",
+                        "token_position_id": str(token_position_id),
+                        "basis_source_mode": str(basis_source_mode),
+                        "site_menu": str(site_menu),
+                        "num_bands_values": [int(value) for value in num_bands_values],
+                        "layers": [int(layer) for layer in selected_layers],
+                        "stage_timestamp": stage_timestamp,
+                        "command": list(
+                            _build_stage_b_or_c_command(
+                                args=args,
+                                normalized=normalized,
+                                stage_timestamp=stage_timestamp,
+                                token_position_id=str(token_position_id),
+                                layers=tuple(int(layer) for layer in selected_layers),
+                                requested_target_vars=tuple(str(target_var) for target_var in normalized["target_vars"]),
+                                layer_target_vars=selected_target_vars_by_layer,
+                                basis_source_mode=str(basis_source_mode),
+                                site_menu=str(site_menu),
+                                num_bands=int(num_bands_values[0]),
+                                num_bands_values=tuple(int(value) for value in num_bands_values),
+                                guided_das=False,
+                            )
+                        ),
+                        "expected_outputs": expected_outputs,
+                        "payload_paths": payload_paths,
+                    }
+                )
 
     _write_task_manifest(sweep_root / "stage_b_native_tasks.json", kind="stage_b_native_tasks", tasks=native_tasks)
     _write_task_manifest(sweep_root / "stage_b_pca_tasks.json", kind="stage_b_pca_tasks", tasks=pca_tasks)

@@ -30,7 +30,6 @@ from mcqa_experiment.runtime import write_json
 from mcqa_experiment.sites import (
     RotatedBandSite,
     enumerate_rotated_band_sites,
-    enumerate_rotated_top_prefix_sites,
     site_total_width,
 )
 from mcqa_experiment.support import (
@@ -45,7 +44,6 @@ DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPositio
 DEFAULT_TOKEN_POSITION_ID = "last_token"
 DEFAULT_NUM_BANDS = 8
 DEFAULT_SITE_MENU = "partition"
-DEFAULT_TOP_PREFIX_SIZES = (8, 16, 32, 64)
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
@@ -160,13 +158,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
-    parser.add_argument("--site-menu", default=DEFAULT_SITE_MENU, choices=("partition", "mixed"))
+    parser.add_argument("--site-menu", default=DEFAULT_SITE_MENU, choices=("partition",))
     parser.add_argument("--num-bands", type=int, default=DEFAULT_NUM_BANDS)
-    parser.add_argument("--band-scheme", default=DEFAULT_BAND_SCHEME, choices=("equal", "head"))
     parser.add_argument(
-        "--top-prefix-sizes",
-        help="Comma-separated top-prefix sizes for mixed PCA menus. Default: 8,16,32,64",
+        "--num-bands-values",
+        default=None,
+        help="Comma-separated PCA band counts to sweep in one process. Overrides --num-bands.",
     )
+    parser.add_argument("--band-scheme", default=DEFAULT_BAND_SCHEME, choices=("equal", "head"))
     parser.add_argument("--basis-source-mode", default=DEFAULT_BASIS_SOURCE_MODE, choices=("pair_bank", "all_variants"))
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--ot-top-k-values", help="Comma-separated OT top-k values. Default: 1,2,3,4,5")
@@ -411,7 +410,6 @@ def _enumerate_pca_sites(
     site_menu: str,
     num_bands: int,
     band_scheme: str,
-    top_prefix_sizes: tuple[int, ...],
 ) -> list[RotatedBandSite]:
     partition_sites = enumerate_rotated_band_sites(
         rank=int(basis.rank),
@@ -423,23 +421,7 @@ def _enumerate_pca_sites(
     )
     if str(site_menu) == "partition":
         return partition_sites
-    if str(site_menu) != "mixed":
-        raise ValueError(f"Unsupported site_menu {site_menu!r}")
-    prefix_sites = enumerate_rotated_top_prefix_sites(
-        rank=int(basis.rank),
-        prefix_sizes=top_prefix_sizes,
-        layer=int(layer),
-        token_position_id=str(token_position_id),
-        basis_id=str(basis.basis_id),
-    )
-    ordered_sites: list[RotatedBandSite] = []
-    seen_labels: set[str] = set()
-    for site in [*partition_sites, *prefix_sites]:
-        if site.label in seen_labels:
-            continue
-        seen_labels.add(site.label)
-        ordered_sites.append(site)
-    return ordered_sites
+    raise ValueError(f"Unsupported site_menu {site_menu!r}; PCA support is partition-only")
 
 
 def _site_catalog_tag(
@@ -447,12 +429,12 @@ def _site_catalog_tag(
     site_menu: str,
     num_bands: int,
     band_scheme: str,
-    top_prefix_sizes: tuple[int, ...],
 ) -> str:
-    tag = f"menu-{str(site_menu)}-bands-{int(num_bands)}-scheme-{str(band_scheme)}"
-    if str(site_menu) == "mixed":
-        tag += f"-top-{'-'.join(str(size) for size in top_prefix_sizes)}"
-    return tag
+    return f"menu-{str(site_menu)}-bands-{int(num_bands)}-scheme-{str(band_scheme)}"
+
+
+def _target_file_suffix(target_var: str) -> str:
+    return f"_target-{str(target_var)}"
 
 
 def _pca_signature_cache_spec(
@@ -785,7 +767,6 @@ def _format_layer_summary(
     site_menu: str,
     num_bands: int,
     band_scheme: str,
-    top_prefix_sizes: tuple[int, ...],
     target_vars: tuple[str, ...],
     transport_target_vars: tuple[str, ...],
     basis: LayerPCABasis,
@@ -807,7 +788,6 @@ def _format_layer_summary(
         f"site_menu: {site_menu}",
         f"num_bands: {int(num_bands)}",
         f"band_scheme: {band_scheme}",
-        f"top_prefix_sizes: {list(int(size) for size in top_prefix_sizes)}",
         f"support_extraction_mode: {support_extraction_mode}",
         f"basis_id: {basis.basis_id}",
         f"rank: {int(basis.rank)}",
@@ -891,6 +871,485 @@ def _write_epsilon_summary(path: Path, *, payload: dict[str, object]) -> None:
     write_text_report(path, "\n".join(lines))
 
 
+def _run_pca_band(
+    *,
+    args: argparse.Namespace,
+    stage_start: float,
+    context_timing_seconds: dict[str, float],
+    model,
+    tokenizer,
+    banks_by_split: dict[str, dict[str, object]],
+    data_metadata: dict[str, object],
+    device: torch.device | str,
+    fit_bank_for_basis,
+    layer: int,
+    target_vars: tuple[str, ...],
+    transport_target_vars: tuple[str, ...],
+    layer_dir: Path,
+    basis: LayerPCABasis,
+    basis_path: Path,
+    prompt_records: list[dict[str, object]] | None,
+    pca_fit_seconds: float,
+    num_bands: int,
+    ot_epsilons: tuple[float, ...],
+    ot_top_k_values: tuple[int, ...],
+    ot_lambdas: tuple[float, ...],
+    calibration_family_weights: tuple[float, ...],
+    screen_mask_names: tuple[str, ...],
+    guided_mask_names: tuple[str, ...],
+    guided_subspace_dims: tuple[int, ...] | None,
+) -> dict[str, object]:
+    if len(target_vars) != 1:
+        raise ValueError(
+            "PCA coupling calibration must receive exactly one target variable; "
+            f"got {list(target_vars)}"
+        )
+    target_var = str(target_vars[0])
+    target_suffix = _target_file_suffix(target_var)
+    site_catalog_tag = _site_catalog_tag(
+        site_menu=str(args.site_menu),
+        num_bands=int(num_bands),
+        band_scheme=str(args.band_scheme),
+    )
+    print(
+        f"[PCA OT] layer={int(layer)} bands={int(num_bands)} "
+        f"calibrating target_var={target_var} epsilons={list(float(e) for e in ot_epsilons)}"
+    )
+    site_build_start = perf_counter()
+    pca_sites = _enumerate_pca_sites(
+        basis=basis,
+        token_position_id=str(args.token_position_id),
+        layer=int(layer),
+        site_menu=str(args.site_menu),
+        num_bands=int(num_bands),
+        band_scheme=str(args.band_scheme),
+    )
+    site_metrics = _rotated_site_metrics(basis=basis, sites=pca_sites)
+    pca_bases_by_id = {str(basis.basis_id): basis}
+    site_build_seconds = float(perf_counter() - site_build_start)
+
+    cache_spec = _pca_signature_cache_spec(
+        fit_bank=fit_bank_for_basis,
+        basis=basis,
+        basis_source_mode=str(args.basis_source_mode),
+        token_position_id=str(args.token_position_id),
+        layer=int(layer),
+        site_catalog_tag=site_catalog_tag,
+        signature_mode=str(args.signature_mode),
+        prompt_records=prompt_records,
+    )
+    cache_path = _pca_signature_cache_path(cache_spec=cache_spec)
+    artifact_prepare_load_seconds = 0.0
+    prepared_artifacts = None
+    if bool(args.cache_signatures):
+        artifact_prepare_load_start = perf_counter()
+        prepared_artifacts = load_prepared_alignment_artifacts(
+            cache_path,
+            expected_spec=cache_spec,
+        )
+        artifact_prepare_load_seconds = float(perf_counter() - artifact_prepare_load_start)
+    artifact_prepare_create_seconds = 0.0
+    ot_compare_payloads: list[dict[str, object]] = []
+    ot_fit_cal_start = perf_counter()
+    for epsilon in ot_epsilons:
+        output_stem = (
+            f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+            f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}"
+            f"{target_suffix}_eps-{float(epsilon):g}_ot"
+        )
+        output_path = layer_dir / f"{output_stem}.json"
+        summary_path = layer_dir / f"{output_stem}.txt"
+        compare_payload = _load_existing_payload(output_path) if bool(args.write_epsilon_artifacts) else None
+        if bool(args.write_epsilon_artifacts):
+            if not _compare_payload_matches_target_vars(
+                payload=compare_payload,
+                expected_target_vars=target_vars,
+                expected_transport_target_vars=transport_target_vars,
+            ):
+                compare_payload = None
+        if compare_payload is None:
+            ot_config = OTConfig(
+                method="ot",
+                batch_size=int(args.batch_size),
+                epsilon=float(epsilon),
+                signature_mode=str(args.signature_mode),
+                top_k_values=ot_top_k_values,
+                lambda_values=ot_lambdas,
+                source_target_vars=transport_target_vars,
+                calibration_metric=DEFAULT_CALIBRATION_METRIC,
+                calibration_family_weights=calibration_family_weights,
+                top_k_values_by_var={target_var: ot_top_k_values},
+                lambda_values_by_var={target_var: ot_lambdas},
+                store_prediction_details=False,
+            )
+            if prepared_artifacts is None:
+                artifact_prepare_start = perf_counter()
+                prepared_artifacts = prepare_alignment_artifacts(
+                    model=model,
+                    fit_banks_by_var={
+                        target_var: banks_by_split["train"][target_var]
+                        for target_var in transport_target_vars
+                    },
+                    sites=pca_sites,
+                    device=device,
+                    config=ot_config,
+                    pca_bases_by_id=pca_bases_by_id,
+                )
+                artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
+                if bool(args.cache_signatures):
+                    save_prepared_alignment_artifacts(
+                        cache_path,
+                        prepared_artifacts=prepared_artifacts,
+                        cache_spec=cache_spec,
+                    )
+            method_payloads = [
+                run_alignment_pipeline(
+                    model=model,
+                    fit_banks_by_var={
+                        source_var: banks_by_split["train"][source_var]
+                        for source_var in transport_target_vars
+                    },
+                    calibration_bank=banks_by_split["calibration"][target_var],
+                    holdout_bank=banks_by_split["test"][target_var],
+                    sites=pca_sites,
+                    device=device,
+                    tokenizer=tokenizer,
+                    config=ot_config,
+                    prepared_artifacts=prepared_artifacts,
+                    pca_bases_by_id=pca_bases_by_id,
+                )
+            ]
+            compare_payload = {
+                "kind": "mcqa_ot_pca_focus_epsilon",
+                "layer": int(layer),
+                "token_position_id": str(args.token_position_id),
+                "site_menu": str(args.site_menu),
+                "num_bands": int(num_bands),
+                "band_scheme": str(args.band_scheme),
+                "basis_source_mode": str(args.basis_source_mode),
+                "ot_epsilon": float(epsilon),
+                "signature_mode": str(args.signature_mode),
+                "target_vars": [str(target_var) for target_var in target_vars],
+                "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
+                "ot_top_k_values": [int(value) for value in ot_top_k_values],
+                "ot_lambdas": [float(value) for value in ot_lambdas],
+                "calibration_family_weights": [float(weight) for weight in calibration_family_weights],
+                "model_name": base_run.MODEL_NAME,
+                "basis": {
+                    "basis_id": str(basis.basis_id),
+                    "rank": int(basis.rank),
+                    "hidden_size": int(basis.hidden_size),
+                    "num_fit_states": int(basis.num_fit_states),
+                    "path": str(basis_path),
+                    "fit_prompt_record_count": 0 if prompt_records is None else len(prompt_records),
+                },
+                "site_labels": [site.label for site in pca_sites],
+                "site_metrics": site_metrics,
+                "data": data_metadata,
+                "method_payloads": {"ot": method_payloads},
+            }
+            compare_payload = _compact_compare_payload(compare_payload)
+            if bool(args.write_epsilon_artifacts):
+                write_json(output_path, compare_payload)
+                _write_epsilon_summary(summary_path, payload=compare_payload)
+        else:
+            compare_payload = _compact_compare_payload(compare_payload)
+        ot_compare_payloads.append(compare_payload)
+    _synchronize_if_cuda(device)
+    ot_fit_cal_seconds = float(perf_counter() - ot_fit_cal_start)
+    artifact_prepare_recorded_seconds = resolve_recorded_artifact_prepare_seconds(
+        prepared_artifacts,
+        artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+    )
+    if artifact_prepare_recorded_seconds <= 0.0:
+        for compare_payload in ot_compare_payloads:
+            if not isinstance(compare_payload, dict):
+                continue
+            method_payloads = compare_payload.get("method_payloads", {})
+            if not isinstance(method_payloads, dict):
+                continue
+            for method_payload in method_payloads.get("ot", []):
+                if not isinstance(method_payload, dict):
+                    continue
+                artifact_prepare_recorded_seconds = max(
+                    artifact_prepare_recorded_seconds,
+                    float(method_payload.get("artifact_prepare_recorded_seconds", 0.0)),
+                    float(method_payload.get("recorded_signature_prepare_runtime_seconds", 0.0)),
+                )
+
+    support_start = perf_counter()
+    support_by_var = extract_selected_site_support(
+        ot_run_payloads=ot_compare_payloads,
+        sites=pca_sites,
+    )
+    support_path = None
+    if bool(args.write_support_artifact):
+        support_path = layer_dir / (
+            f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+            f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}"
+            f"{target_suffix}_support.json"
+        )
+        write_json(support_path, support_by_var)
+    support_extract_seconds = float(perf_counter() - support_start)
+    best_ot_by_var = _best_ot_records(ot_compare_payloads)
+
+    das_screen_start = perf_counter()
+    screen_payloads = _run_pca_das_from_support(
+        model=model,
+        tokenizer=tokenizer,
+        banks_by_split=banks_by_split,
+        device=device,
+        layer_dir=layer_dir,
+        layer=int(layer),
+        token_position_id=str(args.token_position_id),
+        site_catalog_tag=site_catalog_tag,
+        basis_source_mode=str(args.basis_source_mode),
+        signature_mode=str(args.signature_mode),
+        target_vars=target_vars,
+        support_by_var=support_by_var,
+        pca_sites=pca_sites,
+        pca_bases_by_id=pca_bases_by_id,
+        model_hidden_size=int(model.config.hidden_size),
+        batch_size=int(args.batch_size),
+        enabled=bool(args.screen_das),
+        method_suffix="das_screen",
+        method_name="das_pca_screen",
+        title="MCQA PCA DAS Screen Summary",
+        mask_names=screen_mask_names,
+        max_epochs=int(args.screen_max_epochs),
+        min_epochs=int(args.screen_min_epochs),
+        plateau_patience=1,
+        plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
+        learning_rate=base_run.DAS_LEARNING_RATE,
+        explicit_subspace_dims=None,
+        subspace_dim_resolver=_screen_subspace_dims,
+        restarts=int(args.screen_restarts),
+    )
+    _synchronize_if_cuda(device)
+    das_screen_seconds = float(perf_counter() - das_screen_start)
+    das_guided_start = perf_counter()
+    guided_payloads = _run_pca_das_from_support(
+        model=model,
+        tokenizer=tokenizer,
+        banks_by_split=banks_by_split,
+        device=device,
+        layer_dir=layer_dir,
+        layer=int(layer),
+        token_position_id=str(args.token_position_id),
+        site_catalog_tag=site_catalog_tag,
+        basis_source_mode=str(args.basis_source_mode),
+        signature_mode=str(args.signature_mode),
+        target_vars=target_vars,
+        support_by_var=support_by_var,
+        pca_sites=pca_sites,
+        pca_bases_by_id=pca_bases_by_id,
+        model_hidden_size=int(model.config.hidden_size),
+        batch_size=int(args.batch_size),
+        enabled=bool(args.guided_das),
+        method_suffix="das_guided",
+        method_name="das_pca_guided",
+        title="MCQA PCA Guided DAS Summary",
+        mask_names=guided_mask_names,
+        max_epochs=int(args.guided_max_epochs),
+        min_epochs=int(args.guided_min_epochs),
+        plateau_patience=int(base_run.DAS_PLATEAU_PATIENCE),
+        plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
+        learning_rate=base_run.DAS_LEARNING_RATE,
+        explicit_subspace_dims=guided_subspace_dims,
+        subspace_dim_resolver=_guided_subspace_dims,
+        restarts=int(args.guided_restarts),
+    )
+    _synchronize_if_cuda(device)
+    das_guided_seconds = float(perf_counter() - das_guided_start)
+    localization_wall_runtime_seconds = float(
+        pca_fit_seconds
+        + site_build_seconds
+        + artifact_prepare_load_seconds
+        + artifact_prepare_create_seconds
+        + ot_fit_cal_seconds
+        + support_extract_seconds
+    )
+    localization_runtime_seconds = adjust_runtime_for_cached_signatures(
+        wall_runtime_seconds=localization_wall_runtime_seconds,
+        artifact_prepare_load_seconds=artifact_prepare_load_seconds,
+        artifact_prepare_create_seconds=artifact_prepare_create_seconds,
+        artifact_prepare_recorded_seconds=artifact_prepare_recorded_seconds,
+    )
+
+    layer_summary_path = layer_dir / (
+        f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+        f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}"
+        f"{target_suffix}_summary.txt"
+    )
+    write_text_report(
+        layer_summary_path,
+        _format_layer_summary(
+            layer=int(layer),
+            token_position_id=str(args.token_position_id),
+            signature_mode=str(args.signature_mode),
+            target_vars=target_vars,
+            transport_target_vars=transport_target_vars,
+            basis_source_mode=str(args.basis_source_mode),
+            site_menu=str(args.site_menu),
+            num_bands=int(num_bands),
+            band_scheme=str(args.band_scheme),
+            basis=basis,
+            site_metrics=site_metrics,
+            ot_compare_payloads=ot_compare_payloads,
+            support_by_var=support_by_var,
+            support_extraction_mode="selected_only",
+            screen_payloads=screen_payloads,
+            guided_payloads=guided_payloads,
+        ),
+    )
+
+    plot_support_payload = {
+        "kind": "mcqa_plot_pca_support_layer",
+        "layer": int(layer),
+        "token_position_id": str(args.token_position_id),
+        "target_vars": [str(target_var) for target_var in target_vars],
+        "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
+        "site_menu": str(args.site_menu),
+        "num_bands": int(num_bands),
+        "band_scheme": str(args.band_scheme),
+        "basis_source_mode": str(args.basis_source_mode),
+        "signature_mode": str(args.signature_mode),
+        "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
+        "basis_path": str(basis_path),
+        "basis": _basis_metadata(basis=basis, basis_path=basis_path, prompt_records=prompt_records),
+        "fit_prompt_record_count": 0 if prompt_records is None else len(prompt_records),
+        "pca_fit_runtime_seconds": float(pca_fit_seconds),
+        "pca_site_build_runtime_seconds": float(site_build_seconds),
+        "site_labels": [site.label for site in pca_sites],
+        "site_metrics": site_metrics,
+        "support_score_slack": float(args.support_score_slack),
+        "support_extraction_mode": "selected_only",
+        "support_by_var": support_by_var,
+        "method_by_var": best_ot_by_var,
+        "screen_mask_names": [str(mask_name) for mask_name in screen_mask_names],
+        "screen_das_enabled": bool(args.screen_das),
+        "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
+        "guided_subspace_dims": None if guided_subspace_dims is None else [int(dim) for dim in guided_subspace_dims],
+        "guided_das_enabled": bool(args.guided_das),
+        "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)) if prepared_artifacts else False,
+        "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
+        "signature_prepare_runtime_seconds": float(artifact_prepare_recorded_seconds),
+        "localization_runtime_seconds": float(localization_runtime_seconds),
+        "runtime_seconds": float(localization_runtime_seconds),
+        "wall_runtime_seconds": float(localization_wall_runtime_seconds),
+        "context_timing_seconds": context_timing_seconds,
+        "timing_seconds": {
+            "t_model_load": float(context_timing_seconds.get("t_model_load", 0.0)),
+            "t_data_load": float(context_timing_seconds.get("t_data_load", 0.0)),
+            "t_bank_build": float(context_timing_seconds.get("t_bank_build", 0.0)),
+            "t_factual_filter": float(context_timing_seconds.get("t_factual_filter", 0.0)),
+            "t_context_total_wall": float(context_timing_seconds.get("t_context_total_wall", 0.0)),
+            "t_stageB_pca_fit": float(pca_fit_seconds),
+            "t_stageB_pca_site_build": float(site_build_seconds),
+            "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
+            "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
+            "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
+            "t_signature_prepare": float(artifact_prepare_recorded_seconds),
+            "t_stageB_pca_ot_fit_cal": float(ot_fit_cal_seconds),
+            "t_support_extract": float(support_extract_seconds),
+            "t_stageB_pca_localization": float(localization_runtime_seconds),
+            "t_layer_total_wall": float(localization_wall_runtime_seconds),
+            "t_stage_total_wall_so_far": float(perf_counter() - stage_start),
+        },
+        "screen_output_paths": {
+            str(target_var): str(
+                layer_dir / (
+                    f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+                    f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_{str(target_var)}_das_screen.json"
+                )
+            )
+            for target_var in screen_payloads
+        },
+        "guided_output_paths": {
+            str(target_var): str(
+                layer_dir / (
+                    f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+                    f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_{str(target_var)}_das_guided.json"
+                )
+            )
+            for target_var in guided_payloads
+        },
+        "ot_output_paths": [
+            str(
+                layer_dir / (
+                    f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+                    f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}"
+                    f"{target_suffix}_eps-{float(epsilon):g}_ot.json"
+                )
+            )
+            for epsilon in ot_epsilons
+            if bool(args.write_epsilon_artifacts)
+        ],
+        "summary_path": str(layer_summary_path),
+    }
+    plot_support_payload_path = layer_dir / (
+        f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+        f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}"
+        f"{target_suffix}_plot_pca_support.json"
+    )
+    write_json(plot_support_payload_path, plot_support_payload)
+
+    payload_path_for_manifest = plot_support_payload_path
+    runtime_for_manifest = localization_runtime_seconds
+    timing_for_manifest = plot_support_payload["timing_seconds"]
+    if bool(args.guided_das) or bool(args.screen_das):
+        guided_summary_payload = {
+            "kind": "mcqa_plot_das_pca_support_layer",
+            "layer": int(layer),
+            "token_position_id": str(args.token_position_id),
+            "target_vars": [str(target_var) for target_var in target_vars],
+            "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
+            "site_menu": str(args.site_menu),
+            "num_bands": int(num_bands),
+            "band_scheme": str(args.band_scheme),
+            "basis_source_mode": str(args.basis_source_mode),
+            "signature_mode": str(args.signature_mode),
+            "support_path": None if support_path is None else str(support_path),
+            "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
+            "support_extraction_mode": "selected_only",
+            "guided_output_paths": plot_support_payload["guided_output_paths"],
+            "screen_output_paths": plot_support_payload["screen_output_paths"],
+            "guided_das_enabled": bool(args.guided_das),
+            "screen_das_enabled": bool(args.screen_das),
+            "runtime_seconds": float(das_screen_seconds + das_guided_seconds),
+            "localization_runtime_seconds": float(localization_runtime_seconds),
+            "timing_seconds": {
+                "t_stageC_das_screen": float(das_screen_seconds),
+                "t_stageC_das_full": float(das_guided_seconds),
+                "t_stageC_total_wall": float(das_screen_seconds + das_guided_seconds),
+            },
+        }
+        guided_summary_payload_path = layer_dir / (
+            f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+            f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}"
+            f"{target_suffix}_plot_das_pca_support.json"
+        )
+        write_json(guided_summary_payload_path, guided_summary_payload)
+        payload_path_for_manifest = guided_summary_payload_path
+        runtime_for_manifest = float(das_screen_seconds + das_guided_seconds)
+        timing_for_manifest = guided_summary_payload["timing_seconds"]
+    return {
+        "layer": int(layer),
+        "token_position_id": str(args.token_position_id),
+        "site_menu": str(args.site_menu),
+        "num_bands": int(num_bands),
+        "band_scheme": str(args.band_scheme),
+        "basis_source_mode": str(args.basis_source_mode),
+        "signature_mode": str(args.signature_mode),
+        "screen_das_enabled": bool(args.screen_das),
+        "guided_das_enabled": bool(args.guided_das),
+        "runtime_seconds": float(runtime_for_manifest),
+        "timing_seconds": timing_for_manifest,
+        "summary_path": str(layer_summary_path),
+        "payload_path": str(payload_path_for_manifest),
+    }
+
+
 def main() -> None:
     stage_start = perf_counter()
     parser = _build_parser()
@@ -899,8 +1358,15 @@ def main() -> None:
     layers = DEFAULT_LAYERS if args.layers is None else tuple(_parse_csv_ints(args.layers) or [])
     if not layers:
         raise ValueError("No layers selected")
-    if int(args.num_bands) <= 0:
-        raise ValueError("num_bands must be > 0")
+    num_bands_values = tuple(
+        dict.fromkeys(
+            _parse_csv_ints(args.num_bands_values)
+            if args.num_bands_values is not None
+            else [int(args.num_bands)]
+        )
+    )
+    if not num_bands_values or any(int(num_bands) <= 0 for num_bands in num_bands_values):
+        raise ValueError("num_bands values must be > 0")
     requested_target_vars = tuple(
         canonicalize_target_var(target_var)
         for target_var in (_parse_csv_strings(args.target_vars) or list(DEFAULT_TARGET_VARS))
@@ -912,7 +1378,6 @@ def main() -> None:
     calibration_family_weights = tuple(
         _parse_csv_floats(args.calibration_family_weights) or list(DEFAULT_CALIBRATION_FAMILY_WEIGHTS)
     )
-    top_prefix_sizes = tuple(_parse_csv_ints(args.top_prefix_sizes) or list(DEFAULT_TOP_PREFIX_SIZES))
     screen_mask_names = tuple(DEFAULT_SCREEN_MASK_NAMES)
     guided_mask_names = tuple(DEFAULT_GUIDED_DAS_MASK_NAMES)
     guided_subspace_dims = None if args.guided_subspace_dims is None else tuple(_parse_csv_ints(args.guided_subspace_dims) or [])
@@ -943,12 +1408,6 @@ def main() -> None:
         raise ValueError(f"Unknown token_position_id {args.token_position_id!r}")
 
     manifest_runs: list[dict[str, object]] = []
-    site_catalog_tag = _site_catalog_tag(
-        site_menu=str(args.site_menu),
-        num_bands=int(args.num_bands),
-        band_scheme=str(args.band_scheme),
-        top_prefix_sizes=top_prefix_sizes,
-    )
 
     for layer in layers:
         target_vars = layer_target_vars.get(int(layer), requested_target_vars)
@@ -1005,439 +1464,37 @@ def main() -> None:
             )
         _synchronize_if_cuda(device)
         pca_fit_seconds = float(perf_counter() - pca_fit_start)
-        site_build_start = perf_counter()
-        pca_sites = _enumerate_pca_sites(
-            basis=basis,
-            token_position_id=str(args.token_position_id),
-            layer=int(layer),
-            site_menu=str(args.site_menu),
-            num_bands=int(args.num_bands),
-            band_scheme=str(args.band_scheme),
-            top_prefix_sizes=top_prefix_sizes,
-        )
-        site_metrics = _rotated_site_metrics(basis=basis, sites=pca_sites)
-        pca_bases_by_id = {str(basis.basis_id): basis}
-        site_build_seconds = float(perf_counter() - site_build_start)
-
-        cache_spec = _pca_signature_cache_spec(
-            fit_bank=fit_bank_for_basis,
-            basis=basis,
-            basis_source_mode=str(args.basis_source_mode),
-            token_position_id=str(args.token_position_id),
-            layer=int(layer),
-            site_catalog_tag=site_catalog_tag,
-            signature_mode=str(args.signature_mode),
-            prompt_records=prompt_records,
-        )
-        cache_path = _pca_signature_cache_path(cache_spec=cache_spec)
-        artifact_prepare_load_seconds = 0.0
-        prepared_artifacts = None
-        if bool(args.cache_signatures):
-            artifact_prepare_load_start = perf_counter()
-            prepared_artifacts = load_prepared_alignment_artifacts(
-                cache_path,
-                expected_spec=cache_spec,
-            )
-            artifact_prepare_load_seconds = float(perf_counter() - artifact_prepare_load_start)
-        artifact_prepare_create_seconds = 0.0
-        ot_compare_payloads: list[dict[str, object]] = []
-        ot_fit_cal_start = perf_counter()
-        for epsilon in ot_epsilons:
-            output_stem = (
-                f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-                f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_eps-{float(epsilon):g}_ot"
-            )
-            output_path = layer_dir / f"{output_stem}.json"
-            summary_path = layer_dir / f"{output_stem}.txt"
-            compare_payload = _load_existing_payload(output_path) if bool(args.write_epsilon_artifacts) else None
-            if bool(args.write_epsilon_artifacts):
-                if not _compare_payload_matches_target_vars(
-                    payload=compare_payload,
-                    expected_target_vars=target_vars,
-                    expected_transport_target_vars=transport_target_vars,
-                ):
-                    compare_payload = None
-            if compare_payload is None:
-                ot_config = OTConfig(
-                    method="ot",
-                    batch_size=int(args.batch_size),
-                    epsilon=float(epsilon),
-                    signature_mode=str(args.signature_mode),
-                    top_k_values=ot_top_k_values,
-                    lambda_values=ot_lambdas,
-                    source_target_vars=transport_target_vars,
-                    calibration_metric=DEFAULT_CALIBRATION_METRIC,
-                    calibration_family_weights=calibration_family_weights,
-                    top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
-                    lambda_values_by_var={target_var: ot_lambdas for target_var in target_vars},
-                    store_prediction_details=False,
-                )
-                if prepared_artifacts is None:
-                    artifact_prepare_start = perf_counter()
-                    prepared_artifacts = prepare_alignment_artifacts(
+        for target_var in target_vars:
+            for num_bands in num_bands_values:
+                manifest_runs.append(
+                    _run_pca_band(
+                        args=args,
+                        stage_start=stage_start,
+                        context_timing_seconds=context_timing_seconds,
                         model=model,
-                        fit_banks_by_var={target_var: banks_by_split["train"][target_var] for target_var in transport_target_vars},
-                        sites=pca_sites,
+                        tokenizer=tokenizer,
+                        banks_by_split=banks_by_split,
+                        data_metadata=data_metadata,
                         device=device,
-                        config=ot_config,
-                        pca_bases_by_id=pca_bases_by_id,
-                    )
-                    artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
-                    if bool(args.cache_signatures):
-                        save_prepared_alignment_artifacts(
-                            cache_path,
-                            prepared_artifacts=prepared_artifacts,
-                            cache_spec=cache_spec,
-                        )
-                method_payloads = []
-                for target_var in target_vars:
-                    method_payloads.append(
-                        run_alignment_pipeline(
-                            model=model,
-                            fit_banks_by_var={source_var: banks_by_split["train"][source_var] for source_var in transport_target_vars},
-                            calibration_bank=banks_by_split["calibration"][target_var],
-                            holdout_bank=banks_by_split["test"][target_var],
-                            sites=pca_sites,
-                            device=device,
-                            tokenizer=tokenizer,
-                            config=ot_config,
-                            prepared_artifacts=prepared_artifacts,
-                            pca_bases_by_id=pca_bases_by_id,
-                        )
-                    )
-                compare_payload = {
-                    "kind": "mcqa_ot_pca_focus_epsilon",
-                    "layer": int(layer),
-                    "token_position_id": str(args.token_position_id),
-                    "site_menu": str(args.site_menu),
-                    "num_bands": int(args.num_bands),
-                    "band_scheme": str(args.band_scheme),
-                    "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
-                    "basis_source_mode": str(args.basis_source_mode),
-                    "ot_epsilon": float(epsilon),
-                    "signature_mode": str(args.signature_mode),
-                    "target_vars": [str(target_var) for target_var in target_vars],
-                    "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
-                    "ot_top_k_values": [int(value) for value in ot_top_k_values],
-                    "ot_lambdas": [float(value) for value in ot_lambdas],
-                    "calibration_family_weights": [float(weight) for weight in calibration_family_weights],
-                    "model_name": base_run.MODEL_NAME,
-                    "basis": {
-                        "basis_id": str(basis.basis_id),
-                        "rank": int(basis.rank),
-                        "hidden_size": int(basis.hidden_size),
-                        "num_fit_states": int(basis.num_fit_states),
-                        "path": str(basis_path),
-                        "fit_prompt_record_count": 0 if prompt_records is None else len(prompt_records),
-                    },
-                    "site_labels": [site.label for site in pca_sites],
-                    "site_metrics": site_metrics,
-                    "data": data_metadata,
-                    "method_payloads": {"ot": method_payloads},
-                }
-                compare_payload = _compact_compare_payload(compare_payload)
-                if bool(args.write_epsilon_artifacts):
-                    write_json(output_path, compare_payload)
-                    _write_epsilon_summary(summary_path, payload=compare_payload)
-            else:
-                compare_payload = _compact_compare_payload(compare_payload)
-            ot_compare_payloads.append(compare_payload)
-        _synchronize_if_cuda(device)
-        ot_fit_cal_seconds = float(perf_counter() - ot_fit_cal_start)
-        artifact_prepare_recorded_seconds = resolve_recorded_artifact_prepare_seconds(
-            prepared_artifacts,
-            artifact_prepare_create_seconds=artifact_prepare_create_seconds,
-        )
-        if artifact_prepare_recorded_seconds <= 0.0:
-            for compare_payload in ot_compare_payloads:
-                if not isinstance(compare_payload, dict):
-                    continue
-                method_payloads = compare_payload.get("method_payloads", {})
-                if not isinstance(method_payloads, dict):
-                    continue
-                for method_payload in method_payloads.get("ot", []):
-                    if not isinstance(method_payload, dict):
-                        continue
-                    artifact_prepare_recorded_seconds = max(
-                        artifact_prepare_recorded_seconds,
-                        float(method_payload.get("artifact_prepare_recorded_seconds", 0.0)),
-                        float(method_payload.get("recorded_signature_prepare_runtime_seconds", 0.0)),
-                    )
-
-        support_start = perf_counter()
-        support_by_var = extract_selected_site_support(
-            ot_run_payloads=ot_compare_payloads,
-            sites=pca_sites,
-        )
-        support_path = None
-        if bool(args.write_support_artifact):
-            support_path = layer_dir / (
-                f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-                f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_support.json"
-            )
-            write_json(support_path, support_by_var)
-        support_extract_seconds = float(perf_counter() - support_start)
-        best_ot_by_var = _best_ot_records(ot_compare_payloads)
-
-        das_screen_start = perf_counter()
-        screen_payloads = _run_pca_das_from_support(
-            model=model,
-            tokenizer=tokenizer,
-            banks_by_split=banks_by_split,
-            device=device,
-            layer_dir=layer_dir,
-            layer=int(layer),
-            token_position_id=str(args.token_position_id),
-            site_catalog_tag=site_catalog_tag,
-            basis_source_mode=str(args.basis_source_mode),
-            signature_mode=str(args.signature_mode),
-            target_vars=target_vars,
-            support_by_var=support_by_var,
-            pca_sites=pca_sites,
-            pca_bases_by_id=pca_bases_by_id,
-            model_hidden_size=int(model.config.hidden_size),
-            batch_size=int(args.batch_size),
-            enabled=bool(args.screen_das),
-            method_suffix="das_screen",
-            method_name="das_pca_screen",
-            title="MCQA PCA DAS Screen Summary",
-            mask_names=screen_mask_names,
-            max_epochs=int(args.screen_max_epochs),
-            min_epochs=int(args.screen_min_epochs),
-            plateau_patience=1,
-            plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
-            learning_rate=base_run.DAS_LEARNING_RATE,
-            explicit_subspace_dims=None,
-            subspace_dim_resolver=_screen_subspace_dims,
-            restarts=int(args.screen_restarts),
-        )
-        _synchronize_if_cuda(device)
-        das_screen_seconds = float(perf_counter() - das_screen_start)
-        das_guided_start = perf_counter()
-        guided_payloads = _run_pca_das_from_support(
-            model=model,
-            tokenizer=tokenizer,
-            banks_by_split=banks_by_split,
-            device=device,
-            layer_dir=layer_dir,
-            layer=int(layer),
-            token_position_id=str(args.token_position_id),
-            site_catalog_tag=site_catalog_tag,
-            basis_source_mode=str(args.basis_source_mode),
-            signature_mode=str(args.signature_mode),
-            target_vars=target_vars,
-            support_by_var=support_by_var,
-            pca_sites=pca_sites,
-            pca_bases_by_id=pca_bases_by_id,
-            model_hidden_size=int(model.config.hidden_size),
-            batch_size=int(args.batch_size),
-            enabled=bool(args.guided_das),
-            method_suffix="das_guided",
-            method_name="das_pca_guided",
-            title="MCQA PCA Guided DAS Summary",
-            mask_names=guided_mask_names,
-            max_epochs=int(args.guided_max_epochs),
-            min_epochs=int(args.guided_min_epochs),
-            plateau_patience=int(base_run.DAS_PLATEAU_PATIENCE),
-            plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
-            learning_rate=base_run.DAS_LEARNING_RATE,
-            explicit_subspace_dims=guided_subspace_dims,
-            subspace_dim_resolver=_guided_subspace_dims,
-            restarts=int(args.guided_restarts),
-        )
-        _synchronize_if_cuda(device)
-        das_guided_seconds = float(perf_counter() - das_guided_start)
-        layer_total_seconds = float(perf_counter() - layer_start)
-        localization_wall_runtime_seconds = float(
-            pca_fit_seconds
-            + site_build_seconds
-            + artifact_prepare_load_seconds
-            + artifact_prepare_create_seconds
-            + ot_fit_cal_seconds
-            + support_extract_seconds
-        )
-        localization_runtime_seconds = adjust_runtime_for_cached_signatures(
-            wall_runtime_seconds=localization_wall_runtime_seconds,
-            artifact_prepare_load_seconds=artifact_prepare_load_seconds,
-            artifact_prepare_create_seconds=artifact_prepare_create_seconds,
-            artifact_prepare_recorded_seconds=artifact_prepare_recorded_seconds,
-        )
-
-        layer_summary_path = layer_dir / (
-            f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-            f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_summary.txt"
-        )
-        write_text_report(
-            layer_summary_path,
-            _format_layer_summary(
-                layer=int(layer),
-                token_position_id=str(args.token_position_id),
-                signature_mode=str(args.signature_mode),
-                target_vars=target_vars,
-                transport_target_vars=transport_target_vars,
-                basis_source_mode=str(args.basis_source_mode),
-                site_menu=str(args.site_menu),
-                num_bands=int(args.num_bands),
-                band_scheme=str(args.band_scheme),
-                top_prefix_sizes=top_prefix_sizes,
-                basis=basis,
-                site_metrics=site_metrics,
-                ot_compare_payloads=ot_compare_payloads,
-                support_by_var=support_by_var,
-                support_extraction_mode="selected_only",
-                screen_payloads=screen_payloads,
-                guided_payloads=guided_payloads,
-            ),
-        )
-
-        plot_support_payload = {
-            "kind": "mcqa_plot_pca_support_layer",
-            "layer": int(layer),
-            "token_position_id": str(args.token_position_id),
-            "target_vars": [str(target_var) for target_var in target_vars],
-            "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
-            "site_menu": str(args.site_menu),
-            "num_bands": int(args.num_bands),
-            "band_scheme": str(args.band_scheme),
-            "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
-            "basis_source_mode": str(args.basis_source_mode),
-            "signature_mode": str(args.signature_mode),
-            "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
-            "basis_path": str(basis_path),
-            "basis": _basis_metadata(basis=basis, basis_path=basis_path, prompt_records=prompt_records),
-            "fit_prompt_record_count": 0 if prompt_records is None else len(prompt_records),
-            "pca_fit_runtime_seconds": float(pca_fit_seconds),
-            "pca_site_build_runtime_seconds": float(site_build_seconds),
-            "site_labels": [site.label for site in pca_sites],
-            "site_metrics": site_metrics,
-            "support_score_slack": float(args.support_score_slack),
-            "support_extraction_mode": "selected_only",
-            "support_by_var": support_by_var,
-            "method_by_var": best_ot_by_var,
-            "screen_mask_names": [str(mask_name) for mask_name in screen_mask_names],
-            "screen_das_enabled": bool(args.screen_das),
-            "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
-            "guided_subspace_dims": None if guided_subspace_dims is None else [int(dim) for dim in guided_subspace_dims],
-            "guided_das_enabled": bool(args.guided_das),
-            "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)) if prepared_artifacts else False,
-            "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
-            "signature_prepare_runtime_seconds": float(artifact_prepare_recorded_seconds),
-            "localization_runtime_seconds": float(localization_runtime_seconds),
-            "runtime_seconds": float(localization_runtime_seconds),
-            "wall_runtime_seconds": float(localization_wall_runtime_seconds),
-            "context_timing_seconds": context_timing_seconds,
-            "timing_seconds": {
-                "t_model_load": float(context_timing_seconds.get("t_model_load", 0.0)),
-                "t_data_load": float(context_timing_seconds.get("t_data_load", 0.0)),
-                "t_bank_build": float(context_timing_seconds.get("t_bank_build", 0.0)),
-                "t_factual_filter": float(context_timing_seconds.get("t_factual_filter", 0.0)),
-                "t_context_total_wall": float(context_timing_seconds.get("t_context_total_wall", 0.0)),
-                "t_stageB_pca_fit": float(pca_fit_seconds),
-                "t_stageB_pca_site_build": float(site_build_seconds),
-                "t_artifact_prepare_load": float(artifact_prepare_load_seconds),
-                "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
-                "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
-                "t_signature_prepare": float(artifact_prepare_recorded_seconds),
-                "t_stageB_pca_ot_fit_cal": float(ot_fit_cal_seconds),
-                "t_support_extract": float(support_extract_seconds),
-                "t_stageB_pca_localization": float(localization_runtime_seconds),
-                "t_layer_total_wall": float(localization_wall_runtime_seconds),
-                "t_stage_total_wall_so_far": float(perf_counter() - stage_start),
-            },
-            "screen_output_paths": {
-                str(target_var): str(
-                    layer_dir / (
-                        f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-                        f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_{str(target_var)}_das_screen.json"
+                        fit_bank_for_basis=fit_bank_for_basis,
+                        layer=int(layer),
+                        target_vars=(str(target_var),),
+                        transport_target_vars=transport_target_vars,
+                        layer_dir=layer_dir,
+                        basis=basis,
+                        basis_path=basis_path,
+                        prompt_records=prompt_records,
+                        pca_fit_seconds=pca_fit_seconds,
+                        num_bands=int(num_bands),
+                        ot_epsilons=ot_epsilons,
+                        ot_top_k_values=ot_top_k_values,
+                        ot_lambdas=ot_lambdas,
+                        calibration_family_weights=calibration_family_weights,
+                        screen_mask_names=screen_mask_names,
+                        guided_mask_names=guided_mask_names,
+                        guided_subspace_dims=guided_subspace_dims,
                     )
                 )
-                for target_var in screen_payloads
-            },
-            "guided_output_paths": {
-                str(target_var): str(
-                    layer_dir / (
-                        f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-                        f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_{str(target_var)}_das_guided.json"
-                    )
-                )
-                for target_var in guided_payloads
-            },
-            "ot_output_paths": [
-                str(
-                    layer_dir / (
-                        f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-                        f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_eps-{float(epsilon):g}_ot.json"
-                    )
-                )
-                for epsilon in ot_epsilons
-                if bool(args.write_epsilon_artifacts)
-            ],
-            "summary_path": str(layer_summary_path),
-        }
-        plot_support_payload_path = layer_dir / (
-            f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-            f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_plot_pca_support.json"
-        )
-        write_json(plot_support_payload_path, plot_support_payload)
-
-        payload_path_for_manifest = plot_support_payload_path
-        runtime_for_manifest = localization_runtime_seconds
-        timing_for_manifest = plot_support_payload["timing_seconds"]
-        if bool(args.guided_das) or bool(args.screen_das):
-            guided_summary_payload = {
-                "kind": "mcqa_plot_das_pca_support_layer",
-                "layer": int(layer),
-                "token_position_id": str(args.token_position_id),
-                "target_vars": [str(target_var) for target_var in target_vars],
-                "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
-                "site_menu": str(args.site_menu),
-                "num_bands": int(args.num_bands),
-                "band_scheme": str(args.band_scheme),
-                "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
-                "basis_source_mode": str(args.basis_source_mode),
-                "signature_mode": str(args.signature_mode),
-                "support_path": None if support_path is None else str(support_path),
-                "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
-                "support_extraction_mode": "selected_only",
-                "guided_output_paths": plot_support_payload["guided_output_paths"],
-                "screen_output_paths": plot_support_payload["screen_output_paths"],
-                "guided_das_enabled": bool(args.guided_das),
-                "screen_das_enabled": bool(args.screen_das),
-                "runtime_seconds": float(das_screen_seconds + das_guided_seconds),
-                "localization_runtime_seconds": float(localization_runtime_seconds),
-                "timing_seconds": {
-                    "t_stageC_das_screen": float(das_screen_seconds),
-                    "t_stageC_das_full": float(das_guided_seconds),
-                    "t_stageC_total_wall": float(das_screen_seconds + das_guided_seconds),
-                },
-            }
-            guided_summary_payload_path = layer_dir / (
-                f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-                f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_plot_das_pca_support.json"
-            )
-            write_json(guided_summary_payload_path, guided_summary_payload)
-            payload_path_for_manifest = guided_summary_payload_path
-            runtime_for_manifest = float(das_screen_seconds + das_guided_seconds)
-            timing_for_manifest = guided_summary_payload["timing_seconds"]
-        manifest_runs.append(
-            {
-                "layer": int(layer),
-                "token_position_id": str(args.token_position_id),
-                "site_menu": str(args.site_menu),
-                "num_bands": int(args.num_bands),
-                "band_scheme": str(args.band_scheme),
-                "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
-                "basis_source_mode": str(args.basis_source_mode),
-                "signature_mode": str(args.signature_mode),
-                "screen_das_enabled": bool(args.screen_das),
-                "guided_das_enabled": bool(args.guided_das),
-                "runtime_seconds": float(runtime_for_manifest),
-                "timing_seconds": timing_for_manifest,
-                "summary_path": str(layer_summary_path),
-                "payload_path": str(payload_path_for_manifest),
-            }
-        )
-
     manifest_path = sweep_root / "layer_sweep_manifest.json"
     existing_manifest_runs = _load_existing_runs(manifest_path)
     current_payload_paths = {str(run["payload_path"]) for run in manifest_runs}
@@ -1448,9 +1505,8 @@ def main() -> None:
             "layers": [int(layer) for layer in layers],
             "token_position_id": str(args.token_position_id),
             "site_menu": str(args.site_menu),
-            "num_bands": int(args.num_bands),
+            "num_bands_values": [int(num_bands) for num_bands in num_bands_values],
             "band_scheme": str(args.band_scheme),
-            "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
             "basis_source_mode": str(args.basis_source_mode),
             "signature_mode": str(args.signature_mode),
             "screen_das_enabled": bool(args.screen_das),

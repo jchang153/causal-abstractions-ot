@@ -33,11 +33,10 @@ DEFAULT_REGULAR_DAS_SUBSPACE_DIMS = (
     2048,
     2304,
 )
-DEFAULT_PCA_SITE_MENUS = ("partition", "mixed")
+DEFAULT_PCA_SITE_MENUS = ("partition",)
 DEFAULT_PCA_BASIS_SOURCE_MODES = ("pair_bank", "all_variants")
 DEFAULT_PCA_NUM_BANDS = 8
 DEFAULT_PCA_BAND_SCHEME = "equal"
-DEFAULT_PCA_TOP_PREFIX_SIZES = (8, 16, 32, 64)
 DEFAULT_GUIDED_PCA_CONFIGS = ("pair_bank:partition", "all_variants:partition")
 DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
 DEFAULT_STAGES = ("vanilla_ot", "pca_ot", "pca_guided_das", "regular_das")
@@ -68,11 +67,8 @@ def _parse_csv_floats(value: str | None) -> tuple[float, ...]:
     return tuple(float(item) for item in _parse_csv_strings(value))
 
 
-def _site_catalog_tag(*, site_menu: str, num_bands: int, band_scheme: str, top_prefix_sizes: tuple[int, ...]) -> str:
-    tag = f"menu-{str(site_menu)}-bands-{int(num_bands)}-scheme-{str(band_scheme)}"
-    if str(site_menu) == "mixed":
-        tag += f"-top-{'-'.join(str(size) for size in top_prefix_sizes)}"
-    return tag
+def _site_catalog_tag(*, site_menu: str, num_bands: int, band_scheme: str) -> str:
+    return f"menu-{str(site_menu)}-bands-{int(num_bands)}-scheme-{str(band_scheme)}"
 
 
 def _pca_config_slug(*, basis_source_mode: str, site_menu: str) -> str:
@@ -118,11 +114,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--regular-das-plateau-rel-delta", type=float, default=1e-3)
     parser.add_argument("--regular-das-learning-rate", type=float, default=1e-3)
     parser.add_argument("--pca-token-position-id", default=DEFAULT_PCA_TOKEN_POSITION_ID)
-    parser.add_argument("--pca-site-menus", default="partition,mixed")
+    parser.add_argument("--pca-site-menus", default="partition")
     parser.add_argument("--pca-basis-source-modes", default="pair_bank,all_variants")
     parser.add_argument("--pca-num-bands", type=int, default=DEFAULT_PCA_NUM_BANDS)
     parser.add_argument("--pca-band-scheme", default=DEFAULT_PCA_BAND_SCHEME, choices=("equal", "head"))
-    parser.add_argument("--pca-top-prefix-sizes", default="8,16,32,64")
     parser.add_argument("--guided-pca-configs", default="pair_bank:partition,all_variants:partition")
     parser.add_argument(
         "--guided-mask-names",
@@ -146,8 +141,10 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     calibration_family_weights = _parse_csv_floats(args.calibration_family_weights) or DEFAULT_CALIBRATION_FAMILY_WEIGHTS
     regular_das_subspace_dims = _parse_csv_ints(args.regular_das_subspace_dims) or DEFAULT_REGULAR_DAS_SUBSPACE_DIMS
     pca_site_menus = _parse_csv_strings(args.pca_site_menus) or DEFAULT_PCA_SITE_MENUS
+    unsupported_pca_site_menus = sorted(set(str(site_menu) for site_menu in pca_site_menus) - {"partition"})
+    if unsupported_pca_site_menus:
+        raise ValueError(f"Unsupported PCA site menus: {unsupported_pca_site_menus}. PCA support is partition-only.")
     pca_basis_source_modes = _parse_csv_strings(args.pca_basis_source_modes) or DEFAULT_PCA_BASIS_SOURCE_MODES
-    pca_top_prefix_sizes = _parse_csv_ints(args.pca_top_prefix_sizes) or DEFAULT_PCA_TOP_PREFIX_SIZES
     guided_pca_configs = _parse_csv_strings(args.guided_pca_configs) or DEFAULT_GUIDED_PCA_CONFIGS
     guided_mask_names = DEFAULT_GUIDED_MASK_NAMES
     guided_subspace_dims = None
@@ -180,7 +177,6 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "regular_das_subspace_dims": tuple(int(dim) for dim in regular_das_subspace_dims),
         "pca_site_menus": tuple(str(site_menu) for site_menu in pca_site_menus),
         "pca_basis_source_modes": tuple(str(mode) for mode in pca_basis_source_modes),
-        "pca_top_prefix_sizes": tuple(int(size) for size in pca_top_prefix_sizes),
         "guided_pca_configs": tuple((str(mode), str(menu)) for mode, menu in guided_config_pairs),
         "guided_mask_names": tuple(str(mask_name) for mask_name in guided_mask_names),
         "guided_subspace_dims": None if guided_subspace_dims is None else tuple(int(dim) for dim in guided_subspace_dims),
@@ -317,8 +313,6 @@ def _build_pca_command(
         str(int(args.pca_num_bands)),
         "--band-scheme",
         str(args.pca_band_scheme),
-        "--top-prefix-sizes",
-        ",".join(str(size) for size in normalized["pca_top_prefix_sizes"]),
         "--basis-source-mode",
         str(basis_source_mode),
         "--ot-epsilons",
@@ -391,7 +385,6 @@ def build_broad_sweep_plan(*, repo_root: Path, args: argparse.Namespace, normali
                     site_menu=str(site_menu),
                     num_bands=int(args.pca_num_bands),
                     band_scheme=str(args.pca_band_scheme),
-                    top_prefix_sizes=normalized["pca_top_prefix_sizes"],
                 )
                 expected_outputs = [
                     str(sweep_root / "layer_sweep_manifest.json"),
@@ -435,7 +428,6 @@ def build_broad_sweep_plan(*, repo_root: Path, args: argparse.Namespace, normali
                 site_menu=str(site_menu),
                 num_bands=int(args.pca_num_bands),
                 band_scheme=str(args.pca_band_scheme),
-                top_prefix_sizes=normalized["pca_top_prefix_sizes"],
             )
             expected_outputs = []
             for layer in normalized["layers"]:
