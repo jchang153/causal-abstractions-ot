@@ -2149,17 +2149,21 @@ def main() -> None:
         for token_position_id, rankings in stage_a_rankings_by_token.items():
             if str(token_position_id) != "last_token":
                 continue
-            selected_layers = _select_stage_b_layers(
-                rankings=rankings,
-                top_layers_per_var=int(args.stage_b_top_layers_per_var),
-                neighbor_radius=int(args.stage_b_neighbor_radius),
-                max_layers_per_var=int(args.stage_b_max_layers_per_var),
-                valid_layers=_selection_valid_layers(
+            selected_layers = tuple(sorted(dict.fromkeys(
+                int(layer) for layer in normalized.get("stage_b_layer_indices", ()) or ()
+            )))
+            if not selected_layers:
+                selected_layers = _select_stage_b_layers(
                     rankings=rankings,
-                    normalized=normalized,
+                    top_layers_per_var=int(args.stage_b_top_layers_per_var),
+                    neighbor_radius=int(args.stage_b_neighbor_radius),
                     max_layers_per_var=int(args.stage_b_max_layers_per_var),
-                ),
-            )
+                    valid_layers=_selection_valid_layers(
+                        rankings=rankings,
+                        normalized=normalized,
+                        max_layers_per_var=int(args.stage_b_max_layers_per_var),
+                    ),
+                )
             if not selected_layers:
                 continue
             stage_name = f"stage_b_native_{str(token_position_id)}"
@@ -2262,17 +2266,21 @@ def main() -> None:
     stage_b_rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     if "stage_b_pca_ot" in normalized["stages"]:
         for token_position_id, rankings in stage_a_rankings_by_token.items():
-            selected_layers = _select_stage_b_layers(
-                rankings=rankings,
-                top_layers_per_var=int(args.stage_b_top_layers_per_var),
-                neighbor_radius=int(args.stage_b_neighbor_radius),
-                max_layers_per_var=int(args.stage_b_max_layers_per_var),
-                valid_layers=_selection_valid_layers(
+            selected_layers = tuple(sorted(dict.fromkeys(
+                int(layer) for layer in normalized.get("stage_b_layer_indices", ()) or ()
+            )))
+            if not selected_layers:
+                selected_layers = _select_stage_b_layers(
                     rankings=rankings,
-                    normalized=normalized,
+                    top_layers_per_var=int(args.stage_b_top_layers_per_var),
+                    neighbor_radius=int(args.stage_b_neighbor_radius),
                     max_layers_per_var=int(args.stage_b_max_layers_per_var),
-                ),
-            )
+                    valid_layers=_selection_valid_layers(
+                        rankings=rankings,
+                        normalized=normalized,
+                        max_layers_per_var=int(args.stage_b_max_layers_per_var),
+                    ),
+                )
             if not selected_layers:
                 continue
             for basis_source_mode in normalized["pca_basis_source_modes"]:
@@ -2394,17 +2402,21 @@ def main() -> None:
     if "stage_c_guided_das" in normalized["stages"]:
         stage_c_a_only_payload_paths: list[Path] = []
         for token_position_id, rankings in stage_a_rankings_by_token.items():
-            selected_layers = _select_stage_b_layers(
-                rankings=rankings,
-                top_layers_per_var=int(args.stage_b_top_layers_per_var),
-                neighbor_radius=int(args.stage_b_neighbor_radius),
-                max_layers_per_var=int(args.stage_b_max_layers_per_var),
-                valid_layers=_selection_valid_layers(
+            selected_layers = tuple(sorted(dict.fromkeys(
+                int(layer) for layer in normalized.get("stage_b_layer_indices", ()) or ()
+            )))
+            if not selected_layers:
+                selected_layers = _select_stage_b_layers(
                     rankings=rankings,
-                    normalized=normalized,
+                    top_layers_per_var=int(args.stage_b_top_layers_per_var),
+                    neighbor_radius=int(args.stage_b_neighbor_radius),
                     max_layers_per_var=int(args.stage_b_max_layers_per_var),
-                ),
-            )
+                    valid_layers=_selection_valid_layers(
+                        rankings=rankings,
+                        normalized=normalized,
+                        max_layers_per_var=int(args.stage_b_max_layers_per_var),
+                    ),
+                )
             for layer in selected_layers:
                 stage_name = f"stage_c_a_only_{str(token_position_id)}_L{int(layer):02d}"
                 stage_timestamp = f"{str(normalized['results_timestamp'])}_stageC_a_only_{str(token_position_id)}_L{int(layer):02d}"
