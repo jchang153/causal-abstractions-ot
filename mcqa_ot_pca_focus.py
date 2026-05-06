@@ -952,6 +952,19 @@ def main() -> None:
 
     for layer in layers:
         target_vars = layer_target_vars.get(int(layer), requested_target_vars)
+        unknown_target_vars = tuple(
+            str(target_var)
+            for target_var in target_vars
+            if str(target_var) not in set(str(source_var) for source_var in transport_target_vars)
+        )
+        if unknown_target_vars:
+            raise ValueError(
+                f"Layer {int(layer)} requested target vars outside transport rows: {list(unknown_target_vars)}"
+            )
+        print(
+            f"[PCA OT] layer={int(layer)} calibrating target_vars={list(target_vars)} "
+            f"from shared transport rows={list(transport_target_vars)}"
+        )
         layer_start = perf_counter()
         layer_dir = sweep_root / f"layer_{int(layer):02d}"
         layer_dir.mkdir(parents=True, exist_ok=True)
@@ -1055,8 +1068,8 @@ def main() -> None:
                     source_target_vars=transport_target_vars,
                     calibration_metric=DEFAULT_CALIBRATION_METRIC,
                     calibration_family_weights=calibration_family_weights,
-                    top_k_values_by_var={target_var: ot_top_k_values for target_var in transport_target_vars},
-                    lambda_values_by_var={target_var: ot_lambdas for target_var in transport_target_vars},
+                    top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
+                    lambda_values_by_var={target_var: ot_lambdas for target_var in target_vars},
                     store_prediction_details=False,
                 )
                 if prepared_artifacts is None:
