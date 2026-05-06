@@ -47,7 +47,7 @@ COMMON_ARGS=(
   --stage-b-neighbor-radius "${STAGE_B_NEIGHBOR_RADIUS:-0}"
   --stage-b-max-layers-per-var "${STAGE_B_MAX_LAYERS_PER_VAR:-1}"
   --pca-site-menus "${PCA_SITE_MENUS:-partition}"
-  --pca-basis-source-modes "${PCA_BASIS_SOURCE_MODES:-pair_bank,all_variants}"
+  --pca-basis-source-modes "${PCA_BASIS_SOURCE_MODES:-all_variants}"
   --pca-num-bands-values "${PCA_NUM_BANDS_VALUES:-8,16}"
   --pca-band-scheme "${PCA_BAND_SCHEME:-equal}"
   --stage-c-top-configs-per-var "${STAGE_C_TOP_CONFIGS_PER_VAR:-2}"

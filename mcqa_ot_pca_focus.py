@@ -166,7 +166,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated PCA band counts to sweep in one process. Overrides --num-bands.",
     )
     parser.add_argument("--band-scheme", default=DEFAULT_BAND_SCHEME, choices=("equal", "head"))
-    parser.add_argument("--basis-source-mode", default=DEFAULT_BASIS_SOURCE_MODE, choices=("pair_bank", "all_variants"))
+    parser.add_argument(
+        "--basis-source-mode",
+        default=DEFAULT_BASIS_SOURCE_MODE,
+        choices=("pair_bank", "all_variants"),
+        help="PCA fit point cloud source. pair_bank is a deprecated alias for the canonical broad all_variants cloud.",
+    )
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--ot-top-k-values", help="Comma-separated OT top-k values. Default: 1,2,3,4,5")
     parser.add_argument("--ot-lambdas", help="Comma-separated OT lambdas. Default: 10,11,...,30")
@@ -435,6 +440,15 @@ def _site_catalog_tag(
 
 def _target_file_suffix(target_var: str) -> str:
     return f"_target-{str(target_var)}"
+
+
+def _canonical_basis_source_mode(value: str) -> str:
+    mode = str(value)
+    if mode == "pair_bank":
+        return "all_variants"
+    if mode != "all_variants":
+        raise ValueError(f"Unsupported PCA basis source mode {value!r}; use all_variants.")
+    return mode
 
 
 def _pca_signature_cache_spec(
@@ -1354,6 +1368,13 @@ def main() -> None:
     stage_start = perf_counter()
     parser = _build_parser()
     args = parser.parse_args()
+    requested_basis_source_mode = str(args.basis_source_mode)
+    args.basis_source_mode = _canonical_basis_source_mode(requested_basis_source_mode)
+    if requested_basis_source_mode != str(args.basis_source_mode):
+        print(
+            f"[PCA OT] basis_source_mode={requested_basis_source_mode} is deprecated; "
+            f"using basis_source_mode={args.basis_source_mode} so PCA fits one canonical broad all-variants point cloud."
+        )
 
     layers = DEFAULT_LAYERS if args.layers is None else tuple(_parse_csv_ints(args.layers) or [])
     if not layers:
@@ -1433,35 +1454,23 @@ def main() -> None:
         )
         prompt_records = None
         pca_fit_start = perf_counter()
-        if str(args.basis_source_mode) == "all_variants":
-            prompt_records = _unique_prompt_records_for_all_variants(
-                train_bank=fit_bank_for_basis,
-                filtered_datasets=filtered_datasets,
-                token_position=selected_token_position,
-                tokenizer=tokenizer,
-            )
-            basis = load_or_fit_pca_basis_from_prompt_records(
-                path=basis_path,
-                model=model,
-                tokenizer=tokenizer,
-                prompt_records=prompt_records,
-                layer=int(layer),
-                token_position_id=str(args.token_position_id),
-                batch_size=int(args.batch_size),
-                device=device,
-                basis_id=f"L{int(layer)}:{str(args.token_position_id)}:pca-{str(args.basis_source_mode)}",
-            )
-        else:
-            basis = load_or_fit_pca_basis(
-                path=basis_path,
-                model=model,
-                bank=fit_bank_for_basis,
-                layer=int(layer),
-                token_position_id=str(args.token_position_id),
-                batch_size=int(args.batch_size),
-                device=device,
-                basis_id=f"L{int(layer)}:{str(args.token_position_id)}:pca-{str(args.basis_source_mode)}",
-            )
+        prompt_records = _unique_prompt_records_for_all_variants(
+            train_bank=fit_bank_for_basis,
+            filtered_datasets=filtered_datasets,
+            token_position=selected_token_position,
+            tokenizer=tokenizer,
+        )
+        basis = load_or_fit_pca_basis_from_prompt_records(
+            path=basis_path,
+            model=model,
+            tokenizer=tokenizer,
+            prompt_records=prompt_records,
+            layer=int(layer),
+            token_position_id=str(args.token_position_id),
+            batch_size=int(args.batch_size),
+            device=device,
+            basis_id=f"L{int(layer)}:{str(args.token_position_id)}:pca-{str(args.basis_source_mode)}",
+        )
         _synchronize_if_cuda(device)
         pca_fit_seconds = float(perf_counter() - pca_fit_start)
         for target_var in target_vars:

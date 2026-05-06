@@ -34,10 +34,10 @@ DEFAULT_REGULAR_DAS_SUBSPACE_DIMS = (
     2304,
 )
 DEFAULT_PCA_SITE_MENUS = ("partition",)
-DEFAULT_PCA_BASIS_SOURCE_MODES = ("pair_bank", "all_variants")
+DEFAULT_PCA_BASIS_SOURCE_MODES = ("all_variants",)
 DEFAULT_PCA_NUM_BANDS = 8
 DEFAULT_PCA_BAND_SCHEME = "equal"
-DEFAULT_GUIDED_PCA_CONFIGS = ("pair_bank:partition", "all_variants:partition")
+DEFAULT_GUIDED_PCA_CONFIGS = ("all_variants:partition",)
 DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
 DEFAULT_STAGES = ("vanilla_ot", "pca_ot", "pca_guided_das", "regular_das")
 
@@ -73,6 +73,17 @@ def _site_catalog_tag(*, site_menu: str, num_bands: int, band_scheme: str) -> st
 
 def _pca_config_slug(*, basis_source_mode: str, site_menu: str) -> str:
     return f"{str(basis_source_mode)}_{str(site_menu)}"
+
+
+def _canonical_pca_basis_source_mode(value: str) -> str:
+    mode = str(value)
+    if mode == "pair_bank":
+        return "all_variants"
+    if mode != "all_variants":
+        raise ValueError(
+            f"Unsupported PCA basis source mode {value!r}; PCA uses the canonical broad all_variants point cloud."
+        )
+    return mode
 
 
 def _append_optional_arg(args: list[str], name: str, value: str | None) -> None:
@@ -115,10 +126,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--regular-das-learning-rate", type=float, default=1e-3)
     parser.add_argument("--pca-token-position-id", default=DEFAULT_PCA_TOKEN_POSITION_ID)
     parser.add_argument("--pca-site-menus", default="partition")
-    parser.add_argument("--pca-basis-source-modes", default="pair_bank,all_variants")
+    parser.add_argument(
+        "--pca-basis-source-modes",
+        default="all_variants",
+        help="Comma-separated PCA basis source modes. pair_bank is treated as all_variants.",
+    )
     parser.add_argument("--pca-num-bands", type=int, default=DEFAULT_PCA_NUM_BANDS)
     parser.add_argument("--pca-band-scheme", default=DEFAULT_PCA_BAND_SCHEME, choices=("equal", "head"))
-    parser.add_argument("--guided-pca-configs", default="pair_bank:partition,all_variants:partition")
+    parser.add_argument("--guided-pca-configs", default="all_variants:partition")
     parser.add_argument(
         "--guided-mask-names",
         default="Selected",
@@ -144,7 +159,12 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     unsupported_pca_site_menus = sorted(set(str(site_menu) for site_menu in pca_site_menus) - {"partition"})
     if unsupported_pca_site_menus:
         raise ValueError(f"Unsupported PCA site menus: {unsupported_pca_site_menus}. PCA support is partition-only.")
-    pca_basis_source_modes = _parse_csv_strings(args.pca_basis_source_modes) or DEFAULT_PCA_BASIS_SOURCE_MODES
+    pca_basis_source_modes = tuple(
+        dict.fromkeys(
+            _canonical_pca_basis_source_mode(mode)
+            for mode in (_parse_csv_strings(args.pca_basis_source_modes) or DEFAULT_PCA_BASIS_SOURCE_MODES)
+        )
+    )
     guided_pca_configs = _parse_csv_strings(args.guided_pca_configs) or DEFAULT_GUIDED_PCA_CONFIGS
     guided_mask_names = DEFAULT_GUIDED_MASK_NAMES
     guided_subspace_dims = None
@@ -160,7 +180,8 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         basis_source_mode, site_menu = (part.strip() for part in value.split(":", 1))
         if not basis_source_mode or not site_menu:
             raise ValueError(f"guided-pca-config entry must include both basis and menu, got {value!r}")
-        guided_config_pairs.append((basis_source_mode, site_menu))
+        guided_config_pairs.append((_canonical_pca_basis_source_mode(basis_source_mode), site_menu))
+    guided_config_pairs = list(dict.fromkeys(guided_config_pairs))
     results_timestamp = (
         args.results_timestamp
         or os.environ.get("RESULTS_TIMESTAMP")

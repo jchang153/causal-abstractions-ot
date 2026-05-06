@@ -46,7 +46,7 @@ DEFAULT_OT_LAMBDAS = (
     30.0,
 )
 DEFAULT_PCA_SITE_MENUS = ("partition",)
-DEFAULT_PCA_BASIS_SOURCE_MODES = ("pair_bank", "all_variants")
+DEFAULT_PCA_BASIS_SOURCE_MODES = ("all_variants",)
 DEFAULT_PCA_NUM_BANDS_VALUES = (8, 16)
 DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
@@ -247,6 +247,20 @@ def _normalize_num_bands_values(values: tuple[int, ...], site_menu: str) -> tupl
     return tuple(sorted(dict.fromkeys(int(value) for value in values)))
 
 
+def _normalize_pca_basis_source_modes(values: Iterable[str]) -> tuple[str, ...]:
+    resolved: list[str] = []
+    for value in values:
+        mode = str(value)
+        if mode == "pair_bank":
+            mode = "all_variants"
+        if mode != "all_variants":
+            raise ValueError(
+                f"Unsupported PCA basis source mode {value!r}; PCA uses the canonical broad all_variants point cloud."
+            )
+        resolved.append(mode)
+    return tuple(dict.fromkeys(resolved))
+
+
 def _layer_from_site_label(label: object) -> int | None:
     text = str(label)
     if not text.startswith("L") or ":" not in text:
@@ -354,7 +368,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated native OT widths. Default: values from DEFAULT_NATIVE_RESOLUTIONS.",
     )
     parser.add_argument("--pca-site-menus", default="partition")
-    parser.add_argument("--pca-basis-source-modes", default="pair_bank,all_variants")
+    parser.add_argument(
+        "--pca-basis-source-modes",
+        default="all_variants",
+        help="Comma-separated PCA basis source modes. pair_bank is treated as all_variants.",
+    )
     parser.add_argument("--pca-num-bands-values", default="8,16")
     parser.add_argument("--pca-band-scheme", default=DEFAULT_PCA_BAND_SCHEME, choices=("equal", "head"))
     parser.add_argument(
@@ -424,7 +442,9 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     unsupported_pca_site_menus = sorted(set(str(site_menu) for site_menu in pca_site_menus) - {"partition"})
     if unsupported_pca_site_menus:
         raise ValueError(f"Unsupported PCA site menus: {unsupported_pca_site_menus}. PCA support is partition-only.")
-    pca_basis_source_modes = _parse_csv_strings(args.pca_basis_source_modes) or DEFAULT_PCA_BASIS_SOURCE_MODES
+    pca_basis_source_modes = _normalize_pca_basis_source_modes(
+        _parse_csv_strings(args.pca_basis_source_modes) or DEFAULT_PCA_BASIS_SOURCE_MODES
+    )
     pca_num_bands_values = _parse_csv_ints(args.pca_num_bands_values) or DEFAULT_PCA_NUM_BANDS_VALUES
     native_resolutions = _normalize_native_resolutions(
         _parse_csv_ints(args.native_resolutions) or DEFAULT_NATIVE_RESOLUTIONS
