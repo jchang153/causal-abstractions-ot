@@ -2191,6 +2191,25 @@ def main() -> None:
                     stage_a_rankings_by_token[str(token_position_id)] = rankings
                     stage_a_summary_paths.append(ranking_json_path)
 
+    downstream_stages_requiring_stage_a = {
+        "stage_b_plot_native_support",
+        "stage_b_plot_pca_support",
+        "stage_c_plot_das_layer",
+        "stage_c_plot_das_native_support",
+        "stage_c_plot_das_dimension",
+        "stage_c_plot_das_pca_support",
+    }
+    requested_downstream_stages = downstream_stages_requiring_stage_a.intersection(
+        str(stage_name) for stage_name in normalized["stages"]
+    )
+    if requested_downstream_stages and not stage_a_rankings_by_token:
+        raise RuntimeError(
+            "No Stage A layer rankings are available for downstream hierarchical stages "
+            f"{sorted(requested_downstream_stages)}. Include stage_a_plot_layer in --stages, "
+            "provide --stage-a-fixed-layers, or rerun with a results timestamp/root that already "
+            "contains stage_a_<token>_layer_rankings.json."
+        )
+
     native_payload_paths: list[Path] = []
     native_ot_rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     stage_b_selection_logged: set[str] = set()

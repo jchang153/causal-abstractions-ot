@@ -16,6 +16,8 @@ DEFAULT_STAGES = (
     "stage_b_plot_pca_support",
     "stage_c_plot_das_layer",
     "stage_c_plot_das_native_support",
+    "stage_c_plot_das_dimension",
+    "stage_c_plot_das_pca_support",
 )
 DEFAULT_REGULAR_DAS_SUBSPACE_DIMS = (
     32,
