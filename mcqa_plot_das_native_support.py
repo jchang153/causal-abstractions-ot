@@ -185,7 +185,7 @@ def main() -> None:
         layers=(int(layer),),
         selected_token_position_ids=(str(token_position_id),),
     )
-    mask_names = tuple(_parse_csv_strings(args.guided_mask_names) or list(DEFAULT_GUIDED_MASK_NAMES))
+    mask_names = tuple(DEFAULT_GUIDED_MASK_NAMES)
     target_vars = tuple(_parse_csv_strings(args.target_vars) or list(DEFAULT_TARGET_VARS))
     explicit_dims = _parse_csv_ints(args.guided_subspace_dims)
 

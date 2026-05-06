@@ -55,28 +55,6 @@ def _enumerate_ranked_unions(ranked_positions: tuple[str, ...]) -> list[tuple[st
     return unions
 
 
-def _block_mask_from_prefix(
-    ranked_site_indices: tuple[int, ...],
-    evidence_by_site: dict[int, float],
-    *,
-    coverage: float,
-) -> tuple[int, ...]:
-    total_evidence = sum(float(score) for score in evidence_by_site.values() if float(score) > 0.0)
-    if total_evidence <= 0.0:
-        return ranked_site_indices[:1]
-    threshold = float(coverage) * float(total_evidence)
-    selected: list[int] = []
-    captured = 0.0
-    for site_index in ranked_site_indices:
-        if float(evidence_by_site.get(int(site_index), 0.0)) <= 0.0:
-            continue
-        selected.append(int(site_index))
-        captured += float(evidence_by_site[int(site_index)])
-        if captured >= threshold:
-            break
-    return tuple(selected or ranked_site_indices[:1])
-
-
 def _merged_rotated_segments(segments: tuple[RotatedBandSite, ...]) -> tuple[RotatedBandSite, ...]:
     if not segments:
         return ()
@@ -127,51 +105,6 @@ def _site_mask_total_dim(*, sites: list[SiteLike], site_mask: tuple[int, ...]) -
     )
 
 
-def _mask_candidates_from_ordered_support(
-    *,
-    ranked_site_indices: tuple[int, ...],
-    evidence_by_site: dict[int, float],
-    sites: list[SiteLike],
-    prefix_sizes: tuple[int, ...],
-    coverage_specs: tuple[tuple[str, float], ...],
-) -> list[dict[str, object]]:
-    mask_candidates: list[dict[str, object]] = []
-    seen_masks: set[tuple[int, ...]] = set()
-    for count in prefix_sizes:
-        if int(count) <= 0:
-            continue
-        site_mask = tuple(int(site_index) for site_index in ranked_site_indices[: min(int(count), len(ranked_site_indices))])
-        if not site_mask or site_mask in seen_masks:
-            continue
-        seen_masks.add(site_mask)
-        mask_candidates.append(
-            {
-                "name": f"Top{int(count)}",
-                "site_indices": list(site_mask),
-                "site_labels": [sites[site_index].label for site_index in site_mask],
-                "site_total_dim": int(_site_mask_total_dim(sites=sites, site_mask=site_mask)),
-            }
-        )
-    for name, coverage in coverage_specs:
-        site_mask = _block_mask_from_prefix(
-            ranked_site_indices,
-            evidence_by_site,
-            coverage=float(coverage),
-        )
-        if not site_mask or site_mask in seen_masks:
-            continue
-        seen_masks.add(site_mask)
-        mask_candidates.append(
-            {
-                "name": str(name),
-                "site_indices": list(site_mask),
-                "site_labels": [sites[site_index].label for site_index in site_mask],
-                "site_total_dim": int(_site_mask_total_dim(sites=sites, site_mask=site_mask)),
-            }
-        )
-    return mask_candidates
-
-
 def _selected_site_indices_from_payload(
     payload: dict[str, object],
     *,
@@ -210,15 +143,12 @@ def _selected_mask_candidate_from_payload(
     }
 
 
-def extract_ordered_site_support(
+def extract_selected_site_support(
     *,
     ot_run_payloads: list[dict[str, object]],
     sites: list[SiteLike],
-    score_slack: float = 0.05,
-    prefix_sizes: tuple[int, ...] = (1, 2, 4),
-    coverage_specs: tuple[tuple[str, float], ...] = (("S50", 0.50), ("S80", 0.80)),
 ) -> dict[str, dict[str, object]]:
-    """Pool near-best OT runs into row-dominant support over an ordered site catalog."""
+    """Extract only the best calibrated PLOT handle, without evidence pooling."""
     grouped_payloads: dict[str, list[dict[str, object]]] = {}
     for compare_payload in ot_run_payloads:
         for payload in _iter_transport_method_payloads(compare_payload):
@@ -228,125 +158,70 @@ def extract_ordered_site_support(
     for target_var, payloads in grouped_payloads.items():
         if not payloads:
             continue
-        selection_scores = [
-            float(payload.get("results", [{}])[0].get("selection_score", 0.0))
-            for payload in payloads
-        ]
-        best_score = max(selection_scores) if selection_scores else 0.0
-        score_floor = float(best_score) - float(score_slack)
-        kept_payloads = [
-            payload
-            for payload in payloads
-            if float(payload.get("results", [{}])[0].get("selection_score", 0.0)) >= score_floor
-        ]
-        if not kept_payloads:
-            kept_payloads = [
-                max(payloads, key=lambda payload: float(payload.get("results", [{}])[0].get("selection_score", 0.0)))
-            ]
-
-        site_indices = tuple(range(len(sites)))
-        evidence_by_site = {site_index: 0.0 for site_index in site_indices}
-        mean_target_mass_by_site = {site_index: 0.0 for site_index in site_indices}
-        source_target_vars = tuple(str(target) for target in kept_payloads[0].get("source_target_vars", []))
-        if not source_target_vars:
-            source_target_vars = (str(target_var),)
-        for payload in kept_payloads:
-            transport = np.asarray(payload.get("transport", []), dtype=float)
-            if transport.ndim != 2 or transport.shape[1] != len(sites):
-                continue
-            row_sums = transport.sum(axis=1, keepdims=True)
-            safe_row_sums = np.where(row_sums > 0.0, row_sums, 1.0)
-            row_mass = transport / safe_row_sums
-            target_row_index = int(payload.get("target_var_row_index", source_target_vars.index(str(target_var))))
-            for site_index in site_indices:
-                target_mass = float(row_mass[target_row_index, site_index])
-                competitor_mass = max(
-                    [
-                        float(row_mass[other_index, site_index])
-                        for other_index in range(row_mass.shape[0])
-                        if int(other_index) != int(target_row_index)
-                    ]
-                    or [0.0]
-                )
-                evidence_by_site[int(site_index)] += max(target_mass - competitor_mass, 0.0)
-                mean_target_mass_by_site[int(site_index)] += target_mass
-        if kept_payloads:
-            mean_target_mass_by_site = {
-                site_index: float(total_mass / len(kept_payloads))
-                for site_index, total_mass in mean_target_mass_by_site.items()
-            }
-        ranked_site_indices = tuple(
-            site_index
-            for site_index, _score in sorted(
-                evidence_by_site.items(),
-                key=lambda item: (
-                    float(item[1]),
-                    float(mean_target_mass_by_site.get(int(item[0]), 0.0)),
-                    -int(item[0]),
-                ),
-                reverse=True,
-            )
-        )
-        if not ranked_site_indices:
-            continue
         best_payload = max(
             payloads,
-            key=lambda payload: float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
+            key=lambda payload: (
+                float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
+                float(payload.get("results", [{}])[0].get("exact_acc", 0.0)),
+            ),
         )
         selected_candidate = _selected_mask_candidate_from_payload(best_payload, sites=sites)
-        mask_candidates = _mask_candidates_from_ordered_support(
-            ranked_site_indices=ranked_site_indices,
-            evidence_by_site=evidence_by_site,
-            sites=sites,
-            prefix_sizes=prefix_sizes,
-            coverage_specs=coverage_specs,
-        )
-        if selected_candidate is not None:
-            selected_mask = tuple(selected_candidate["site_indices"])
-            mask_candidates = [
-                selected_candidate,
-                *[
-                    candidate
-                    for candidate in mask_candidates
-                    if tuple(candidate.get("site_indices", [])) != selected_mask
-                ],
-            ]
+        if selected_candidate is None:
+            continue
+        selected_indices = tuple(int(site_index) for site_index in selected_candidate.get("site_indices", []))
+        ranked_site_indices = tuple(dict.fromkeys([*selected_indices, *range(len(sites))]))
         best_result = best_payload.get("results", [{}])[0]
         best_result = best_result if isinstance(best_result, dict) else {}
         support_by_var[str(target_var)] = {
             "target_var": str(target_var),
-            "best_selection_score": float(best_score),
-            "score_slack": float(score_slack),
-            "kept_trial_count": len(kept_payloads),
+            "support_extraction_mode": "selected_only",
+            "best_selection_score": float(best_result.get("selection_score", 0.0)),
+            "score_slack": 0.0,
+            "kept_trial_count": 1,
             "selected_trial": {
                 "selection_score": float(best_result.get("selection_score", 0.0)),
                 "exact_acc": float(best_result.get("exact_acc", 0.0)),
-                "epsilon": float(best_payload.get("transport_meta", {}).get("epsilon_config", best_payload.get("ot_epsilon", 0.0))),
+                "epsilon": float(
+                    best_payload.get("transport_meta", {}).get(
+                        "epsilon_config",
+                        best_payload.get("ot_epsilon", 0.0),
+                    )
+                ),
                 "top_k": best_result.get("top_k"),
                 "lambda": best_result.get("lambda"),
                 "selected_site_labels": list(best_result.get("selected_site_labels", []) or []),
             },
             "kept_trials": [
                 {
-                    "selection_score": float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
-                    "exact_acc": float(payload.get("results", [{}])[0].get("exact_acc", 0.0)),
-                    "epsilon": float(payload.get("transport_meta", {}).get("epsilon_config", payload.get("ot_epsilon", 0.0))),
+                    "selection_score": float(best_result.get("selection_score", 0.0)),
+                    "exact_acc": float(best_result.get("exact_acc", 0.0)),
+                    "epsilon": float(
+                        best_payload.get("transport_meta", {}).get(
+                            "epsilon_config",
+                            best_payload.get("ot_epsilon", 0.0),
+                        )
+                    ),
                 }
-                for payload in kept_payloads
             ],
-            "site_evidence": {
-                sites[site_index].label: float(evidence_by_site[site_index])
-                for site_index in ranked_site_indices
-            },
-            "mean_target_site_mass": {
-                sites[site_index].label: float(mean_target_mass_by_site[site_index])
-                for site_index in ranked_site_indices
-            },
+            "site_evidence": {},
+            "mean_target_site_mass": {},
             "ranked_site_indices": [int(site_index) for site_index in ranked_site_indices],
             "ranked_site_labels": [sites[site_index].label for site_index in ranked_site_indices],
-            "mask_candidates": mask_candidates,
+            "mask_candidates": [selected_candidate],
         }
     return support_by_var
+
+
+def extract_ordered_site_support(
+    *,
+    ot_run_payloads: list[dict[str, object]],
+    sites: list[SiteLike],
+    score_slack: float = 0.05,
+    prefix_sizes: tuple[int, ...] = (1, 2, 4),
+    coverage_specs: tuple[tuple[str, float], ...] = (),
+) -> dict[str, dict[str, object]]:
+    """Return the exact best calibrated PLOT handle over an ordered site catalog."""
+    return extract_selected_site_support(ot_run_payloads=ot_run_payloads, sites=sites)
 
 
 def extract_layer_position_support(
@@ -451,138 +326,8 @@ def extract_block_mask_support(
     sites: list[ResidualSite],
     score_slack: float = 0.05,
 ) -> dict[str, dict[str, object]]:
-    """Pool near-best OT block runs into row-dominant within-layer block masks."""
-    grouped_payloads: dict[str, list[dict[str, object]]] = {}
-    for compare_payload in ot_run_payloads:
-        for payload in _iter_transport_method_payloads(compare_payload):
-            grouped_payloads.setdefault(str(payload.get("target_var")), []).append(payload)
-
-    support_by_var: dict[str, dict[str, object]] = {}
-    for target_var, payloads in grouped_payloads.items():
-        if not payloads:
-            continue
-        selection_scores = [
-            float(payload.get("results", [{}])[0].get("selection_score", 0.0))
-            for payload in payloads
-        ]
-        best_score = max(selection_scores) if selection_scores else 0.0
-        score_floor = float(best_score) - float(score_slack)
-        kept_payloads = [
-            payload
-            for payload in payloads
-            if float(payload.get("results", [{}])[0].get("selection_score", 0.0)) >= score_floor
-        ]
-        if not kept_payloads:
-            kept_payloads = [max(payloads, key=lambda payload: float(payload.get("results", [{}])[0].get("selection_score", 0.0)))]
-
-        site_indices = tuple(range(len(sites)))
-        evidence_by_site = {site_index: 0.0 for site_index in site_indices}
-        mean_target_mass_by_site = {site_index: 0.0 for site_index in site_indices}
-        source_target_vars = tuple(str(target) for target in kept_payloads[0].get("source_target_vars", []))
-        if not source_target_vars:
-            source_target_vars = (str(target_var),)
-        for payload in kept_payloads:
-            transport = np.asarray(payload.get("transport", []), dtype=float)
-            if transport.ndim != 2 or transport.shape[1] != len(sites):
-                continue
-            row_sums = transport.sum(axis=1, keepdims=True)
-            safe_row_sums = np.where(row_sums > 0.0, row_sums, 1.0)
-            row_mass = transport / safe_row_sums
-            target_row_index = int(payload.get("target_var_row_index", source_target_vars.index(str(target_var))))
-            for site_index in site_indices:
-                target_mass = float(row_mass[target_row_index, site_index])
-                competitor_mass = max(
-                    [
-                        float(row_mass[other_index, site_index])
-                        for other_index in range(row_mass.shape[0])
-                        if int(other_index) != int(target_row_index)
-                    ]
-                    or [0.0]
-                )
-                evidence_by_site[int(site_index)] += max(target_mass - competitor_mass, 0.0)
-                mean_target_mass_by_site[int(site_index)] += target_mass
-        if kept_payloads:
-            mean_target_mass_by_site = {
-                site_index: float(total_mass / len(kept_payloads))
-                for site_index, total_mass in mean_target_mass_by_site.items()
-            }
-        ranked_site_indices = tuple(
-            site_index
-            for site_index, _score in sorted(
-                evidence_by_site.items(),
-                key=lambda item: (
-                    float(item[1]),
-                    float(mean_target_mass_by_site.get(int(item[0]), 0.0)),
-                    -int(item[0]),
-                ),
-                reverse=True,
-            )
-        )
-        if not ranked_site_indices:
-            continue
-        mask_candidates: list[dict[str, object]] = []
-        seen_masks: set[tuple[int, ...]] = set()
-        fixed_prefix_specs = (
-            ("Top1", 1),
-            ("Top2", 2),
-            ("Top4", 4),
-        )
-        for name, count in fixed_prefix_specs:
-            site_mask = tuple(int(site_index) for site_index in ranked_site_indices[: min(int(count), len(ranked_site_indices))])
-            if not site_mask or site_mask in seen_masks:
-                continue
-            seen_masks.add(site_mask)
-            mask_candidates.append(
-                {
-                    "name": str(name),
-                    "site_indices": list(site_mask),
-                    "site_labels": [sites[site_index].label for site_index in site_mask],
-                    "site_total_dim": sum(int(sites[site_index].dim_end) - int(sites[site_index].dim_start) for site_index in site_mask),
-                }
-            )
-        for name, coverage in (("S50", 0.50), ("S80", 0.80)):
-            site_mask = _block_mask_from_prefix(
-                ranked_site_indices,
-                evidence_by_site,
-                coverage=float(coverage),
-            )
-            if not site_mask or site_mask in seen_masks:
-                continue
-            seen_masks.add(site_mask)
-            mask_candidates.append(
-                {
-                    "name": str(name),
-                    "site_indices": list(site_mask),
-                    "site_labels": [sites[site_index].label for site_index in site_mask],
-                    "site_total_dim": sum(int(sites[site_index].dim_end) - int(sites[site_index].dim_start) for site_index in site_mask),
-                }
-            )
-        support_by_var[str(target_var)] = {
-            "target_var": str(target_var),
-            "best_selection_score": float(best_score),
-            "score_slack": float(score_slack),
-            "kept_trial_count": len(kept_payloads),
-            "kept_trials": [
-                {
-                    "selection_score": float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
-                    "exact_acc": float(payload.get("results", [{}])[0].get("exact_acc", 0.0)),
-                    "epsilon": float(payload.get("transport_meta", {}).get("epsilon_config", payload.get("ot_epsilon", 0.0))),
-                }
-                for payload in kept_payloads
-            ],
-            "site_evidence": {
-                sites[site_index].label: float(evidence_by_site[site_index])
-                for site_index in ranked_site_indices
-            },
-            "mean_target_site_mass": {
-                sites[site_index].label: float(mean_target_mass_by_site[site_index])
-                for site_index in ranked_site_indices
-            },
-            "ranked_site_indices": [int(site_index) for site_index in ranked_site_indices],
-            "ranked_site_labels": [sites[site_index].label for site_index in ranked_site_indices],
-            "mask_candidates": mask_candidates,
-        }
-    return support_by_var
+    """Return the exact best calibrated PLOT handle over block sites."""
+    return extract_selected_site_support(ot_run_payloads=ot_run_payloads, sites=sites)
 
 
 def build_union_sites_from_support(

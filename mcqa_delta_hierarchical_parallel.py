@@ -37,9 +37,8 @@ from mcqa_delta_hierarchical_sweep import (
     _normalize_num_bands_values,
     _select_stage_b_layers,
     _select_stage_b_layers_by_var,
-    _select_stage_c_configs,
+    _select_stage_c_config_entries,
     _select_stage_c_native_support_entries,
-    _select_stage_c_native_support_groups,
     _selected_target_vars_by_layer,
     _site_catalog_tag,
     _stage_b_slug,
@@ -172,6 +171,7 @@ def _expected_pca_guided_outputs(
     site_menu: str,
     num_bands: int,
     layer: int,
+    target_vars: tuple[str, ...] | None = None,
 ) -> list[str]:
     site_catalog_tag = _site_catalog_tag(
         site_menu=str(site_menu),
@@ -196,7 +196,8 @@ def _expected_pca_guided_outputs(
             )
         ),
     ]
-    for target_var in normalized["target_vars"]:
+    resolved_target_vars = tuple(str(target_var) for target_var in (target_vars or normalized["target_vars"]))
+    for target_var in resolved_target_vars:
         outputs.append(
             str(
                 layer_dir
@@ -356,6 +357,13 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
     native_tasks: list[dict[str, object]] = []
     pca_tasks: list[dict[str, object]] = []
     for token_position_id, rankings in rankings_by_token.items():
+        selected_layers_by_var = _select_stage_b_layers_by_var(
+            rankings=rankings,
+            top_layers_per_var=int(args.stage_b_top_layers_per_var),
+            neighbor_radius=int(args.stage_b_neighbor_radius),
+            max_layers_per_var=int(args.stage_b_max_layers_per_var),
+        )
+        selected_target_vars_by_layer = _selected_target_vars_by_layer(selected_by_var=selected_layers_by_var)
         selected_layers = _select_stage_b_layers(
             rankings=rankings,
             top_layers_per_var=int(args.stage_b_top_layers_per_var),
@@ -387,6 +395,12 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
                                 normalized=normalized,
                                 stage_timestamp=stage_timestamp,
                                 layers=(int(layer),),
+                                layer_target_vars={
+                                    int(layer): selected_target_vars_by_layer.get(
+                                        int(layer),
+                                        tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS),
+                                    )
+                                },
                             )
                         ),
                         "expected_outputs": expected_outputs,
@@ -433,6 +447,13 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
                                         stage_timestamp=stage_timestamp,
                                         token_position_id=str(token_position_id),
                                         layers=(int(layer),),
+                                        requested_target_vars=tuple(str(target_var) for target_var in normalized["target_vars"]),
+                                        layer_target_vars={
+                                            int(layer): selected_target_vars_by_layer.get(
+                                                int(layer),
+                                                tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS),
+                                            )
+                                        },
                                         basis_source_mode=str(basis_source_mode),
                                         site_menu=str(site_menu),
                                         num_bands=int(num_bands),
@@ -609,11 +630,15 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
     native_rankings_path = sweep_root / "stage_b_native_support_rankings.json"
     if _stage_output_is_valid(native_rankings_path):
         native_rankings = _read_rankings(native_rankings_path)
-        native_support_groups = _select_stage_c_native_support_groups(
+        native_support_entries = _select_stage_c_native_support_entries(
             rankings=native_rankings,
-            top_configs_per_var=int(args.stage_c_top_configs_per_var),
+            top_configs_per_var=1,
         )
-        for native_support_path, target_vars in native_support_groups.items():
+        for entry in native_support_entries:
+            target_var = str(entry.get("variable"))
+            if target_var not in DEFAULT_TARGET_VARS:
+                continue
+            native_support_path = Path(str(entry.get("payload_path", "")))
             if not _stage_output_is_valid(native_support_path):
                 continue
             native_payload = _load_json(native_support_path)
@@ -621,7 +646,11 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
                 continue
             layer = int(native_payload.get("layer"))
             native_resolution = int(native_payload.get("native_resolution", native_payload.get("atomic_width")))
-            stage_timestamp = f"{str(normalized['results_timestamp'])}_stageC_native_L{int(layer):02d}_W{int(native_resolution):04d}"
+            target_vars = (target_var,)
+            stage_timestamp = (
+                f"{str(normalized['results_timestamp'])}_stageC_native_{target_var}"
+                f"_L{int(layer):02d}_W{int(native_resolution):04d}"
+            )
             payload_path = _expected_native_das_payload_path(
                 args=args,
                 stage_timestamp=stage_timestamp,
@@ -629,7 +658,7 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
             )
             native_tasks.append(
                 {
-                    "task_id": f"native_das_L{int(layer):02d}_W{int(native_resolution):04d}",
+                    "task_id": f"native_das_{target_var}_L{int(layer):02d}_W{int(native_resolution):04d}",
                     "category": "stage_c_plot_das_native_support",
                     "layer": int(layer),
                     "native_resolution": int(native_resolution),
@@ -654,7 +683,7 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
     if native_rankings:
         for entry in _select_stage_c_native_support_entries(
             rankings=native_rankings,
-            top_configs_per_var=int(args.stage_c_top_configs_per_var),
+            top_configs_per_var=1,
         ):
             target_var = str(entry.get("variable"))
             if target_var not in DEFAULT_TARGET_VARS:
@@ -715,58 +744,72 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
         legacy_stage_b_rankings_path = sweep_root / "stage_b_pca_rankings.json"
         stage_b_rankings_path = legacy_stage_b_rankings_path if _stage_output_is_valid(legacy_stage_b_rankings_path) else stage_b_rankings_path
     stage_b_rankings = _read_rankings(stage_b_rankings_path)
-    selected_groups = _select_stage_c_configs(
+    selected_entries = _select_stage_c_config_entries(
         rankings=stage_b_rankings,
-        top_configs_per_var=int(args.stage_c_top_configs_per_var),
+        top_configs_per_var=1,
     )
-    pca_manifest = _load_task_manifest(sweep_root / "stage_b_pca_tasks.json")
-    pca_lookup = _pca_task_lookup(pca_manifest["tasks"])
     stage_c_tasks: list[dict[str, object]] = []
 
-    for (token_position_id, basis_source_mode, site_menu, num_bands), layers in selected_groups.items():
-        for layer in layers:
-            key = (str(token_position_id), str(basis_source_mode), str(site_menu), int(num_bands), int(layer))
-            stage_b_task = pca_lookup.get(key)
-            if stage_b_task is None:
-                raise RuntimeError(f"Could not find Stage B PCA task for Stage C key={key}")
-            stage_timestamp = str(stage_b_task["stage_timestamp"])
-            expected_outputs = _expected_pca_guided_outputs(
-                args=args,
-                normalized=normalized,
-                stage_timestamp=stage_timestamp,
-                token_position_id=str(token_position_id),
-                basis_source_mode=str(basis_source_mode),
-                site_menu=str(site_menu),
-                num_bands=int(num_bands),
-                layer=int(layer),
-            )
-            stage_c_tasks.append(
-                {
-                    "task_id": f"stage_c_{stage_b_task['task_id']}",
-                    "category": "stage_c_pca_support_das",
-                    "token_position_id": str(token_position_id),
-                    "basis_source_mode": str(basis_source_mode),
-                    "site_menu": str(site_menu),
-                    "num_bands": int(num_bands),
-                    "layer": int(layer),
-                    "stage_timestamp": stage_timestamp,
-                    "command": list(
-                        _build_stage_b_or_c_command(
-                            args=args,
-                            normalized=normalized,
-                            stage_timestamp=stage_timestamp,
-                            token_position_id=str(token_position_id),
-                            layers=(int(layer),),
-                            basis_source_mode=str(basis_source_mode),
-                            site_menu=str(site_menu),
-                            num_bands=int(num_bands),
-                            guided_das=True,
-                        )
-                    ),
-                    "expected_outputs": expected_outputs,
-                    "payload_paths": [expected_outputs[1]],
-                }
-            )
+    for entry in selected_entries:
+        target_var = str(entry.get("variable"))
+        if target_var not in DEFAULT_TARGET_VARS:
+            continue
+        token_position_id = str(entry["token_position_id"])
+        basis_source_mode = str(entry["basis_source_mode"])
+        site_menu = str(entry["site_menu"])
+        num_bands = int(entry["num_bands"])
+        layer = int(entry["layer"])
+        base_slug = _stage_b_slug(
+            token_position_id=str(token_position_id),
+            basis_source_mode=str(basis_source_mode),
+            site_menu=str(site_menu),
+            num_bands=int(num_bands),
+        )
+        stage_timestamp = (
+            f"{str(normalized['results_timestamp'])}_stageC_pca_{target_var}"
+            f"_{base_slug}_L{int(layer):02d}"
+        )
+        expected_outputs = _expected_pca_guided_outputs(
+            args=args,
+            normalized=normalized,
+            stage_timestamp=stage_timestamp,
+            token_position_id=str(token_position_id),
+            basis_source_mode=str(basis_source_mode),
+            site_menu=str(site_menu),
+            num_bands=int(num_bands),
+            layer=int(layer),
+            target_vars=(target_var,),
+        )
+        stage_c_tasks.append(
+            {
+                "task_id": f"stage_c_pca_{target_var}_{base_slug}_L{int(layer):02d}",
+                "category": "stage_c_pca_support_das",
+                "token_position_id": str(token_position_id),
+                "basis_source_mode": str(basis_source_mode),
+                "site_menu": str(site_menu),
+                "num_bands": int(num_bands),
+                "layer": int(layer),
+                "target_vars": [target_var],
+                "stage_timestamp": stage_timestamp,
+                "command": list(
+                    _build_stage_b_or_c_command(
+                        args=args,
+                        normalized=normalized,
+                        stage_timestamp=stage_timestamp,
+                        token_position_id=str(token_position_id),
+                        layers=(int(layer),),
+                        requested_target_vars=(target_var,),
+                        layer_target_vars={int(layer): (target_var,)},
+                        basis_source_mode=str(basis_source_mode),
+                        site_menu=str(site_menu),
+                        num_bands=int(num_bands),
+                        guided_das=True,
+                    )
+                ),
+                "expected_outputs": expected_outputs,
+                "payload_paths": [expected_outputs[1]],
+            }
+        )
     _write_task_manifest(sweep_root / "stage_c_pca_tasks.json", kind="stage_c_pca_tasks", tasks=stage_c_tasks)
     _write_text(
         sweep_root / "stage_c_task_plan.txt",

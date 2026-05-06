@@ -33,7 +33,10 @@ from mcqa_experiment.sites import (
     enumerate_rotated_top_prefix_sites,
     site_total_width,
 )
-from mcqa_experiment.support import build_rotated_span_sites_from_support, extract_ordered_site_support
+from mcqa_experiment.support import (
+    build_rotated_span_sites_from_support,
+    extract_selected_site_support,
+)
 
 
 DEFAULT_LAYERS = (20, 25)
@@ -47,16 +50,38 @@ DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
-DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
-DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
+DEFAULT_OT_TOP_K_VALUES = (1, 2, 3, 4, 5)
+DEFAULT_OT_LAMBDAS = (
+    10.0,
+    11.0,
+    12.0,
+    13.0,
+    14.0,
+    15.0,
+    16.0,
+    17.0,
+    18.0,
+    19.0,
+    20.0,
+    21.0,
+    22.0,
+    23.0,
+    24.0,
+    25.0,
+    26.0,
+    27.0,
+    28.0,
+    29.0,
+    30.0,
+)
 DEFAULT_BAND_SCHEME = "equal"
 DEFAULT_BASIS_SOURCE_MODE = "all_variants"
 DEFAULT_SCREEN_MAX_EPOCHS = 25
 DEFAULT_SCREEN_MIN_EPOCHS = 2
-DEFAULT_SCREEN_MASK_NAMES = ("Top1", "Top2")
+DEFAULT_SCREEN_MASK_NAMES = ("Selected",)
 DEFAULT_GUIDED_DAS_MAX_EPOCHS = 100
 DEFAULT_GUIDED_DAS_MIN_EPOCHS = 5
-DEFAULT_GUIDED_DAS_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
+DEFAULT_GUIDED_DAS_MASK_NAMES = ("Selected",)
 
 
 def _synchronize_if_cuda(device: torch.device | str) -> None:
@@ -144,18 +169,41 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--basis-source-mode", default=DEFAULT_BASIS_SOURCE_MODE, choices=("pair_bank", "all_variants"))
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
-    parser.add_argument("--ot-top-k-values", help="Comma-separated OT top-k values. Default: 1,2,4")
-    parser.add_argument("--ot-lambdas", help="Comma-separated OT lambdas. Default: 0.5,1,2,4")
+    parser.add_argument("--ot-top-k-values", help="Comma-separated OT top-k values. Default: 1,2,3,4,5")
+    parser.add_argument("--ot-lambdas", help="Comma-separated OT lambdas. Default: 10,11,...,30")
     parser.add_argument(
         "--calibration-family-weights",
         help="Comma-separated family weights in answerPosition,randomLetter,answerPosition_randomLetter order. Default: 1,1,1",
     )
     parser.add_argument("--support-score-slack", type=float, default=0.05)
+    parser.add_argument(
+        "--support-extraction-mode",
+        default="selected_only",
+        choices=("ranked", "selected_only"),
+        help=(
+            "Deprecated compatibility flag. PCA support now always keeps only the best calibrated PLOT handle."
+        ),
+    )
+    parser.add_argument(
+        "--write-epsilon-artifacts",
+        action="store_true",
+        help="Write per-epsilon PCA OT JSON/TXT artifacts. Disabled by default to reduce disk use.",
+    )
+    parser.add_argument(
+        "--write-support-artifact",
+        action="store_true",
+        help="Write a separate support JSON. Disabled by default because the final PLOT payload already embeds support.",
+    )
+    parser.add_argument(
+        "--cache-signatures",
+        action="store_true",
+        help="Persist PCA alignment signature artifacts. Disabled by default to reduce cache growth.",
+    )
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument("--screen-das", action="store_true")
     parser.add_argument(
         "--screen-mask-names",
-        help="Comma-separated PCA support masks for the tiny DAS screen. Default: Top1,Top2",
+        help="Deprecated compatibility flag. PCA DAS always uses the exact Selected PLOT handle.",
     )
     parser.add_argument("--screen-max-epochs", type=int, default=DEFAULT_SCREEN_MAX_EPOCHS)
     parser.add_argument("--screen-min-epochs", type=int, default=DEFAULT_SCREEN_MIN_EPOCHS)
@@ -163,7 +211,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guided-das", action="store_true")
     parser.add_argument(
         "--guided-mask-names",
-        help="Comma-separated PCA support masks for the guided DAS sweep. Default: Top1,Top2,Top4,S50,S80",
+        help="Deprecated compatibility flag. PCA DAS always uses the exact Selected PLOT handle.",
     )
     parser.add_argument(
         "--guided-subspace-dims",
@@ -465,23 +513,91 @@ def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, 
         epsilon = float(compare_payload.get("ot_epsilon", 0.0))
         for payload in compare_payload.get("method_payloads", {}).get("ot", []):
             result = payload.get("results", [{}])[0]
+            selected_hyperparameters = payload.get("selected_hyperparameters", {})
+            if not isinstance(selected_hyperparameters, dict):
+                selected_hyperparameters = {}
             target_var = str(payload.get("target_var"))
             record = {
                 "exact_acc": float(result.get("exact_acc", 0.0)),
                 "selection_score": float(result.get("selection_score", 0.0)),
                 "site_label": str(result.get("site_label")),
                 "epsilon": float(epsilon),
+                "selected_hyperparameters": {
+                    "top_k": int(selected_hyperparameters.get("top_k", result.get("top_k", 0)) or 0),
+                    "lambda": float(selected_hyperparameters.get("lambda", result.get("lambda", 0.0)) or 0.0),
+                },
             }
             previous = best_by_var.get(target_var)
             if previous is None or (
-                float(record["exact_acc"]),
                 float(record["selection_score"]),
+                float(record["exact_acc"]),
             ) > (
-                float(previous["exact_acc"]),
                 float(previous["selection_score"]),
+                float(previous["exact_acc"]),
             ):
                 best_by_var[target_var] = record
     return best_by_var
+
+
+def _basis_metadata(
+    *,
+    basis: LayerPCABasis,
+    basis_path: Path,
+    prompt_records: list[dict[str, object]] | None,
+) -> dict[str, object]:
+    return {
+        "basis_id": str(basis.basis_id),
+        "rank": int(basis.rank),
+        "hidden_size": int(basis.hidden_size),
+        "num_fit_states": int(basis.num_fit_states),
+        "path": str(basis_path),
+        "fit_prompt_record_count": 0 if prompt_records is None else len(prompt_records),
+    }
+
+
+def _drop_prediction_details(value):
+    if isinstance(value, dict):
+        return {
+            str(key): _drop_prediction_details(item)
+            for key, item in value.items()
+            if str(key) != "prediction_details"
+        }
+    if isinstance(value, list):
+        return [_drop_prediction_details(item) for item in value]
+    return value
+
+
+def _compact_ot_method_payload(payload: dict[str, object]) -> dict[str, object]:
+    compact = _drop_prediction_details(payload)
+    if isinstance(compact, dict):
+        for key in (
+            "transport",
+            "normalized_transport",
+            "target_transport",
+            "target_normalized_transport",
+            "selection_transport",
+            "selected_transport",
+            "calibration_sweep",
+        ):
+            compact.pop(key, None)
+    return compact
+
+
+def _compact_compare_payload(payload: dict[str, object]) -> dict[str, object]:
+    compact = dict(payload)
+    method_payloads = compact.get("method_payloads", {})
+    if isinstance(method_payloads, dict):
+        compact["method_payloads"] = {
+            method_name: [
+                _compact_ot_method_payload(method_payload)
+                if isinstance(method_payload, dict)
+                else method_payload
+                for method_payload in method_entries
+            ]
+            for method_name, method_entries in method_payloads.items()
+            if isinstance(method_entries, list)
+        }
+    return compact
 
 
 def _filter_support_summary_by_mask_names(
@@ -676,6 +792,7 @@ def _format_layer_summary(
     site_metrics: list[dict[str, object]],
     ot_compare_payloads: list[dict[str, object]],
     support_by_var: dict[str, dict[str, object]],
+    support_extraction_mode: str,
     screen_payloads: dict[str, dict[str, object]],
     guided_payloads: dict[str, dict[str, object]],
 ) -> str:
@@ -691,6 +808,7 @@ def _format_layer_summary(
         f"num_bands: {int(num_bands)}",
         f"band_scheme: {band_scheme}",
         f"top_prefix_sizes: {list(int(size) for size in top_prefix_sizes)}",
+        f"support_extraction_mode: {support_extraction_mode}",
         f"basis_id: {basis.basis_id}",
         f"rank: {int(basis.rank)}",
         f"num_fit_states: {int(basis.num_fit_states)}",
@@ -711,7 +829,7 @@ def _format_layer_summary(
             f"eps={float(record['epsilon']):g} site={record['site_label']}"
         )
     lines.append("")
-    lines.append("pooled PCA support:")
+    lines.append("selected PCA support:")
     for target_var in target_vars:
         summary = support_by_var.get(str(target_var), {})
         if not summary:
@@ -720,7 +838,6 @@ def _format_layer_summary(
             f"support[{target_var}] best_score={float(summary.get('best_selection_score', 0.0)):.4f} "
             f"masks={[candidate.get('name') for candidate in summary.get('mask_candidates', [])]}"
         )
-        lines.append(f"support[{target_var}] evidence={summary.get('site_evidence', {})}")
     if screen_payloads:
         lines.append("")
         lines.append("tiny PCA-span DAS screen:")
@@ -796,8 +913,8 @@ def main() -> None:
         _parse_csv_floats(args.calibration_family_weights) or list(DEFAULT_CALIBRATION_FAMILY_WEIGHTS)
     )
     top_prefix_sizes = tuple(_parse_csv_ints(args.top_prefix_sizes) or list(DEFAULT_TOP_PREFIX_SIZES))
-    screen_mask_names = tuple(_parse_csv_strings(args.screen_mask_names) or list(DEFAULT_SCREEN_MASK_NAMES))
-    guided_mask_names = tuple(_parse_csv_strings(args.guided_mask_names) or list(DEFAULT_GUIDED_DAS_MASK_NAMES))
+    screen_mask_names = tuple(DEFAULT_SCREEN_MASK_NAMES)
+    guided_mask_names = tuple(DEFAULT_GUIDED_DAS_MASK_NAMES)
     guided_subspace_dims = None if args.guided_subspace_dims is None else tuple(_parse_csv_ints(args.guided_subspace_dims) or [])
 
     results_root = Path(args.results_root)
@@ -825,7 +942,6 @@ def main() -> None:
     if selected_token_position is None:
         raise ValueError(f"Unknown token_position_id {args.token_position_id!r}")
 
-    all_payloads: list[dict[str, object]] = []
     manifest_runs: list[dict[str, object]] = []
     site_catalog_tag = _site_catalog_tag(
         site_menu=str(args.site_menu),
@@ -901,12 +1017,15 @@ def main() -> None:
             prompt_records=prompt_records,
         )
         cache_path = _pca_signature_cache_path(cache_spec=cache_spec)
-        artifact_prepare_load_start = perf_counter()
-        prepared_artifacts = load_prepared_alignment_artifacts(
-            cache_path,
-            expected_spec=cache_spec,
-        )
-        artifact_prepare_load_seconds = float(perf_counter() - artifact_prepare_load_start)
+        artifact_prepare_load_seconds = 0.0
+        prepared_artifacts = None
+        if bool(args.cache_signatures):
+            artifact_prepare_load_start = perf_counter()
+            prepared_artifacts = load_prepared_alignment_artifacts(
+                cache_path,
+                expected_spec=cache_spec,
+            )
+            artifact_prepare_load_seconds = float(perf_counter() - artifact_prepare_load_start)
         artifact_prepare_create_seconds = 0.0
         ot_compare_payloads: list[dict[str, object]] = []
         ot_fit_cal_start = perf_counter()
@@ -917,13 +1036,14 @@ def main() -> None:
             )
             output_path = layer_dir / f"{output_stem}.json"
             summary_path = layer_dir / f"{output_stem}.txt"
-            compare_payload = _load_existing_payload(output_path)
-            if not _compare_payload_matches_target_vars(
-                payload=compare_payload,
-                expected_target_vars=target_vars,
-                expected_transport_target_vars=transport_target_vars,
-            ):
-                compare_payload = None
+            compare_payload = _load_existing_payload(output_path) if bool(args.write_epsilon_artifacts) else None
+            if bool(args.write_epsilon_artifacts):
+                if not _compare_payload_matches_target_vars(
+                    payload=compare_payload,
+                    expected_target_vars=target_vars,
+                    expected_transport_target_vars=transport_target_vars,
+                ):
+                    compare_payload = None
             if compare_payload is None:
                 ot_config = OTConfig(
                     method="ot",
@@ -937,6 +1057,7 @@ def main() -> None:
                     calibration_family_weights=calibration_family_weights,
                     top_k_values_by_var={target_var: ot_top_k_values for target_var in transport_target_vars},
                     lambda_values_by_var={target_var: ot_lambdas for target_var in transport_target_vars},
+                    store_prediction_details=False,
                 )
                 if prepared_artifacts is None:
                     artifact_prepare_start = perf_counter()
@@ -949,11 +1070,12 @@ def main() -> None:
                         pca_bases_by_id=pca_bases_by_id,
                     )
                     artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
-                    save_prepared_alignment_artifacts(
-                        cache_path,
-                        prepared_artifacts=prepared_artifacts,
-                        cache_spec=cache_spec,
-                    )
+                    if bool(args.cache_signatures):
+                        save_prepared_alignment_artifacts(
+                            cache_path,
+                            prepared_artifacts=prepared_artifacts,
+                            cache_spec=cache_spec,
+                        )
                 method_payloads = []
                 for target_var in target_vars:
                     method_payloads.append(
@@ -1000,8 +1122,12 @@ def main() -> None:
                     "data": data_metadata,
                     "method_payloads": {"ot": method_payloads},
                 }
-                write_json(output_path, compare_payload)
-                _write_epsilon_summary(summary_path, payload=compare_payload)
+                compare_payload = _compact_compare_payload(compare_payload)
+                if bool(args.write_epsilon_artifacts):
+                    write_json(output_path, compare_payload)
+                    _write_epsilon_summary(summary_path, payload=compare_payload)
+            else:
+                compare_payload = _compact_compare_payload(compare_payload)
             ot_compare_payloads.append(compare_payload)
         _synchronize_if_cuda(device)
         ot_fit_cal_seconds = float(perf_counter() - ot_fit_cal_start)
@@ -1026,18 +1152,17 @@ def main() -> None:
                     )
 
         support_start = perf_counter()
-        support_by_var = extract_ordered_site_support(
+        support_by_var = extract_selected_site_support(
             ot_run_payloads=ot_compare_payloads,
             sites=pca_sites,
-            score_slack=float(args.support_score_slack),
-            prefix_sizes=(1, 2, 4),
-            coverage_specs=(("S50", 0.50), ("S80", 0.80)),
         )
-        support_path = layer_dir / (
-            f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
-            f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_support.json"
-        )
-        write_json(support_path, support_by_var)
+        support_path = None
+        if bool(args.write_support_artifact):
+            support_path = layer_dir / (
+                f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
+                f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_support.json"
+            )
+            write_json(support_path, support_by_var)
         support_extract_seconds = float(perf_counter() - support_start)
         best_ot_by_var = _best_ot_records(ot_compare_payloads)
 
@@ -1146,6 +1271,7 @@ def main() -> None:
                 site_metrics=site_metrics,
                 ot_compare_payloads=ot_compare_payloads,
                 support_by_var=support_by_var,
+                support_extraction_mode="selected_only",
                 screen_payloads=screen_payloads,
                 guided_payloads=guided_payloads,
             ),
@@ -1165,13 +1291,14 @@ def main() -> None:
             "signature_mode": str(args.signature_mode),
             "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
             "basis_path": str(basis_path),
-            "basis": basis.to_payload(),
+            "basis": _basis_metadata(basis=basis, basis_path=basis_path, prompt_records=prompt_records),
             "fit_prompt_record_count": 0 if prompt_records is None else len(prompt_records),
             "pca_fit_runtime_seconds": float(pca_fit_seconds),
             "pca_site_build_runtime_seconds": float(site_build_seconds),
             "site_labels": [site.label for site in pca_sites],
             "site_metrics": site_metrics,
             "support_score_slack": float(args.support_score_slack),
+            "support_extraction_mode": "selected_only",
             "support_by_var": support_by_var,
             "method_by_var": best_ot_by_var,
             "screen_mask_names": [str(mask_name) for mask_name in screen_mask_names],
@@ -1230,6 +1357,7 @@ def main() -> None:
                     )
                 )
                 for epsilon in ot_epsilons
+                if bool(args.write_epsilon_artifacts)
             ],
             "summary_path": str(layer_summary_path),
         }
@@ -1238,7 +1366,6 @@ def main() -> None:
             f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_plot_pca_support.json"
         )
         write_json(plot_support_payload_path, plot_support_payload)
-        all_payloads.append(plot_support_payload)
 
         payload_path_for_manifest = plot_support_payload_path
         runtime_for_manifest = localization_runtime_seconds
@@ -1256,8 +1383,9 @@ def main() -> None:
                 "top_prefix_sizes": [int(size) for size in top_prefix_sizes],
                 "basis_source_mode": str(args.basis_source_mode),
                 "signature_mode": str(args.signature_mode),
-                "support_path": str(support_path),
+                "support_path": None if support_path is None else str(support_path),
                 "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
+                "support_extraction_mode": "selected_only",
                 "guided_output_paths": plot_support_payload["guided_output_paths"],
                 "screen_output_paths": plot_support_payload["screen_output_paths"],
                 "guided_das_enabled": bool(args.guided_das),
@@ -1275,7 +1403,6 @@ def main() -> None:
                 f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}_plot_das_pca_support.json"
             )
             write_json(guided_summary_payload_path, guided_summary_payload)
-            all_payloads.append(guided_summary_payload)
             payload_path_for_manifest = guided_summary_payload_path
             runtime_for_manifest = float(das_screen_seconds + das_guided_seconds)
             timing_for_manifest = guided_summary_payload["timing_seconds"]
@@ -1319,6 +1446,9 @@ def main() -> None:
             "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
             "guided_subspace_dims": None if guided_subspace_dims is None else [int(dim) for dim in guided_subspace_dims],
             "context_timing_seconds": context_timing_seconds,
+            "cache_signatures": bool(args.cache_signatures),
+            "write_epsilon_artifacts": bool(args.write_epsilon_artifacts),
+            "write_support_artifact": bool(args.write_support_artifact),
             "runtime_seconds": float(perf_counter() - stage_start),
             "runs": [
                 *[run for run in existing_manifest_runs if str(run.get("payload_path", "")) not in current_payload_paths],
@@ -1331,13 +1461,14 @@ def main() -> None:
     write_json(
         aggregate_path,
         {
+            "kind": "mcqa_ot_pca_focus",
             "runs": [
                 *[
                     run
                     for run in existing_payload_runs
                     if str(run.get("payload_path", "")) not in current_payload_paths
                 ],
-                *all_payloads,
+                *manifest_runs,
             ]
         },
     )

@@ -95,7 +95,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pca-num-bands-values", default="8,16")
     parser.add_argument("--pca-band-scheme", default="equal")
     parser.add_argument("--pca-top-prefix-sizes", default="8,16,32,64")
-    parser.add_argument("--guided-mask-names", default="Top1,Top2,Top4,S50,S80")
+    parser.add_argument("--guided-mask-names", default="Selected")
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
     parser.add_argument("--guided-restarts", type=int, default=2)

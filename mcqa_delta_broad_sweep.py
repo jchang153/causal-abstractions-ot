@@ -39,7 +39,7 @@ DEFAULT_PCA_NUM_BANDS = 8
 DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_PCA_TOP_PREFIX_SIZES = (8, 16, 32, 64)
 DEFAULT_GUIDED_PCA_CONFIGS = ("pair_bank:partition", "all_variants:partition")
-DEFAULT_GUIDED_MASK_NAMES = ("Top1", "Top2", "Top4", "S80")
+DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
 DEFAULT_STAGES = ("vanilla_ot", "pca_ot", "pca_guided_das", "regular_das")
 
 
@@ -124,7 +124,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pca-band-scheme", default=DEFAULT_PCA_BAND_SCHEME, choices=("equal", "head"))
     parser.add_argument("--pca-top-prefix-sizes", default="8,16,32,64")
     parser.add_argument("--guided-pca-configs", default="pair_bank:partition,all_variants:partition")
-    parser.add_argument("--guided-mask-names", default="Top1,Top2,Top4,S80")
+    parser.add_argument(
+        "--guided-mask-names",
+        default="Selected",
+        help="Deprecated compatibility flag. Guided DAS now uses the exact Selected PLOT handle.",
+    )
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
     parser.add_argument("--guided-subspace-dims", default=None)
@@ -145,7 +149,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     pca_basis_source_modes = _parse_csv_strings(args.pca_basis_source_modes) or DEFAULT_PCA_BASIS_SOURCE_MODES
     pca_top_prefix_sizes = _parse_csv_ints(args.pca_top_prefix_sizes) or DEFAULT_PCA_TOP_PREFIX_SIZES
     guided_pca_configs = _parse_csv_strings(args.guided_pca_configs) or DEFAULT_GUIDED_PCA_CONFIGS
-    guided_mask_names = _parse_csv_strings(args.guided_mask_names) or DEFAULT_GUIDED_MASK_NAMES
+    guided_mask_names = DEFAULT_GUIDED_MASK_NAMES
     guided_subspace_dims = None
     if args.guided_subspace_dims is not None:
         guided_subspace_dims = _parse_csv_ints(args.guided_subspace_dims)

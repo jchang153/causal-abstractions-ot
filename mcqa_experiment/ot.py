@@ -225,6 +225,7 @@ class OTConfig:
     calibration_family_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
     top_k_values_by_var: dict[str, tuple[int, ...]] | None = None
     lambda_values_by_var: dict[str, tuple[float, ...]] | None = None
+    store_prediction_details: bool = True
 
 
 def load_prepared_alignment_artifacts(
@@ -1182,7 +1183,7 @@ def run_alignment_pipeline(
         device=device,
         tokenizer=tokenizer,
         source_target_vars=target_source_target_vars,
-        include_details=True,
+        include_details=bool(config.store_prediction_details),
         pca_bases_by_id=pca_bases_by_id,
     )
     _synchronize_if_cuda(device)
@@ -1306,7 +1307,7 @@ def run_bruteforce_site_pipeline(
         batch_size=config.batch_size,
         device=device,
         tokenizer=tokenizer,
-        include_details=True,
+        include_details=bool(config.store_prediction_details),
         pca_bases_by_id=pca_bases_by_id,
     )
     holdout_result, holdout_ranking = _evaluate_single_site_intervention(
@@ -1318,7 +1319,7 @@ def run_bruteforce_site_pipeline(
         batch_size=config.batch_size,
         device=device,
         tokenizer=tokenizer,
-        include_details=True,
+        include_details=bool(config.store_prediction_details),
         pca_bases_by_id=pca_bases_by_id,
     )
     holdout_result["method"] = "bruteforce"
