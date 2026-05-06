@@ -217,7 +217,54 @@ def _native_selected_width_epsilon_runtime(
     rankings: dict[str, object],
     entries_by_var: dict[str, dict[str, object] | None],
     restrict_to_selected_layer: bool = False,
+    restrict_to_selected_width: bool = True,
+    restrict_to_selected_epsilon: bool = True,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, dict[int, float]]]:
+    if not bool(restrict_to_selected_width) or not bool(restrict_to_selected_epsilon):
+        runtime_grid_by_width: dict[tuple[str, int, int], float] = {}
+        for target_var in TARGET_VARS:
+            entries = rankings.get(target_var)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                layer = int(entry.get("layer", -1))
+                native_resolution = int(entry.get("native_resolution", entry.get("atomic_width", -1)))
+                if layer < 0 or native_resolution < 0:
+                    continue
+                key = (str(target_var), int(layer), int(native_resolution))
+                runtime_grid_by_width[key] = max(
+                    _as_float(runtime_grid_by_width.get(key)),
+                    _as_float(entry.get("runtime_seconds")),
+                )
+
+        downstream_by_var: dict[str, float] = {}
+        parallel_by_var: dict[str, float] = {}
+        runtime_by_layer_by_var: dict[str, dict[int, float]] = {}
+        for target_var, entry in entries_by_var.items():
+            if not entry:
+                downstream_by_var[target_var] = 0.0
+                parallel_by_var[target_var] = 0.0
+                runtime_by_layer_by_var[target_var] = {}
+                continue
+            selected_layer = int(entry.get("layer", -1))
+            selected_width = int(entry.get("native_resolution", entry.get("atomic_width", -1)))
+            layer_runtimes: dict[int, float] = {}
+            for (row_var, layer, native_resolution), runtime_seconds in runtime_grid_by_width.items():
+                if str(row_var) != str(target_var):
+                    continue
+                if restrict_to_selected_layer and int(layer) != int(selected_layer):
+                    continue
+                if restrict_to_selected_width and int(native_resolution) != int(selected_width):
+                    continue
+                layer_runtimes[int(layer)] = _as_float(layer_runtimes.get(int(layer))) + float(runtime_seconds)
+            runtime_by_layer_by_var[str(target_var)] = layer_runtimes
+            values = list(layer_runtimes.values())
+            downstream_by_var[str(target_var)] = float(sum(values))
+            parallel_by_var[str(target_var)] = float(max(values) if values else 0.0)
+        return downstream_by_var, parallel_by_var, runtime_by_layer_by_var
+
     runtime_grid: dict[tuple[str, int, int, float], float] = {}
     payload_paths: set[Path] = set()
     for target_var in TARGET_VARS:
@@ -321,8 +368,12 @@ def _pca_selected_config_epsilon_runtime(
     *,
     rankings: dict[str, object],
     entries_by_var: dict[str, dict[str, object] | None],
+    restrict_to_selected_layer: bool = False,
+    restrict_to_selected_config: bool = True,
+    restrict_to_selected_epsilon: bool = True,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, dict[int, float]]]:
     runtime_grid: dict[tuple[str, int, str, str, int, float], float] = {}
+    full_config_runtime_grid: dict[tuple[str, int, str, str, int], float] = {}
     payload_paths: set[Path] = set()
     for target_var in TARGET_VARS:
         entries = rankings.get(target_var)
@@ -354,6 +405,7 @@ def _pca_selected_config_epsilon_runtime(
                 + _as_float(timing_seconds.get("t_stageB_pca_site_build"))
             )
         config_setup_seconds += _signature_setup_seconds_from_payload(payload)
+        core_runtime_by_var: dict[str, float] = {}
         for ot_path_str in payload.get("ot_output_paths", []):
             compare_payload = _load_json(Path(str(ot_path_str)))
             if not isinstance(compare_payload, dict):
@@ -372,9 +424,50 @@ def _pca_selected_config_epsilon_runtime(
                     method_payload.get("runtime_seconds", method_payload.get("wall_runtime_seconds"))
                 )
                 method_signature_seconds = _as_float(method_payload.get("signature_prepare_runtime_seconds"))
+                core_runtime_by_var[target_var] = _as_float(core_runtime_by_var.get(target_var)) + float(
+                    method_runtime_seconds - method_signature_seconds
+                )
                 runtime_grid[(target_var, layer, basis_source_mode, site_menu, num_bands, epsilon)] = float(
                     method_runtime_seconds - method_signature_seconds + config_setup_seconds
                 )
+        for target_var, core_runtime_seconds in core_runtime_by_var.items():
+            full_config_runtime_grid[(target_var, layer, basis_source_mode, site_menu, num_bands)] = float(
+                config_setup_seconds + core_runtime_seconds
+            )
+
+    if not bool(restrict_to_selected_config) or not bool(restrict_to_selected_epsilon):
+        downstream_by_var: dict[str, float] = {}
+        parallel_by_var: dict[str, float] = {}
+        runtime_by_layer_by_var: dict[str, dict[int, float]] = {}
+        for target_var, entry in entries_by_var.items():
+            if not entry:
+                downstream_by_var[target_var] = 0.0
+                parallel_by_var[target_var] = 0.0
+                runtime_by_layer_by_var[target_var] = {}
+                continue
+            selected_layer = int(entry.get("layer", -1))
+            selected_basis = str(entry.get("basis_source_mode"))
+            selected_menu = str(entry.get("site_menu"))
+            selected_bands = int(entry.get("num_bands", -1))
+            layer_runtimes: dict[int, float] = {}
+            for (row_var, layer, basis_source_mode, site_menu, num_bands), runtime_seconds in full_config_runtime_grid.items():
+                if str(row_var) != str(target_var):
+                    continue
+                if restrict_to_selected_layer and int(layer) != int(selected_layer):
+                    continue
+                if restrict_to_selected_config:
+                    if str(basis_source_mode) != selected_basis:
+                        continue
+                    if str(site_menu) != selected_menu:
+                        continue
+                    if int(num_bands) != selected_bands:
+                        continue
+                layer_runtimes[int(layer)] = _as_float(layer_runtimes.get(int(layer))) + float(runtime_seconds)
+            runtime_by_layer_by_var[str(target_var)] = layer_runtimes
+            values = list(layer_runtimes.values())
+            downstream_by_var[str(target_var)] = float(sum(values))
+            parallel_by_var[str(target_var)] = float(max(values) if values else 0.0)
+        return downstream_by_var, parallel_by_var, runtime_by_layer_by_var
 
     downstream_by_var: dict[str, float] = {}
     parallel_by_var: dict[str, float] = {}
@@ -608,6 +701,7 @@ def build_paper_runtime_summary(
     pca_rankings = _read_rankings(sweep_root, "stage_b_pca_support_rankings.json")
     layer_das_rankings = _read_rankings(sweep_root, "stage_c_layer_das_rankings.json")
     native_guided_rankings = _read_rankings(sweep_root, "stage_c_native_support_das_rankings.json")
+    dimension_das_rankings = _read_rankings(sweep_root, "stage_c_dimension_das_rankings.json")
     pca_guided_rankings = _read_rankings(sweep_root, "stage_c_pca_support_das_rankings.json")
 
     native_stage_b_by_layer = _runtime_by_layer_from_rankings(native_rankings)
@@ -640,6 +734,8 @@ def build_paper_runtime_summary(
     native_downstream, native_parallel_by_var, native_runtime_by_layer_by_var = _native_selected_width_epsilon_runtime(
         rankings=native_rankings,
         entries_by_var=native_entries,
+        restrict_to_selected_width=False,
+        restrict_to_selected_epsilon=False,
     )
     native_shared_by_layer = {
         layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in native_runtime_by_layer_by_var.values())
@@ -656,7 +752,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=native_serial,
             parallel_downstream_seconds=native_parallel,
             shared_runtime_seconds_by_layer=native_shared_by_layer,
-            notes="Stage A plus the selected native-support width+epsilon slice, summed across all Stage B-executed layers for each variable; width/epsilon search overhead is excluded.",
+            notes="Stage A plus the full native-support localization sweep over all executed widths and epsilons for the Stage B-selected layers.",
         )
     )
 
@@ -664,6 +760,8 @@ def build_paper_runtime_summary(
     pca_downstream, pca_parallel_by_var, pca_runtime_by_layer_by_var = _pca_selected_config_epsilon_runtime(
         rankings=pca_rankings,
         entries_by_var=pca_entries,
+        restrict_to_selected_config=False,
+        restrict_to_selected_epsilon=False,
     )
     pca_shared_by_layer = {
         layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in pca_runtime_by_layer_by_var.values())
@@ -680,7 +778,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=pca_serial,
             parallel_downstream_seconds=pca_parallel,
             shared_runtime_seconds_by_layer=pca_shared_by_layer,
-            notes="Stage A plus the selected PCA-support config+epsilon slice, summed across all Stage B-executed layers for each variable; PCA config and epsilon search overhead is excluded.",
+            notes="Stage A plus the full PCA-support localization sweep over all executed PCA configs and epsilons for the Stage B-selected layers.",
         )
     )
 
@@ -712,6 +810,8 @@ def build_paper_runtime_summary(
         rankings=native_rankings,
         entries_by_var=native_guided_stage_b_entries,
         restrict_to_selected_layer=True,
+        restrict_to_selected_width=False,
+        restrict_to_selected_epsilon=False,
     )
     native_guided_stage_b_by_layer = {
         layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in native_guided_stage_b_runtime_by_layer_by_var.values())
@@ -741,27 +841,88 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=native_guided_serial,
             parallel_downstream_seconds=native_guided_parallel,
             shared_runtime_seconds_by_layer=native_guided_stage_b_by_layer,
-            notes="Stage A plus the exact selected native-support layer+width+epsilon localization runtime and DAS over the selected native supports.",
+            notes="Stage A plus the full native-support localization sweep over all widths and epsilons for the selected layer, then DAS over the selected native support.",
+        )
+    )
+
+    dimension_entries = {var: _first_entry(dimension_das_rankings, var) for var in TARGET_VARS}
+    dimension_stage_b_entries = _matching_native_stage_b_entries(
+        native_rankings=native_rankings,
+        guided_entries_by_var=dimension_entries,
+    )
+    (
+        dimension_stage_b_downstream,
+        dimension_stage_b_parallel_by_var,
+        dimension_stage_b_runtime_by_layer_by_var,
+    ) = _native_selected_width_epsilon_runtime(
+        rankings=native_rankings,
+        entries_by_var=dimension_stage_b_entries,
+        restrict_to_selected_layer=True,
+        restrict_to_selected_width=False,
+        restrict_to_selected_epsilon=False,
+    )
+    dimension_stage_b_by_layer = {
+        layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in dimension_stage_b_runtime_by_layer_by_var.values())
+        for layer in sorted(
+            {layer for layer_runtimes in dimension_stage_b_runtime_by_layer_by_var.values() for layer in layer_runtimes}
+        )
+    }
+    dimension_downstream = {}
+    dimension_das = {}
+    for var, entry in dimension_entries.items():
+        if entry:
+            stage_b_seconds = _as_float(dimension_stage_b_downstream.get(var))
+            das_seconds = _as_float(entry.get("runtime_seconds"))
+            dimension_das[var] = das_seconds
+            dimension_downstream[var] = stage_b_seconds + das_seconds
+        else:
+            dimension_das[var] = 0.0
+            dimension_downstream[var] = 0.0
+    dimension_serial = sum(_as_float(dimension_downstream.get(var)) for var in TARGET_VARS)
+    dimension_parallel = float(max((_as_float(dimension_downstream.get(var)) for var in TARGET_VARS), default=0.0))
+    records.append(
+        _method_record(
+            method="PLOT-DAS (dimension)",
+            stage_a_seconds=stage_a_seconds,
+            downstream_by_var=dimension_downstream,
+            entries_by_var=dimension_entries,
+            serial_downstream_seconds=dimension_serial,
+            parallel_downstream_seconds=dimension_parallel,
+            shared_runtime_seconds_by_layer=dimension_stage_b_by_layer,
+            notes="Stage A plus the full native-support localization sweep over all widths and epsilons for the selected layer, then full-layer DAS over dimensions around the selected native support width.",
         )
     )
 
     pca_guided_entries = {var: _first_entry(pca_guided_rankings, var) for var in TARGET_VARS}
-    pca_guided_stage_b_by_layer, pca_guided_stage_b_serial, _ = _unique_layer_runtime(
-        pca_guided_entries,
-        pca_stage_b_by_layer,
+    (
+        pca_guided_stage_b_downstream,
+        pca_guided_stage_b_parallel_by_var,
+        pca_guided_stage_b_runtime_by_layer_by_var,
+    ) = _pca_selected_config_epsilon_runtime(
+        rankings=pca_rankings,
+        entries_by_var=pca_guided_entries,
+        restrict_to_selected_layer=True,
+        restrict_to_selected_config=False,
+        restrict_to_selected_epsilon=False,
     )
+    pca_guided_stage_b_by_layer = {
+        layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in pca_guided_stage_b_runtime_by_layer_by_var.values())
+        for layer in sorted(
+            {layer for layer_runtimes in pca_guided_stage_b_runtime_by_layer_by_var.values() for layer in layer_runtimes}
+        )
+    }
     pca_guided_downstream = {}
     pca_guided_das = {}
     for var, entry in pca_guided_entries.items():
         if entry:
-            stage_b_seconds = pca_stage_b_by_layer.get(int(entry["layer"]), 0.0)
+            stage_b_seconds = _as_float(pca_guided_stage_b_downstream.get(var))
             das_seconds = _as_float(entry.get("runtime_seconds"))
             pca_guided_das[var] = das_seconds
             pca_guided_downstream[var] = stage_b_seconds + das_seconds
         else:
             pca_guided_das[var] = 0.0
             pca_guided_downstream[var] = 0.0
-    pca_guided_serial = pca_guided_stage_b_serial + sum(_as_float(pca_guided_das.get(var)) for var in TARGET_VARS)
+    pca_guided_serial = sum(_as_float(pca_guided_downstream.get(var)) for var in TARGET_VARS)
     pca_guided_parallel = max(_as_float(pca_guided_downstream.get(var)) for var in TARGET_VARS)
     records.append(
         _method_record(
@@ -772,7 +933,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=pca_guided_serial,
             parallel_downstream_seconds=pca_guided_parallel,
             shared_runtime_seconds_by_layer=pca_guided_stage_b_by_layer,
-            notes="Stage A plus PCA-support localization plus DAS over the selected PCA supports.",
+            notes="Stage A plus the full PCA-support localization sweep over all configs and epsilons for the selected layer, then DAS over the selected PCA supports.",
         )
     )
 
@@ -784,8 +945,8 @@ def build_paper_runtime_summary(
         "kind": "mcqa_paper_runtime_summary",
         "sweep_root": str(sweep_root),
         "stage_a_runtime_seconds": float(stage_a_seconds),
-        "native_stage_b_runtime_seconds_by_layer": {str(k): float(v) for k, v in native_stage_b_by_layer.items()},
-        "pca_stage_b_runtime_seconds_by_layer": {str(k): float(v) for k, v in pca_stage_b_by_layer.items()},
+        "native_stage_b_runtime_seconds_by_layer": {str(k): float(v) for k, v in native_shared_by_layer.items()},
+        "pca_stage_b_runtime_seconds_by_layer": {str(k): float(v) for k, v in pca_shared_by_layer.items()},
         "methods": records,
         "test_used_for_selection": False,
     }

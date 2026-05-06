@@ -28,7 +28,9 @@ DEFAULT_PCA_BASIS_SOURCE_MODES = ("pair_bank", "all_variants")
 DEFAULT_PCA_NUM_BANDS_VALUES = (8, 16)
 DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_PCA_TOP_PREFIX_SIZES = (8, 16, 32, 64)
-DEFAULT_GUIDED_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
+DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
+DEFAULT_GUIDED_SUPPORT_DIM_COUNT = 10
+DEFAULT_DIM_HINT_SCALE_FACTORS = (0.5, 0.75, 1.0, 1.25, 1.5)
 DEFAULT_NATIVE_RESOLUTIONS = [16, 32, 128, 256]
 DEFAULT_DAS_SUBSPACE_DIMS = (
     32,
@@ -49,6 +51,7 @@ DEFAULT_STAGES = (
     "stage_b_plot_pca_support",
     "stage_c_plot_das_layer",
     "stage_c_plot_das_native_support",
+    "stage_c_plot_das_dimension",
     "stage_c_plot_das_pca_support",
 )
 
@@ -285,7 +288,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument(
         "--stages",
-        default="stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_layer,stage_c_plot_das_native_support,stage_c_plot_das_pca_support",
+        default="stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_layer,stage_c_plot_das_native_support,stage_c_plot_das_dimension,stage_c_plot_das_pca_support",
     )
     parser.add_argument("--stage-a-token-position-ids", default="last_token")
     parser.add_argument("--stage-a-layer-indices", default=None, help="Comma-separated layer indices. Default: all layers.")
@@ -324,16 +327,26 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pca-num-bands-values", default="8,16")
     parser.add_argument("--pca-band-scheme", default=DEFAULT_PCA_BAND_SCHEME, choices=("equal", "head"))
     parser.add_argument("--pca-top-prefix-sizes", default="8,16,32,64")
-    parser.add_argument("--stage-c-top-configs-per-var", type=int, default=2)
-    parser.add_argument("--guided-mask-names", default="Top1,Top2,Top4,S50,S80")
+    parser.add_argument("--stage-c-top-configs-per-var", type=int, default=1)
+    parser.add_argument(
+        "--guided-mask-names",
+        default="Selected",
+        help="Deprecated for native-support DAS; native support always uses the exact Selected PLOT handle.",
+    )
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
     parser.add_argument("--screen-restarts", type=int, default=1)
     parser.add_argument("--guided-restarts", type=int, default=2)
+    parser.add_argument("--guided-support-dim-count", type=int, default=DEFAULT_GUIDED_SUPPORT_DIM_COUNT)
     parser.add_argument(
         "--guided-subspace-dims",
         default=None,
-        help="Optional comma-separated guided DAS dims override. Native support defaults to the standard DAS grid clipped to the support width.",
+        help="Deprecated for native-support DAS. Native support defaults to evenly spaced dims up to the selected support width.",
+    )
+    parser.add_argument(
+        "--stage-c-dim-hint-scale-factors",
+        default="0.5,0.75,1,1.25,1.5",
+        help="Comma-separated multiplicative full-layer DAS dimension factors around the selected native support width.",
     )
     parser.add_argument("--full-das-output", type=Path, action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument(
@@ -370,6 +383,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     guided_subspace_dims = None
     if args.guided_subspace_dims is not None:
         guided_subspace_dims = _parse_csv_ints(args.guided_subspace_dims)
+    dim_hint_scale_factors = _parse_csv_floats(args.stage_c_dim_hint_scale_factors) or DEFAULT_DIM_HINT_SCALE_FACTORS
     regular_das_subspace_dims = _parse_csv_ints(args.regular_das_subspace_dims) or DEFAULT_DAS_SUBSPACE_DIMS
     results_timestamp = (
         args.results_timestamp
@@ -397,7 +411,9 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "ot_lambdas": tuple(float(value) for value in ot_lambdas),
         "calibration_family_weights": tuple(float(weight) for weight in calibration_family_weights),
         "guided_mask_names": tuple(str(mask_name) for mask_name in guided_mask_names),
+        "guided_support_dim_count": max(1, int(args.guided_support_dim_count)),
         "guided_subspace_dims": None if guided_subspace_dims is None else tuple(int(dim) for dim in guided_subspace_dims),
+        "dim_hint_scale_factors": tuple(float(value) for value in dim_hint_scale_factors),
         "regular_das_subspace_dims": tuple(int(dim) for dim in regular_das_subspace_dims),
         "results_timestamp": str(results_timestamp),
     }
@@ -638,7 +654,13 @@ def _build_layer_das_command(
     token_position_id: str,
     layer: int,
     target_vars: tuple[str, ...],
+    das_subspace_dims: tuple[int, ...] | None = None,
 ) -> tuple[str, ...]:
+    resolved_das_subspace_dims = (
+        tuple(int(dim) for dim in normalized["regular_das_subspace_dims"])
+        if das_subspace_dims is None
+        else tuple(int(dim) for dim in das_subspace_dims)
+    )
     command = [
         sys.executable,
         "mcqa_plot_das_layer.py",
@@ -669,7 +691,13 @@ def _build_layer_das_command(
         "--signature-mode",
         str(args.signature_mode),
         "--das-subspace-dims",
-        ",".join(str(dim) for dim in normalized["regular_das_subspace_dims"]),
+        ",".join(str(dim) for dim in resolved_das_subspace_dims),
+        "--das-max-epochs",
+        str(int(args.guided_max_epochs)),
+        "--das-min-epochs",
+        str(int(args.guided_min_epochs)),
+        "--das-restarts",
+        str(max(1, int(args.guided_restarts))),
         "--results-root",
         str(args.results_root),
         "--results-timestamp",
@@ -718,6 +746,8 @@ def _build_native_support_das_command(
         ",".join(str(target_var) for target_var in target_vars),
         "--guided-mask-names",
         ",".join(str(mask_name) for mask_name in normalized["guided_mask_names"]),
+        "--guided-support-dim-count",
+        str(int(normalized["guided_support_dim_count"])),
         "--guided-max-epochs",
         str(int(args.guided_max_epochs)),
         "--guided-min-epochs",
@@ -731,13 +761,6 @@ def _build_native_support_das_command(
         "--signatures-dir",
         str(args.signatures_dir),
     ]
-    if normalized["guided_subspace_dims"] is not None:
-        command.extend(
-            [
-                "--guided-subspace-dims",
-                ",".join(str(dim) for dim in normalized["guided_subspace_dims"]),
-            ]
-        )
     _append_optional_arg(command, "--dataset-config", args.dataset_config)
     if bool(args.prompt_hf_login):
         command.append("--prompt-hf-login")
@@ -1159,9 +1182,33 @@ def _stage_b_payload_matches_target_vars(
     actual_transport_target_vars = payload.get("transport_target_vars")
     if not isinstance(actual_transport_target_vars, list):
         return False
-    return tuple(str(target_var) for target_var in actual_transport_target_vars) == tuple(
+    if tuple(str(target_var) for target_var in actual_transport_target_vars) != tuple(
         str(target_var) for target_var in expected_transport_target_vars
-    )
+    ):
+        return False
+    support_by_var = payload.get("support_by_var")
+    kind = str(payload.get("kind"))
+    if kind in {"mcqa_plot_native_support_layer", "mcqa_plot_pca_support_layer"} and not isinstance(support_by_var, dict):
+        return False
+    if isinstance(support_by_var, dict):
+        for target_var in expected_target_vars:
+            support_summary = support_by_var.get(str(target_var))
+            if not isinstance(support_summary, dict):
+                return False
+            mask_candidates = support_summary.get("mask_candidates", [])
+            if not isinstance(mask_candidates, list):
+                return False
+            selected_candidate = next(
+                (
+                    candidate
+                    for candidate in mask_candidates
+                    if isinstance(candidate, dict) and str(candidate.get("name")) == "Selected"
+                ),
+                None,
+            )
+            if not isinstance(selected_candidate, dict) or not selected_candidate.get("site_indices"):
+                return False
+    return True
 
 
 def _das_payload_matches_target_vars(*, payload_path: Path, expected_target_vars: tuple[str, ...]) -> bool:
@@ -1171,15 +1218,19 @@ def _das_payload_matches_target_vars(*, payload_path: Path, expected_target_vars
     if not isinstance(payload, dict):
         return False
     expected = tuple(str(target_var) for target_var in expected_target_vars)
-    actual = payload.get("target_vars")
-    if isinstance(actual, list):
-        return tuple(str(target_var) for target_var in actual) == expected
     kind = str(payload.get("kind"))
     if kind == "mcqa_plot_das_native_support":
+        if str(payload.get("support_mode")) != "selected_plot_handle":
+            return False
+        if payload.get("guided_support_dim_count") is None:
+            return False
         payloads_by_var = payload.get("payloads_by_var", {})
         if not isinstance(payloads_by_var, dict):
             return False
         return tuple(str(target_var) for target_var in payloads_by_var.keys()) == expected
+    actual = payload.get("target_vars")
+    if isinstance(actual, list):
+        return tuple(str(target_var) for target_var in actual) == expected
     if kind == "mcqa_plot_das_pca_support_layer":
         if isinstance(actual, list):
             return tuple(str(target_var) for target_var in actual) == expected
@@ -1322,10 +1373,41 @@ def _extract_native_support_rankings(*, payload_paths: Iterable[Path]) -> dict[s
                 continue
             support_summary = support_by_var.get(str(target_var), {}) if isinstance(support_by_var, dict) else {}
             top_site_label = None
+            selected_site_total_dim = None
+            selected_site_labels = None
+            selected_top_k = None
+            selected_lambda = None
             if isinstance(support_summary, dict):
                 ranked_site_labels = support_summary.get("ranked_site_labels", [])
                 if isinstance(ranked_site_labels, list) and ranked_site_labels:
                     top_site_label = ranked_site_labels[0]
+                mask_candidates = support_summary.get("mask_candidates", [])
+                if isinstance(mask_candidates, list):
+                    selected_mask = next(
+                        (
+                            candidate
+                            for candidate in mask_candidates
+                            if isinstance(candidate, dict) and str(candidate.get("name")) == "Selected"
+                        ),
+                        None,
+                    )
+                    if isinstance(selected_mask, dict):
+                        if selected_mask.get("site_total_dim") is not None:
+                            selected_site_total_dim = int(selected_mask.get("site_total_dim", 0))
+                        if isinstance(selected_mask.get("site_labels"), list):
+                            selected_site_labels = [str(label) for label in selected_mask.get("site_labels", [])]
+                selected_trial = support_summary.get("selected_trial", {})
+                if isinstance(selected_trial, dict):
+                    if selected_trial.get("top_k") is not None:
+                        selected_top_k = int(selected_trial.get("top_k"))
+                    if selected_trial.get("lambda") is not None:
+                        selected_lambda = float(selected_trial.get("lambda"))
+            selected_hyperparameters = method_summary.get("selected_hyperparameters", {})
+            if isinstance(selected_hyperparameters, dict):
+                if selected_top_k is None and selected_hyperparameters.get("top_k") is not None:
+                    selected_top_k = int(selected_hyperparameters.get("top_k"))
+                if selected_lambda is None and selected_hyperparameters.get("lambda") is not None:
+                    selected_lambda = float(selected_hyperparameters.get("lambda"))
             rankings.setdefault(str(target_var), []).append(
                 {
                     "variable": str(target_var),
@@ -1335,6 +1417,10 @@ def _extract_native_support_rankings(*, payload_paths: Iterable[Path]) -> dict[s
                     "selection_score": float(method_summary.get("selection_score", 0.0)),
                     "epsilon": float(method_summary.get("epsilon", 0.0)),
                     "site_label": top_site_label or method_summary.get("site_label"),
+                    "selected_top_k": selected_top_k,
+                    "selected_lambda": selected_lambda,
+                    "selected_site_total_dim": selected_site_total_dim,
+                    "selected_site_labels": selected_site_labels,
                     "runtime_seconds": float(runtime_seconds),
                     "payload_path": str(payload_path),
                 }
@@ -1386,6 +1472,12 @@ def _extract_native_support_das_rankings(*, payload_paths: Iterable[Path]) -> di
             continue
         layer = int(payload.get("layer"))
         native_resolution = int(payload.get("native_resolution", payload.get("atomic_width")))
+        native_support_payload = None
+        native_support_path = payload.get("native_support_path")
+        if native_support_path is not None and Path(str(native_support_path)).exists():
+            maybe_native_support_payload = _load_json(Path(str(native_support_path)))
+            if isinstance(maybe_native_support_payload, dict):
+                native_support_payload = maybe_native_support_payload
         for target_var, das_payload in payload.get("payloads_by_var", {}).items():
             if not isinstance(das_payload, dict):
                 continue
@@ -1393,6 +1485,24 @@ def _extract_native_support_das_rankings(*, payload_paths: Iterable[Path]) -> di
             if not results or not isinstance(results[0], dict):
                 continue
             result = results[0]
+            selected_metadata: dict[str, object] = {}
+            if isinstance(native_support_payload, dict):
+                support_summary = native_support_payload.get("support_by_var", {}).get(str(target_var), {})
+                if isinstance(support_summary, dict):
+                    selected_trial = support_summary.get("selected_trial", {})
+                    if isinstance(selected_trial, dict):
+                        if selected_trial.get("top_k") is not None:
+                            selected_metadata["selected_top_k"] = int(selected_trial.get("top_k"))
+                        if selected_trial.get("lambda") is not None:
+                            selected_metadata["selected_lambda"] = float(selected_trial.get("lambda"))
+                    for candidate in support_summary.get("mask_candidates", []):
+                        if not isinstance(candidate, dict) or str(candidate.get("name")) != "Selected":
+                            continue
+                        if candidate.get("site_total_dim") is not None:
+                            selected_metadata["selected_site_total_dim"] = int(candidate.get("site_total_dim", 0))
+                        if isinstance(candidate.get("site_labels"), list):
+                            selected_metadata["selected_site_labels"] = [str(label) for label in candidate.get("site_labels", [])]
+                        break
             rankings.setdefault(str(target_var), []).append(
                 {
                     "variable": str(target_var),
@@ -1404,6 +1514,57 @@ def _extract_native_support_das_rankings(*, payload_paths: Iterable[Path]) -> di
                     "subspace_dim": result.get("subspace_dim"),
                     "site_total_dim": result.get("site_total_dim"),
                     "runtime_seconds": float(das_payload.get("runtime_seconds", payload.get("runtime_seconds", 0.0))),
+                    **selected_metadata,
+                }
+            )
+    for target_var in list(rankings):
+        rankings[target_var] = _sort_best_first(rankings[target_var])
+    return rankings
+
+
+def _extract_dimension_das_rankings(
+    *,
+    payload_records: Iterable[tuple[Path, dict[str, object]]],
+) -> dict[str, list[dict[str, object]]]:
+    rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+    for payload_path, metadata in payload_records:
+        payload = _load_json(payload_path)
+        if not isinstance(payload, dict) or str(payload.get("kind")) != "mcqa_plot_das_layer":
+            continue
+        target_var = str(metadata.get("variable"))
+        layer = int(metadata.get("layer", payload.get("layer", -1)))
+        native_resolution = int(metadata.get("native_resolution", metadata.get("atomic_width", -1)))
+        method_payloads = payload.get("method_payloads", {}).get("das", [])
+        for method_payload in method_payloads:
+            if not isinstance(method_payload, dict):
+                continue
+            results = method_payload.get("results", [])
+            if not results or not isinstance(results[0], dict):
+                continue
+            result = results[0]
+            result_target_var = str(method_payload.get("target_var") or result.get("variable"))
+            if result_target_var != target_var:
+                continue
+            rankings.setdefault(target_var, []).append(
+                {
+                    "variable": target_var,
+                    "layer": int(layer),
+                    "native_resolution": int(native_resolution),
+                    "exact_acc": float(result.get("exact_acc", 0.0)),
+                    "selection_score": _selection_score(result),
+                    "site_label": result.get("site_label"),
+                    "subspace_dim": result.get("subspace_dim"),
+                    "site_total_dim": result.get("site_total_dim"),
+                    "runtime_seconds": float(payload.get("runtime_seconds", 0.0)),
+                    "payload_path": str(payload_path),
+                    "native_support_payload_path": metadata.get("payload_path"),
+                    "dim_hint_effective_dim": metadata.get("dim_hint_effective_dim"),
+                    "dim_hint_subspace_dims": metadata.get("dim_hint_subspace_dims"),
+                    "selected_top_k": metadata.get("selected_top_k"),
+                    "selected_lambda": metadata.get("selected_lambda"),
+                    "selected_site_total_dim": metadata.get("selected_site_total_dim"),
+                    "selected_site_labels": metadata.get("selected_site_labels"),
+                    "epsilon": metadata.get("epsilon"),
                 }
             )
     for target_var in list(rankings):
@@ -1427,10 +1588,20 @@ def _format_native_summary(*, title: str, rankings: dict[str, list[dict[str, obj
                 parts.append(f"eps={float(entry['epsilon']):g}")
             if entry.get("site_label") is not None:
                 parts.append(f"site={entry.get('site_label')}")
+            if entry.get("selected_top_k") is not None:
+                parts.append(f"k={entry.get('selected_top_k')}")
+            if entry.get("selected_lambda") is not None:
+                parts.append(f"lambda={float(entry.get('selected_lambda')):g}")
+            if entry.get("selected_site_total_dim") is not None:
+                parts.append(f"selected_width={entry.get('selected_site_total_dim')}")
             if entry.get("subspace_dim") is not None:
                 parts.append(f"dim={entry.get('subspace_dim')}")
             if entry.get("site_total_dim") is not None:
                 parts.append(f"width={entry.get('site_total_dim')}")
+            if entry.get("dim_hint_effective_dim") is not None:
+                parts.append(f"dim_hint_width={entry.get('dim_hint_effective_dim')}")
+            if entry.get("dim_hint_subspace_dims") is not None:
+                parts.append(f"dim_grid={entry.get('dim_hint_subspace_dims')}")
             if entry.get("runtime_seconds") is not None:
                 parts.append(f"runtime={float(entry['runtime_seconds']):.2f}s")
             lines.append("  - " + " ".join(parts))
@@ -1482,6 +1653,54 @@ def _select_stage_c_config_targets(
         }
         for key, layers in grouped.items()
     }
+
+
+def _select_stage_c_native_support_groups(
+    *,
+    rankings: dict[str, list[dict[str, object]]],
+    top_configs_per_var: int,
+) -> dict[Path, tuple[str, ...]]:
+    grouped: dict[Path, list[str]] = {}
+    for target_var in DEFAULT_TARGET_VARS:
+        for entry in rankings.get(target_var, [])[: max(1, int(top_configs_per_var))]:
+            payload_path = entry.get("payload_path")
+            if payload_path is None:
+                continue
+            grouped.setdefault(Path(str(payload_path)), []).append(str(target_var))
+    return {
+        payload_path: tuple(dict.fromkeys(target_vars))
+        for payload_path, target_vars in grouped.items()
+    }
+
+
+def _select_stage_c_native_support_entries(
+    *,
+    rankings: dict[str, list[dict[str, object]]],
+    top_configs_per_var: int,
+) -> list[dict[str, object]]:
+    selected: list[dict[str, object]] = []
+    for target_var in DEFAULT_TARGET_VARS:
+        for entry in rankings.get(target_var, [])[: max(1, int(top_configs_per_var))]:
+            record = dict(entry)
+            record["variable"] = str(target_var)
+            selected.append(record)
+    return selected
+
+
+def _dim_hint_subspace_dims(
+    effective_dim: int,
+    *,
+    min_dim: int = 32,
+    max_dim: int = 2304,
+    scale_factors: Iterable[float] = DEFAULT_DIM_HINT_SCALE_FACTORS,
+) -> tuple[int, ...]:
+    dims: list[int] = []
+    for factor in scale_factors:
+        dim = int(round(float(effective_dim) * float(factor)))
+        dim = max(int(min_dim), min(int(max_dim), dim))
+        dims.append(dim)
+    dims.append(max(int(min_dim), min(int(max_dim), int(effective_dim))))
+    return tuple(sorted(dict.fromkeys(dims)))
 
 
 def _extract_stage_c_rankings(*, payload_paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
@@ -1602,9 +1821,11 @@ def _write_status(
             "pca_basis_source_modes": list(normalized["pca_basis_source_modes"]),
             "pca_num_bands_values": list(normalized["pca_num_bands_values"]),
             "guided_mask_names": list(normalized["guided_mask_names"]),
+            "guided_support_dim_count": int(normalized["guided_support_dim_count"]),
             "guided_subspace_dims": None
             if normalized["guided_subspace_dims"] is None
             else list(normalized["guided_subspace_dims"]),
+            "stage_c_dim_hint_scale_factors": list(normalized["dim_hint_scale_factors"]),
             "regular_das_subspace_dims": list(normalized["regular_das_subspace_dims"]),
         },
         "stage_statuses": stage_statuses,
@@ -1801,6 +2022,7 @@ def main() -> None:
                     stage_a_summary_paths.append(ranking_json_path)
 
     native_payload_paths: list[Path] = []
+    native_ot_rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     stage_b_selection_logged: set[str] = set()
     if "stage_b_plot_native_support" in normalized["stages"]:
         for token_position_id, rankings in stage_a_rankings_by_token.items():
@@ -1923,7 +2145,10 @@ def main() -> None:
             sweep_root / "stage_b_native_support_rankings.txt",
             _format_native_summary(title="MCQA Hierarchical Stage B Native Support Ranking", rankings=native_ot_rankings),
         )
-    elif "stage_c_plot_das_native_support" in normalized["stages"]:
+    elif (
+        "stage_c_plot_das_native_support" in normalized["stages"]
+        or "stage_c_plot_das_dimension" in normalized["stages"]
+    ):
         for token_position_id, rankings in stage_a_rankings_by_token.items():
             if str(token_position_id) != "last_token":
                 continue
@@ -1948,6 +2173,18 @@ def main() -> None:
                 )
                 if _stage_output_is_valid(path)
             )
+        if native_payload_paths:
+            native_ot_rankings = _extract_native_support_rankings(payload_paths=native_payload_paths)
+        else:
+            native_rankings_path = sweep_root / "stage_b_native_support_rankings.json"
+            if _stage_output_is_valid(native_rankings_path):
+                maybe_rankings = _load_json(native_rankings_path)
+                if isinstance(maybe_rankings, dict):
+                    native_ot_rankings = {
+                        str(target_var): [dict(entry) for entry in entries if isinstance(entry, dict)]
+                        for target_var, entries in maybe_rankings.items()
+                        if isinstance(entries, list)
+                    }
 
     if "stage_c_plot_das_layer" in normalized["stages"]:
         layer_das_payload_paths: list[Path] = []
@@ -2000,24 +2237,19 @@ def main() -> None:
             _format_native_summary(title="MCQA Hierarchical Stage C Layer DAS Ranking", rankings=layer_das_rankings),
         )
 
-    if "stage_c_plot_das_native_support" in normalized["stages"] and native_payload_paths:
+    if "stage_c_plot_das_native_support" in normalized["stages"] and native_ot_rankings:
         native_das_payload_paths: list[Path] = []
-        native_target_vars_by_layer: dict[int, tuple[str, ...]] = {}
-        for token_position_id, rankings in stage_a_rankings_by_token.items():
-            selected_layers_by_var = _select_stage_b_layers_by_var(
-                rankings=rankings,
-                top_layers_per_var=int(args.stage_b_top_layers_per_var),
-                neighbor_radius=int(args.stage_b_neighbor_radius),
-                max_layers_per_var=int(args.stage_b_max_layers_per_var),
-            )
-            for layer, target_vars in _selected_target_vars_by_layer(selected_by_var=selected_layers_by_var).items():
-                native_target_vars_by_layer[int(layer)] = tuple(str(target_var) for target_var in target_vars)
-        for native_payload_path in native_payload_paths:
+        native_support_groups = _select_stage_c_native_support_groups(
+            rankings=native_ot_rankings,
+            top_configs_per_var=int(args.stage_c_top_configs_per_var),
+        )
+        for native_payload_path, target_vars in native_support_groups.items():
+            if not _stage_output_is_valid(native_payload_path):
+                continue
             native_payload = _load_json(native_payload_path)
             if not isinstance(native_payload, dict):
                 continue
             layer = int(native_payload.get("layer"))
-            target_vars = native_target_vars_by_layer.get(int(layer), tuple(str(target_var) for target_var in DEFAULT_TARGET_VARS))
             native_resolution = int(native_payload.get("native_resolution", native_payload.get("atomic_width")))
             stage_name = f"stage_c_native_L{int(layer):02d}_W{int(native_resolution):04d}"
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageC_native_L{int(layer):02d}_W{int(native_resolution):04d}"
@@ -2049,6 +2281,70 @@ def main() -> None:
         _write_text(
             sweep_root / "stage_c_native_support_das_rankings.txt",
             _format_native_summary(title="MCQA Hierarchical Stage C Native Support DAS Ranking", rankings=native_das_rankings),
+        )
+
+    if "stage_c_plot_das_dimension" in normalized["stages"] and native_ot_rankings:
+        dimension_payload_records: list[tuple[Path, dict[str, object]]] = []
+        selected_entries = _select_stage_c_native_support_entries(
+            rankings=native_ot_rankings,
+            top_configs_per_var=int(args.stage_c_top_configs_per_var),
+        )
+        for entry in selected_entries:
+            target_var = str(entry.get("variable"))
+            if target_var not in DEFAULT_TARGET_VARS:
+                continue
+            effective_dim = int(entry.get("selected_site_total_dim") or 0)
+            if effective_dim <= 0:
+                continue
+            native_support_path = entry.get("payload_path")
+            if native_support_path is None or not _stage_output_is_valid(Path(str(native_support_path))):
+                continue
+            layer = int(entry["layer"])
+            native_resolution = int(entry.get("native_resolution", entry.get("atomic_width", -1)))
+            das_subspace_dims = _dim_hint_subspace_dims(
+                effective_dim,
+                scale_factors=normalized["dim_hint_scale_factors"],
+            )
+            stage_name = f"stage_c_dimension_{target_var}_L{int(layer):02d}_W{int(native_resolution):04d}"
+            stage_timestamp = (
+                f"{str(normalized['results_timestamp'])}_stageC_dimension_{target_var}"
+                f"_L{int(layer):02d}_W{int(native_resolution):04d}"
+            )
+            run_root = results_root / f"{stage_timestamp}_mcqa_plot_das_layer"
+            payload_path = run_root / f"layer_{int(layer):02d}" / (
+                f"mcqa_plot_das_layer_layer-{int(layer)}_pos-last_token_summary.json"
+            )
+            if not _das_payload_matches_target_vars(payload_path=payload_path, expected_target_vars=(target_var,)):
+                stage = SweepStage(
+                    name=stage_name,
+                    category="stage_c_plot_das_dimension",
+                    description=(
+                        f"Full-layer DAS around selected native support width for {target_var}: "
+                        f"layer {int(layer)} width {int(native_resolution)} dims={list(das_subspace_dims)}."
+                    ),
+                    stage_timestamp=stage_timestamp,
+                    command=_build_layer_das_command(
+                        args=args,
+                        normalized=normalized,
+                        stage_timestamp=stage_timestamp,
+                        token_position_id="last_token",
+                        layer=int(layer),
+                        target_vars=(target_var,),
+                        das_subspace_dims=das_subspace_dims,
+                    ),
+                    expected_outputs=(str(payload_path),),
+                )
+                _run_stage_command(stage=stage, repo_root=repo_root)
+            if _stage_output_is_valid(payload_path):
+                metadata = dict(entry)
+                metadata["dim_hint_effective_dim"] = int(effective_dim)
+                metadata["dim_hint_subspace_dims"] = list(das_subspace_dims)
+                dimension_payload_records.append((payload_path, metadata))
+        dimension_das_rankings = _extract_dimension_das_rankings(payload_records=dimension_payload_records)
+        _write_json(sweep_root / "stage_c_dimension_das_rankings.json", dimension_das_rankings)
+        _write_text(
+            sweep_root / "stage_c_dimension_das_rankings.txt",
+            _format_native_summary(title="MCQA Hierarchical Stage C Dimension DAS Ranking", rankings=dimension_das_rankings),
         )
 
     stage_b_payload_paths: list[Path] = []

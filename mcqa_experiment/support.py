@@ -172,6 +172,44 @@ def _mask_candidates_from_ordered_support(
     return mask_candidates
 
 
+def _selected_site_indices_from_payload(
+    payload: dict[str, object],
+    *,
+    sites: list[SiteLike],
+) -> tuple[int, ...]:
+    result = payload.get("results", [{}])[0]
+    if not isinstance(result, dict):
+        return ()
+    labels = result.get("selected_site_labels")
+    if not isinstance(labels, list) or not labels:
+        fallback_label = result.get("top_site_label") or result.get("site_label")
+        labels = [fallback_label] if fallback_label is not None else []
+    label_to_index = {str(site.label): index for index, site in enumerate(sites)}
+    selected: list[int] = []
+    for label in labels:
+        index = label_to_index.get(str(label))
+        if index is not None:
+            selected.append(int(index))
+    return tuple(dict.fromkeys(selected))
+
+
+def _selected_mask_candidate_from_payload(
+    payload: dict[str, object],
+    *,
+    sites: list[SiteLike],
+) -> dict[str, object] | None:
+    selected_indices = _selected_site_indices_from_payload(payload, sites=sites)
+    if not selected_indices:
+        return None
+    return {
+        "name": "Selected",
+        "site_indices": list(selected_indices),
+        "site_labels": [sites[site_index].label for site_index in selected_indices],
+        "site_total_dim": int(_site_mask_total_dim(sites=sites, site_mask=selected_indices)),
+        "selection_source": "best_calibrated_plot_handle",
+    }
+
+
 def extract_ordered_site_support(
     *,
     ot_run_payloads: list[dict[str, object]],
@@ -251,11 +289,43 @@ def extract_ordered_site_support(
         )
         if not ranked_site_indices:
             continue
+        best_payload = max(
+            payloads,
+            key=lambda payload: float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
+        )
+        selected_candidate = _selected_mask_candidate_from_payload(best_payload, sites=sites)
+        mask_candidates = _mask_candidates_from_ordered_support(
+            ranked_site_indices=ranked_site_indices,
+            evidence_by_site=evidence_by_site,
+            sites=sites,
+            prefix_sizes=prefix_sizes,
+            coverage_specs=coverage_specs,
+        )
+        if selected_candidate is not None:
+            selected_mask = tuple(selected_candidate["site_indices"])
+            mask_candidates = [
+                selected_candidate,
+                *[
+                    candidate
+                    for candidate in mask_candidates
+                    if tuple(candidate.get("site_indices", [])) != selected_mask
+                ],
+            ]
+        best_result = best_payload.get("results", [{}])[0]
+        best_result = best_result if isinstance(best_result, dict) else {}
         support_by_var[str(target_var)] = {
             "target_var": str(target_var),
             "best_selection_score": float(best_score),
             "score_slack": float(score_slack),
             "kept_trial_count": len(kept_payloads),
+            "selected_trial": {
+                "selection_score": float(best_result.get("selection_score", 0.0)),
+                "exact_acc": float(best_result.get("exact_acc", 0.0)),
+                "epsilon": float(best_payload.get("transport_meta", {}).get("epsilon_config", best_payload.get("ot_epsilon", 0.0))),
+                "top_k": best_result.get("top_k"),
+                "lambda": best_result.get("lambda"),
+                "selected_site_labels": list(best_result.get("selected_site_labels", []) or []),
+            },
             "kept_trials": [
                 {
                     "selection_score": float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
@@ -274,13 +344,7 @@ def extract_ordered_site_support(
             },
             "ranked_site_indices": [int(site_index) for site_index in ranked_site_indices],
             "ranked_site_labels": [sites[site_index].label for site_index in ranked_site_indices],
-            "mask_candidates": _mask_candidates_from_ordered_support(
-                ranked_site_indices=ranked_site_indices,
-                evidence_by_site=evidence_by_site,
-                sites=sites,
-                prefix_sizes=prefix_sizes,
-                coverage_specs=coverage_specs,
-            ),
+            "mask_candidates": mask_candidates,
         }
     return support_by_var
 

@@ -16,8 +16,8 @@ from mcqa_experiment.support import build_ordered_composite_sites_from_support
 
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
-DEFAULT_GUIDED_MASK_NAMES = ("Top1", "Top2", "Top4", "S50", "S80")
-DEFAULT_GUIDED_SUBSPACE_DIMS = (32, 64, 96, 128, 256, 512, 768, 1024, 1536, 2048, 2304)
+DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
+DEFAULT_GUIDED_SUPPORT_DIM_COUNT = 10
 
 
 def _parse_csv_strings(value: str | None) -> list[str] | None:
@@ -48,11 +48,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--native-support-path", required=True)
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
-    parser.add_argument("--guided-mask-names", help="Comma-separated support masks. Default: Top1,Top2,Top4,S50,S80")
+    parser.add_argument(
+        "--guided-mask-names",
+        help="Deprecated compatibility flag. Native support DAS always uses the exact Selected PLOT handle.",
+    )
+    parser.add_argument("--guided-support-dim-count", type=int, default=DEFAULT_GUIDED_SUPPORT_DIM_COUNT)
     parser.add_argument(
         "--guided-subspace-dims",
         default=None,
-        help="Optional comma-separated DAS dims override. By default native support uses the standard DAS grid clipped to the support width.",
+        help="Deprecated compatibility flag. By default native support uses evenly spaced dims up to the selected support width.",
     )
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
@@ -92,15 +96,17 @@ def _load_json(path: Path) -> dict[str, object]:
     return payload
 
 
-def _filter_support_summary(support_summary: dict[str, object], mask_names: tuple[str, ...]) -> dict[str, object]:
-    allowed = set(str(mask_name) for mask_name in mask_names)
-    filtered_candidates = [
-        candidate
-        for candidate in support_summary.get("mask_candidates", [])
-        if str(candidate.get("name")) in allowed
-    ]
-    if not filtered_candidates and support_summary.get("mask_candidates"):
-        filtered_candidates = [support_summary["mask_candidates"][0]]
+def _selected_support_summary(support_summary: dict[str, object]) -> dict[str, object]:
+    mask_candidates = support_summary.get("mask_candidates", [])
+    filtered_candidates = []
+    if isinstance(mask_candidates, list):
+        filtered_candidates = [
+            candidate
+            for candidate in mask_candidates
+            if isinstance(candidate, dict) and str(candidate.get("name")) == "Selected"
+        ]
+    if not filtered_candidates:
+        raise ValueError("Native support payload does not contain the exact Selected PLOT handle.")
     return {
         **support_summary,
         "mask_candidates": filtered_candidates,
@@ -110,12 +116,32 @@ def _filter_support_summary(support_summary: dict[str, object], mask_names: tupl
 def _native_support_subspace_dims(
     *,
     support_total_dim: int,
+    dim_count: int,
     explicit_dims: tuple[int, ...] | None,
 ) -> tuple[int, ...]:
     capped_support_total_dim = max(1, int(support_total_dim))
-    candidate_dims = DEFAULT_GUIDED_SUBSPACE_DIMS if explicit_dims is None else tuple(int(dim) for dim in explicit_dims)
+    if explicit_dims is None:
+        resolved_count = max(1, int(dim_count))
+        candidate_dims = tuple(
+            max(
+                1,
+                min(
+                    capped_support_total_dim,
+                    int(round(float(capped_support_total_dim) * float(index) / float(resolved_count))),
+                ),
+            )
+            for index in range(1, resolved_count + 1)
+        )
+    else:
+        candidate_dims = tuple(int(dim) for dim in explicit_dims)
     filtered = tuple(int(dim) for dim in candidate_dims if 0 < int(dim) <= capped_support_total_dim)
-    return filtered or (int(capped_support_total_dim),)
+    return tuple(sorted(dict.fromkeys(filtered))) or (int(capped_support_total_dim),)
+
+
+def _existing_native_support_das_payload_valid(payload: dict[str, object] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("support_mode")) == "selected_plot_handle"
 
 
 def main() -> None:
@@ -170,7 +196,7 @@ def main() -> None:
         support_summary = native_payload.get("support_by_var", {}).get(str(target_var))
         if not isinstance(support_summary, dict):
             continue
-        filtered_summary = _filter_support_summary(support_summary, mask_names)
+        filtered_summary = _selected_support_summary(support_summary)
         support_sites = build_ordered_composite_sites_from_support(
             support_summary=filtered_summary,
             sites=atomic_sites,
@@ -180,6 +206,7 @@ def main() -> None:
         subspace_dims_by_site_label = {
             site.label: _native_support_subspace_dims(
                 support_total_dim=int(site_total_width(site, model_hidden_size=hidden_size)),
+                dim_count=max(1, int(args.guided_support_dim_count)),
                 explicit_dims=None if explicit_dims is None else tuple(explicit_dims),
             )
             for site in support_sites
@@ -196,6 +223,8 @@ def main() -> None:
         output_path = layer_dir / f"mcqa_plot_das_native_support_layer-{int(layer)}_{str(target_var)}.json"
         summary_path = layer_dir / f"mcqa_plot_das_native_support_layer-{int(layer)}_{str(target_var)}.txt"
         payload = _load_json(output_path) if output_path.exists() else None
+        if not _existing_native_support_das_payload_valid(payload):
+            payload = None
         if payload is None:
             payload = run_das_pipeline(
                 model=model,
@@ -221,7 +250,9 @@ def main() -> None:
                 ),
             )
             payload["support_summary"] = filtered_summary
+            payload["support_mode"] = "selected_plot_handle"
             payload["mask_names"] = [str(mask_name) for mask_name in mask_names]
+            payload["guided_support_dim_count"] = int(args.guided_support_dim_count)
             payload["guided_subspace_dims_by_site_label"] = {
                 str(label): [int(dim) for dim in dims]
                 for label, dims in subspace_dims_by_site_label.items()
@@ -234,7 +265,8 @@ def main() -> None:
                         "MCQA PLOT-DAS (native support) Summary",
                         f"target_var: {target_var}",
                         f"layer: {int(layer)}",
-                        f"mask_names: {list(mask_names)}",
+                        "support_mode: selected_plot_handle",
+                        f"selected_site_labels: {filtered_summary.get('mask_candidates', [{}])[0].get('site_labels', []) if filtered_summary.get('mask_candidates') else []}",
                         f"unique_subspace_dims: {list(int(dim) for dim in unique_subspace_dims)}",
                         f"subspace_dims_by_site_label: {payload['guided_subspace_dims_by_site_label']}",
                     ]
@@ -249,7 +281,9 @@ def main() -> None:
         "native_resolution": int(native_resolution),
         "target_vars": [str(target_var) for target_var in target_vars],
         "native_support_path": str(native_support_path),
+        "support_mode": "selected_plot_handle",
         "guided_mask_names": [str(mask_name) for mask_name in mask_names],
+        "guided_support_dim_count": int(args.guided_support_dim_count),
         "payloads_by_var": payloads_by_var,
         "runtime_seconds": float(perf_counter() - stage_start),
     }
