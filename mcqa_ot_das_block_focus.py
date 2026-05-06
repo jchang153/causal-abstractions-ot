@@ -51,6 +51,7 @@ DEFAULT_DAS_SUBSPACE_DIMS = (
 DEFAULT_SCREEN_MAX_EPOCHS = 25
 DEFAULT_SCREEN_MIN_EPOCHS = 2
 DEFAULT_FULL_MASK_LIMIT = 2
+DEFAULT_GUIDED_SUPPORT_DIM_COUNT = 10
 
 
 def _synchronize_if_cuda(device: torch.device | str) -> None:
@@ -76,6 +77,16 @@ def _guided_subspace_dims(max_width: int) -> tuple[int, ...]:
     ]
     dims = tuple(int(dim) for dim in raw_dims if 1 <= int(dim) <= int(resolved_width))
     return dims or (resolved_width,)
+
+
+def _evenly_spaced_support_dims(max_width: int, *, count: int = DEFAULT_GUIDED_SUPPORT_DIM_COUNT) -> tuple[int, ...]:
+    resolved_width = max(1, int(max_width))
+    resolved_count = max(1, int(count))
+    dims = [
+        max(1, min(resolved_width, int(round(float(resolved_width) * float(index) / float(resolved_count)))))
+        for index in range(1, resolved_count + 1)
+    ]
+    return tuple(sorted(dict.fromkeys(dims)))
 
 
 def _parse_csv_strings(value: str | None) -> list[str] | None:
@@ -150,6 +161,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration-pool-size", type=int, default=100)
     parser.add_argument("--test-pool-size", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--target-vars", default="answer_pointer,answer_token")
+    parser.add_argument(
+        "--transport-target-vars",
+        default="answer_pointer,answer_token",
+        help="Comma-separated abstract variables used as transport rows. Stage C may evaluate only --target-vars.",
+    )
     parser.add_argument("--layers", help="Comma-separated focused layers. Default: 20,25")
     parser.add_argument("--block-resolutions", help="Comma-separated last-token block widths. Default: 128,144,192,256,288,384,576,768")
     parser.add_argument("--include-144", action="store_true", help="Append 144-d blocks to the resolution grid.")
@@ -172,18 +189,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--guided-mask-names",
         default="Selected",
-        help="Comma-separated support masks for native guided DAS. Use Selected for the exact PLOT-calibrated support.",
+        help="Deprecated for native support DAS; the runner always uses the exact PLOT-calibrated Selected support.",
     )
+    parser.add_argument("--guided-max-epochs", type=int, default=base_run.DAS_MAX_EPOCHS)
+    parser.add_argument("--guided-min-epochs", type=int, default=base_run.DAS_MIN_EPOCHS)
+    parser.add_argument("--guided-support-dim-count", type=int, default=DEFAULT_GUIDED_SUPPORT_DIM_COUNT)
     parser.add_argument("--skip-full-das", action="store_true", help="Skip the full-layer DAS baseline in this runner.")
-    parser.add_argument("--skip-guided-das", action="store_true", help="Skip native guided/screen/block DAS and run PLOT support only.")
+    parser.add_argument("--skip-guided-das", action="store_true", help="Skip native support DAS and run PLOT support only.")
     parser.add_argument(
         "--full-das-subspace-dims",
         help="Comma-separated full-layer DAS dims. Default: wide paper grid.",
     )
     parser.add_argument(
         "--guided-subspace-dims",
-        default="32,64,96,128,256,512,768,1024,1536,2048,2304",
-        help="Comma-separated native-guided DAS dims. Defaults to the paper master grid.",
+        default=None,
+        help="Deprecated for native support DAS; dimensions are now evenly spaced up to the selected support width.",
     )
     parser.add_argument("--results-root", default="results/anvil")
     parser.add_argument("--results-timestamp")
@@ -192,7 +212,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _configure_base_run(args: argparse.Namespace, *, sweep_root: Path, results_timestamp: str) -> None:
+def _configure_base_run(
+    args: argparse.Namespace,
+    *,
+    sweep_root: Path,
+    results_timestamp: str,
+    target_vars: tuple[str, ...],
+) -> None:
     base_run.DEVICE = str(args.device)
     base_run.RUN_TIMESTAMP = str(results_timestamp)
     base_run.RUN_DIR = sweep_root
@@ -207,7 +233,7 @@ def _configure_base_run(args: argparse.Namespace, *, sweep_root: Path, results_t
     base_run.CALIBRATION_POOL_SIZE = int(args.calibration_pool_size)
     base_run.TEST_POOL_SIZE = int(args.test_pool_size)
     base_run.BATCH_SIZE = int(args.batch_size)
-    base_run.TARGET_VARS = list(DEFAULT_TARGET_VARS)
+    base_run.TARGET_VARS = list(target_vars)
     base_run.COUNTERFACTUAL_NAMES = list(DEFAULT_COUNTERFACTUAL_NAMES)
     base_run.PROMPT_HF_LOGIN = bool(args.prompt_hf_login)
 
@@ -371,26 +397,14 @@ def _format_resolution_summary(
             f"cal={float(record['selection_score']):.4f} site={record['site_label']}"
         )
     lines.append("")
-    lines.append("screened block-mask DAS:")
-    for target_var in DEFAULT_TARGET_VARS:
-        payload = screen_payloads.get(target_var)
-        if payload is None:
-            continue
-        result = payload.get("results", [{}])[0]
-        lines.append(
-            f"DAS_SCREEN[{target_var}] exact={float(result.get('exact_acc', 0.0)):.4f} "
-            f"cal={float(result.get('selection_exact_acc', result.get('calibration_exact_acc', 0.0))):.4f} "
-            f"site={result.get('site_label')} dim={result.get('subspace_dim')}"
-        )
-    lines.append("")
-    lines.append("full block-mask DAS rerun:")
+    lines.append("native selected-support DAS:")
     for target_var in DEFAULT_TARGET_VARS:
         payload = block_payloads.get(target_var)
         if payload is None:
             continue
         result = payload.get("results", [{}])[0]
         lines.append(
-            f"DAS_BLOCK[{target_var}] exact={float(result.get('exact_acc', 0.0)):.4f} "
+            f"DAS_NATIVE_SUPPORT[{target_var}] exact={float(result.get('exact_acc', 0.0)):.4f} "
             f"cal={float(result.get('selection_exact_acc', result.get('calibration_exact_acc', 0.0))):.4f} "
             f"site={result.get('site_label')} dim={result.get('subspace_dim')}"
         )
@@ -429,6 +443,15 @@ def main() -> None:
         None if args.guided_subspace_dims is None else tuple(_parse_csv_ints(args.guided_subspace_dims) or [])
     )
     guided_mask_names = tuple(_parse_csv_strings(args.guided_mask_names) or ["Selected"])
+    target_vars = tuple(
+        canonicalize_target_var(target_var)
+        for target_var in (_parse_csv_strings(args.target_vars) or list(DEFAULT_TARGET_VARS))
+    )
+    transport_target_vars = tuple(
+        canonicalize_target_var(target_var)
+        for target_var in (_parse_csv_strings(args.transport_target_vars) or list(DEFAULT_TARGET_VARS))
+    )
+    context_target_vars = tuple(dict.fromkeys([*transport_target_vars, *target_vars]))
     run_full_das = not bool(args.skip_full_das)
     run_guided_das = not bool(args.skip_guided_das)
     signature_modes = [
@@ -445,7 +468,12 @@ def main() -> None:
     sweep_root = results_root / f"{results_timestamp}_mcqa_ot_das_block_focus"
     sweep_root.mkdir(parents=True, exist_ok=True)
 
-    _configure_base_run(args, sweep_root=sweep_root, results_timestamp=results_timestamp)
+    _configure_base_run(
+        args,
+        sweep_root=sweep_root,
+        results_timestamp=results_timestamp,
+        target_vars=context_target_vars,
+    )
     context = base_run.build_run_context()
     context_timing_seconds = dict(context.get("timing_seconds", {}))
     model = context["model"]
@@ -455,7 +483,6 @@ def main() -> None:
     data_metadata = context["data_metadata"]
     device = context["device"]
     hidden_size = int(model.config.hidden_size)
-    target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
     token_position_ids = tuple(token_position.id for token_position in token_positions)
 
     all_payloads: list[dict[str, object]] = []
@@ -518,16 +545,16 @@ def main() -> None:
                     layers=(int(layer),),
                     selected_token_position_ids=DEFAULT_TOKEN_POSITION_IDS,
                 )
-                train_banks = {target_var: banks_by_split["train"][target_var] for target_var in target_vars}
+                train_banks = {target_var: banks_by_split["train"][target_var] for target_var in transport_target_vars}
                 cache_spec = base_run._signature_cache_spec(
-                    train_bank=train_banks[target_vars[0]],
+                    train_bank=train_banks[transport_target_vars[0]],
                     resolution=resolution,
                     resolved_resolution=resolved_resolution,
                     signature_mode=signature_mode,
                     selected_layers=[int(layer)],
                     token_position_ids=DEFAULT_TOKEN_POSITION_IDS,
                     layer_blocks=None,
-                    source_target_vars=tuple(str(target_var) for target_var in target_vars),
+                    source_target_vars=tuple(str(target_var) for target_var in transport_target_vars),
                 )
                 cache_path = base_run._signature_cache_path(
                     resolution=resolution,
@@ -553,11 +580,11 @@ def main() -> None:
                             signature_mode=signature_mode,
                             top_k_values=ot_top_k_values,
                             lambda_values=ot_lambdas,
-                            source_target_vars=target_vars,
+                            source_target_vars=transport_target_vars,
                             calibration_metric=DEFAULT_CALIBRATION_METRIC,
                             calibration_family_weights=DEFAULT_CALIBRATION_FAMILY_WEIGHTS,
-                            top_k_values_by_var={target_var: ot_top_k_values for target_var in target_vars},
-                            lambda_values_by_var={target_var: ot_lambdas for target_var in target_vars},
+                            top_k_values_by_var={target_var: ot_top_k_values for target_var in transport_target_vars},
+                            lambda_values_by_var={target_var: ot_lambdas for target_var in transport_target_vars},
                         ),
                     )
                     save_prepared_alignment_artifacts(
@@ -596,6 +623,7 @@ def main() -> None:
                                 summary_path=summary_path,
                                 methods=(transport_method,),
                                 target_vars=target_vars,
+                                ot_source_target_vars=transport_target_vars,
                                 batch_size=int(args.batch_size),
                                 ot_epsilon=float(epsilon),
                                 uot_beta_neural=float(uot_beta_neural if uot_beta_neural is not None else uot_beta_neurals[0]),
@@ -642,106 +670,26 @@ def main() -> None:
                     support_summary = support_by_var.get(str(target_var))
                     if support_summary is None:
                         continue
-                    support_summary = _filter_support_summary_by_mask_names(
-                        support_summary=support_summary,
-                        mask_names=guided_mask_names,
-                    )
-                    mask_sites = build_mask_sites_from_support(
+                    selected_sites = build_mask_sites_from_support(
                         support_summary=support_summary,
                         sites=ot_sites,
                     )
-                    if not mask_sites:
-                        continue
-                    mask_max_width = max(
-                        int(site_total_width(site, model_hidden_size=int(hidden_size)))
-                        for site in mask_sites
-                    )
-                    if explicit_guided_subspace_dims is None:
-                        mask_subspace_dims = _guided_subspace_dims(mask_max_width)
-                    else:
-                        mask_subspace_dims = tuple(
-                            int(dim)
-                            for dim in explicit_guided_subspace_dims
-                            if 1 <= int(dim) <= int(mask_max_width)
-                        )
-                    if not mask_subspace_dims:
-                        mask_subspace_dims = _guided_subspace_dims(mask_max_width)
-                    screen_output_path = layer_dir / (
-                        f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}_sig-{signature_mode}_{target_var}_das_block_screen.json"
-                    )
-                    screen_summary_path = layer_dir / (
-                        f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}_sig-{signature_mode}_{target_var}_das_block_screen.txt"
-                    )
-                    screen_payload = _load_existing_payload(screen_output_path)
-                    screen_start = perf_counter()
-                    if screen_payload is None:
-                        screen_payload = run_das_pipeline(
-                            model=model,
-                            train_bank=banks_by_split["train"][target_var],
-                            calibration_bank=banks_by_split["calibration"][target_var],
-                            holdout_bank=banks_by_split["test"][target_var],
-                            sites=mask_sites,
-                            device=device,
-                            tokenizer=tokenizer,
-                            config=DASConfig(
-                                method_name="das_block_screen",
-                                batch_size=int(args.batch_size),
-                                max_epochs=int(args.screen_max_epochs),
-                                min_epochs=int(args.screen_min_epochs),
-                                plateau_patience=1,
-                                plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
-                                learning_rate=base_run.DAS_LEARNING_RATE,
-                                subspace_dims=mask_subspace_dims,
-                                store_candidate_holdout_metrics=False,
-                                restarts=max(1, int(args.screen_restarts)),
-                                verbose=True,
-                            ),
-                        )
-                        screen_payload["support_summary"] = support_summary
-                        write_json(screen_output_path, screen_payload)
-                        _write_das_text_report(
-                            screen_summary_path,
-                            title="MCQA Block DAS Screen Summary",
-                            payload=screen_payload,
-                            extra_lines=[
-                                f"target_var: {target_var}",
-                                f"mask_candidates: {[candidate.get('name') for candidate in support_summary.get('mask_candidates', [])]}",
-                                f"subspace_dims: {list(int(dim) for dim in mask_subspace_dims)}",
-                                f"restarts: {max(1, int(args.screen_restarts))}",
-                            ],
-                        )
-                    _synchronize_if_cuda(device)
-                    das_screen_seconds += float(perf_counter() - screen_start)
-                    screen_payloads[str(target_var)] = screen_payload
-
-                    selected_site_labels = _best_screen_sites(
-                        screen_payload,
-                        target_var=str(target_var),
-                        limit=max(1, int(args.full_mask_limit)),
-                    )
-                    selected_sites = [site for site in mask_sites if site.label in set(selected_site_labels)]
                     if not selected_sites:
-                        selected_sites = [mask_sites[0]]
+                        continue
                     selected_max_width = max(
                         int(site_total_width(site, model_hidden_size=int(hidden_size)))
                         for site in selected_sites
                     )
-                    if explicit_guided_subspace_dims is None:
-                        selected_subspace_dims = _guided_subspace_dims(selected_max_width)
-                    else:
-                        selected_subspace_dims = tuple(
-                            int(dim)
-                            for dim in explicit_guided_subspace_dims
-                            if 1 <= int(dim) <= int(selected_max_width)
-                        )
-                    if not selected_subspace_dims:
-                        selected_subspace_dims = _guided_subspace_dims(selected_max_width)
+                    selected_subspace_dims = _evenly_spaced_support_dims(
+                        selected_max_width,
+                        count=max(1, int(args.guided_support_dim_count)),
+                    )
 
                     block_output_path = layer_dir / (
-                        f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}_sig-{signature_mode}_{target_var}_das_block.json"
+                        f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}_sig-{signature_mode}_{target_var}_das_native_support.json"
                     )
                     block_summary_path = layer_dir / (
-                        f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}_sig-{signature_mode}_{target_var}_das_block.txt"
+                        f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}_sig-{signature_mode}_{target_var}_das_native_support.txt"
                     )
                     block_payload = _load_existing_payload(block_output_path)
                     block_start = perf_counter()
@@ -755,10 +703,10 @@ def main() -> None:
                             device=device,
                             tokenizer=tokenizer,
                             config=DASConfig(
-                                method_name="das_block",
+                                method_name="das_native_support",
                                 batch_size=int(args.batch_size),
-                                max_epochs=base_run.DAS_MAX_EPOCHS,
-                                min_epochs=base_run.DAS_MIN_EPOCHS,
+                                max_epochs=int(args.guided_max_epochs),
+                                min_epochs=int(args.guided_min_epochs),
                                 plateau_patience=base_run.DAS_PLATEAU_PATIENCE,
                                 plateau_rel_delta=base_run.DAS_PLATEAU_REL_DELTA,
                                 learning_rate=base_run.DAS_LEARNING_RATE,
@@ -769,15 +717,23 @@ def main() -> None:
                             ),
                         )
                         block_payload["support_summary"] = support_summary
-                        block_payload["selected_screen_site_labels"] = selected_site_labels
+                        block_payload["selected_support_site_labels"] = [
+                            str(label)
+                            for candidate in support_summary.get("mask_candidates", [])
+                            if isinstance(candidate, dict) and str(candidate.get("name")) == "Selected"
+                            for label in (candidate.get("site_labels", []) or [])
+                        ]
+                        block_payload["guided_support_dim_count"] = int(args.guided_support_dim_count)
+                        block_payload["guided_support_subspace_dims"] = [int(dim) for dim in selected_subspace_dims]
                         write_json(block_output_path, block_payload)
                         _write_das_text_report(
                             block_summary_path,
-                            title="MCQA Block DAS Summary",
+                            title="MCQA Native Support DAS Summary",
                             payload=block_payload,
                             extra_lines=[
                                 f"target_var: {target_var}",
-                                f"selected_screen_site_labels: {selected_site_labels}",
+                                f"selected_support_site_labels: {block_payload['selected_support_site_labels']}",
+                                f"support_width: {int(selected_max_width)}",
                                 f"subspace_dims: {list(int(dim) for dim in selected_subspace_dims)}",
                                 f"restarts: {max(1, int(args.full_restarts))}",
                             ],
@@ -813,6 +769,8 @@ def main() -> None:
                     "signature_mode": str(signature_mode),
                     "transport_method": transport_method,
                     "methods": [transport_method],
+                    "target_vars": [str(target_var) for target_var in target_vars],
+                    "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
                     "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
                     "uot_beta_neurals": [float(beta) for beta in uot_beta_neurals],
                     "ot_top_k_values": [int(value) for value in ot_top_k_values],
@@ -821,6 +779,7 @@ def main() -> None:
                     "full_das_enabled": bool(run_full_das),
                     "native_guided_das_enabled": bool(run_guided_das),
                     "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
+                    "guided_support_dim_count": int(args.guided_support_dim_count),
                     "full_das_subspace_dims": [int(dim) for dim in full_das_subspace_dims],
                     "guided_subspace_dims": None
                     if explicit_guided_subspace_dims is None
@@ -839,6 +798,7 @@ def main() -> None:
                         "t_support_extract": float(support_extract_seconds),
                         "t_stageC_das_screen": float(das_screen_seconds),
                         "t_stageC_das_full": float(das_block_seconds),
+                        "t_stageC_das_native_support": float(das_block_seconds),
                         "t_resolution_total_wall": float(resolution_total_seconds),
                         "t_layer_total_wall_so_far": float(perf_counter() - layer_start),
                         "t_stage_total_wall_so_far": float(perf_counter() - stage_start),
@@ -861,17 +821,12 @@ def main() -> None:
                         for epsilon, uot_beta_neural in transport_sweep_points
                     ],
                     "das_full_output_path": str(das_full_output_path),
-                    "screen_output_paths": {
-                        str(target_var): str(
-                            layer_dir / f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}_sig-{signature_mode}_{target_var}_das_block_screen.json"
-                        )
-                        for target_var in target_vars
-                    },
+                    "screen_output_paths": {},
                     "block_output_paths": {
                         str(target_var): str(
-                            layer_dir / f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}_sig-{signature_mode}_{target_var}_das_block.json"
+                            layer_dir / f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}_sig-{signature_mode}_{target_var}_das_native_support.json"
                         )
-                        for target_var in target_vars
+                        for target_var in block_payloads
                     },
                     "summary_path": str(resolution_summary_path),
                 }
@@ -906,6 +861,8 @@ def main() -> None:
             "signature_modes": [str(signature_mode) for signature_mode in signature_modes],
             "transport_method": transport_method,
             "methods": [transport_method],
+            "target_vars": [str(target_var) for target_var in target_vars],
+            "transport_target_vars": [str(target_var) for target_var in transport_target_vars],
             "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
             "uot_beta_neurals": [float(beta) for beta in uot_beta_neurals],
             "ot_top_k_values": [int(value) for value in ot_top_k_values],
@@ -913,6 +870,7 @@ def main() -> None:
             "full_das_enabled": bool(run_full_das),
             "native_guided_das_enabled": bool(run_guided_das),
             "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
+            "guided_support_dim_count": int(args.guided_support_dim_count),
             "full_das_subspace_dims": [int(dim) for dim in full_das_subspace_dims],
             "guided_subspace_dims": None
             if explicit_guided_subspace_dims is None

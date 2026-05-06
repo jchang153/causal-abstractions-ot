@@ -71,6 +71,27 @@ def _first_matching(
     return None
 
 
+def _first_matching_dimension(
+    rankings: dict[str, object],
+    target_var: str,
+    *,
+    layer_selection_method: str,
+    stage_b_transport_method: str,
+) -> dict[str, object] | None:
+    entries = rankings.get(target_var)
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("layer_selection_method", "custom")) != str(layer_selection_method):
+            continue
+        if str(entry.get("stage_b_transport_method", entry.get("transport_method", "ot"))) != str(stage_b_transport_method):
+            continue
+        return entry
+    return None
+
+
 def _read_rankings(sweep_root: Path, filename: str) -> dict[str, object]:
     path = sweep_root / filename
     if not path.exists():
@@ -430,6 +451,9 @@ def build_paper_runtime_summary(
     pca_rankings = _read_rankings(sweep_root, "stage_b_pca_rankings.json")
     a_only_rankings = _read_rankings(sweep_root, "stage_c_a_only_rankings.json")
     native_guided_rankings = _read_rankings(sweep_root, "stage_c_native_guided_rankings.json")
+    native_dimension_rankings = _read_rankings(sweep_root, "stage_c_native_dimension_rankings.json")
+    if not native_dimension_rankings:
+        native_dimension_rankings = _read_rankings(sweep_root, "stage_c_native_dim_rankings.json")
 
     native_stage_b_by_layer = _native_stage_b_runtime_by_layer(sweep_root)
     pca_stage_b_by_layer = _pca_stage_b_runtime_by_layer(sweep_root)
@@ -462,6 +486,7 @@ def build_paper_runtime_summary(
         pca_rankings,
         a_only_rankings,
         native_guided_rankings,
+        native_dimension_rankings,
         pca_guided_rankings,
         sweep_root=sweep_root,
     )
@@ -491,6 +516,7 @@ def build_paper_runtime_summary(
             native_rankings,
             pca_rankings,
             native_guided_rankings,
+            native_dimension_rankings,
             pca_guided_rankings,
             selection_method=selection_method,
         )
@@ -567,6 +593,38 @@ def build_paper_runtime_summary(
                         serial_downstream_seconds=float(native_branch_runtime["serial"]) + sum(native_guided_das.values()),
                         parallel_downstream_seconds=float(native_branch_runtime["parallel"]) + max(native_guided_das.values()),
                         notes="Stage A plus complete Stage B native search plus guided DAS in the selected native support.",
+                    )
+                )
+
+            native_dimension_entries = {
+                var: _first_matching_dimension(
+                    native_dimension_rankings,
+                    var,
+                    layer_selection_method=selection_method,
+                    stage_b_transport_method=transport_method,
+                )
+                for var in TARGET_VARS
+            }
+            native_dimension_das = {
+                var: _as_float(entry.get("runtime_seconds")) if entry else 0.0
+                for var, entry in native_dimension_entries.items()
+            }
+            if any(native_dimension_entries.values()):
+                records.append(
+                    _method_record(
+                        method=f"PLOT-DAS dimension ({selection_method}, {transport_method})",
+                        stage_a_seconds=stage_a_seconds,
+                        downstream_by_var={
+                            var: float(native_branch_runtime["serial"]) + _as_float(native_dimension_das.get(var))
+                            for var in TARGET_VARS
+                        },
+                        entries_by_var=native_dimension_entries,
+                        serial_downstream_seconds=float(native_branch_runtime["serial"]) + sum(native_dimension_das.values()),
+                        parallel_downstream_seconds=float(native_branch_runtime["parallel"]) + max(native_dimension_das.values()),
+                        notes=(
+                            "Stage A plus complete Stage B native search plus full-layer DAS on the selected "
+                            "native layer with dimensions around the PLOT support width."
+                        ),
                     )
                 )
 

@@ -250,7 +250,7 @@ def _expected_native_guided_outputs(
                 layer_dir
                 / (
                     f"mcqa_layer-{int(layer)}_pos-last_token_res-{resolution_tag}"
-                    f"_sig-{str(args.signature_mode)}_{str(target_var)}_das_block.json"
+                    f"_sig-{str(args.signature_mode)}_{str(target_var)}_das_native_support.json"
                 )
             )
         )
@@ -1074,8 +1074,8 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
     if bool(normalized["enable_dim_hint_das"]):
         selected_native_dim_configs = _select_stage_c_dim_hint_configs(
             rankings=native_rankings,
-            source="native",
-            top_configs_per_var=1,
+            source="native_support",
+            top_configs_per_var=int(args.stage_c_top_configs_per_var),
             scale_factors=normalized["dim_hint_scale_factors"],
         )
         selected_pca_dim_configs = _select_stage_c_dim_hint_configs(
@@ -1181,6 +1181,8 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
                         skip_full_das=True,
                         skip_guided_das=False,
                         guided_mask_names=tuple(str(mask_name) for mask_name in normalized["guided_mask_names"]),
+                        target_vars=tuple(str(target_var) for target_var in target_vars),
+                        transport_target_vars=tuple(str(target_var) for target_var in normalized["target_vars"]),
                     )
                 ),
                 "expected_outputs": expected_outputs,
@@ -1204,7 +1206,7 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
         stage_c_native_dim_tasks.append(
             {
                 "task_id": f"stage_c_native_dim_{var_slug}_{token_position_id}_L{layer:02d}_res{resolution}_d{effective_dim}",
-                "category": "stage_c_native_dim_hint_das",
+                "category": "stage_c_native_dimension_das",
                 "layer_selection_method": str(entry.get("layer_selection_method", "custom")),
                 "layer_selection_top_layers_per_var": entry.get("layer_selection_top_layers_per_var"),
                 "layer_selection_neighbor_radius": entry.get("layer_selection_neighbor_radius"),
@@ -1216,12 +1218,17 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
                 "resolution": "full",
                 "stage_b_resolution": resolution,
                 "target_var": target_var,
-                "dim_hint_source": "native",
+                "dim_hint_source": "native_support",
                 "dim_hint_effective_dim": effective_dim,
                 "dim_hint_subspace_dims": [int(dim) for dim in dim_values],
+                "selected_top_k": entry.get("selected_top_k"),
+                "selected_lambda": entry.get("selected_lambda"),
+                "selected_site_total_dim": entry.get("selected_site_total_dim"),
+                "selected_site_labels": entry.get("selected_site_labels"),
                 "stage_b_selected_top_k": entry.get("selected_top_k"),
                 "stage_b_selected_lambda": entry.get("selected_lambda"),
                 "stage_b_selected_site_total_dim": entry.get("selected_site_total_dim"),
+                "stage_b_transport_method": str(entry.get("transport_method", "ot")),
                 "stage_timestamp": stage_timestamp,
                 "command": list(
                     _build_stage_c_a_only_command(
@@ -1432,10 +1439,15 @@ def aggregate_stage_c(args: argparse.Namespace, *, strict: bool = True) -> None:
             payload_paths=native_dim_payload_paths,
             metadata_by_payload_path=_task_metadata_by_payload_path(native_dim_manifest["tasks"]),
         )
+        _write_json(sweep_root / "stage_c_native_dimension_rankings.json", native_dim_rankings)
         _write_json(sweep_root / "stage_c_native_dim_rankings.json", native_dim_rankings)
         _write_text(
+            sweep_root / "stage_c_native_dimension_rankings.txt",
+            _format_native_summary(title="MCQA Hierarchical Stage C Native Dimension DAS Ranking", rankings=native_dim_rankings),
+        )
+        _write_text(
             sweep_root / "stage_c_native_dim_rankings.txt",
-            _format_native_summary(title="MCQA Hierarchical Stage C Native Dim-Hinted DAS Ranking", rankings=native_dim_rankings),
+            _format_native_summary(title="MCQA Hierarchical Stage C Native Dimension DAS Ranking", rankings=native_dim_rankings),
         )
     pca_dim_payload_paths: list[Path] = []
     if _stage_output_is_valid(pca_dim_manifest_path):
@@ -1495,6 +1507,7 @@ def aggregate_final(args: argparse.Namespace, *, strict: bool = True) -> None:
         "stage_a_last_token_layer_rankings.txt",
         "stage_b_native_rankings.txt",
         "stage_c_native_guided_rankings.txt",
+        "stage_c_native_dimension_rankings.txt",
         "stage_c_native_dim_rankings.txt",
         "stage_c_a_only_rankings.txt",
         "stage_b_pca_rankings.txt",

@@ -537,52 +537,9 @@ def extract_block_mask_support(
         if not ranked_site_indices:
             continue
         mask_candidates: list[dict[str, object]] = []
-        seen_masks: set[tuple[int, ...]] = set()
-        fixed_prefix_specs = (
-            ("Top1", 1),
-            ("Top2", 2),
-            ("Top4", 4),
-        )
-        for name, count in fixed_prefix_specs:
-            site_mask = tuple(int(site_index) for site_index in ranked_site_indices[: min(int(count), len(ranked_site_indices))])
-            if not site_mask or site_mask in seen_masks:
-                continue
-            seen_masks.add(site_mask)
-            mask_candidates.append(
-                {
-                    "name": str(name),
-                    "site_indices": list(site_mask),
-                    "site_labels": [sites[site_index].label for site_index in site_mask],
-                    "site_total_dim": sum(int(sites[site_index].dim_end) - int(sites[site_index].dim_start) for site_index in site_mask),
-                }
-            )
-        for name, coverage in (("S50", 0.50), ("S80", 0.80)):
-            site_mask = _block_mask_from_prefix(
-                ranked_site_indices,
-                evidence_by_site,
-                coverage=float(coverage),
-            )
-            if not site_mask or site_mask in seen_masks:
-                continue
-            seen_masks.add(site_mask)
-            mask_candidates.append(
-                {
-                    "name": str(name),
-                    "site_indices": list(site_mask),
-                    "site_labels": [sites[site_index].label for site_index in site_mask],
-                    "site_total_dim": sum(int(sites[site_index].dim_end) - int(sites[site_index].dim_start) for site_index in site_mask),
-                }
-            )
         selected_candidate = _selected_mask_candidate_from_payload(best_payload, sites=sites)
         if selected_candidate is not None:
-            mask_candidates = [
-                selected_candidate,
-                *[
-                    candidate
-                    for candidate in mask_candidates
-                    if tuple(candidate.get("site_indices", [])) != tuple(selected_candidate["site_indices"])
-                ],
-            ]
+            mask_candidates = [selected_candidate]
         support_by_var[str(target_var)] = {
             "target_var": str(target_var),
             "best_selection_score": float(best_score),

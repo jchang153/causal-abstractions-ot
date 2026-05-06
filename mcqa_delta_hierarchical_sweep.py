@@ -34,7 +34,8 @@ DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_PCA_TOP_PREFIX_SIZES = (8, 16, 32, 64)
 DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
 DEFAULT_NATIVE_BLOCK_RESOLUTIONS = (128, 144, 192, 256, 288, 384, 576, 768)
-DEFAULT_DIM_HINT_SCALE_FACTORS = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+DEFAULT_GUIDED_SUPPORT_DIM_COUNT = 10
+DEFAULT_DIM_HINT_SCALE_FACTORS = (0.5, 0.75, 1.0, 1.25, 1.5)
 DEFAULT_DAS_SUBSPACE_DIMS = (
     32,
     64,
@@ -414,8 +415,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--guided-mask-names",
         default="Selected",
         help=(
-            "Comma-separated Stage C support masks. 'Selected' is the exact support chosen by "
-            "Stage B PLOT calibration; Top1/Top2/Top4/S50/S80 are optional prefix/coverage masks."
+            "Deprecated for native-support DAS; native support always uses the exact Selected PLOT handle."
         ),
     )
     parser.add_argument("--guided-max-epochs", type=int, default=100)
@@ -423,9 +423,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--screen-restarts", type=int, default=1)
     parser.add_argument("--guided-restarts", type=int, default=2)
     parser.add_argument("--guided-subspace-dims", default="32,64,96,128,256,512,768,1024,1536,2048,2304")
+    parser.add_argument("--guided-support-dim-count", type=int, default=DEFAULT_GUIDED_SUPPORT_DIM_COUNT)
     parser.add_argument(
         "--stage-c-dim-hint-scale-factors",
-        default="0.5,0.75,1,1.25,1.5,2",
+        default="0.5,0.75,1,1.25,1.5",
         help="Comma-separated multiplicative DAS dimension factors around the Stage B selected handle width.",
     )
     parser.add_argument(
@@ -527,6 +528,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "ot_lambdas": tuple(float(value) for value in ot_lambdas),
         "calibration_family_weights": tuple(float(weight) for weight in calibration_family_weights),
         "guided_mask_names": tuple(str(mask_name) for mask_name in guided_mask_names),
+        "guided_support_dim_count": max(1, int(args.guided_support_dim_count)),
         "guided_subspace_dims": None if guided_subspace_dims is None else tuple(int(dim) for dim in guided_subspace_dims),
         "regular_das_subspace_dims": tuple(int(dim) for dim in regular_das_subspace_dims),
         "dim_hint_scale_factors": tuple(float(value) for value in dim_hint_scale_factors),
@@ -706,7 +708,13 @@ def _build_native_block_command(
     skip_full_das: bool = False,
     skip_guided_das: bool = False,
     guided_mask_names: tuple[str, ...] | None = None,
+    target_vars: tuple[str, ...] | None = None,
+    transport_target_vars: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
+    if target_vars is None:
+        target_vars = tuple(str(target_var) for target_var in normalized["target_vars"])
+    if transport_target_vars is None:
+        transport_target_vars = tuple(str(target_var) for target_var in normalized["target_vars"])
     command = [
         sys.executable,
         "mcqa_ot_das_block_focus.py",
@@ -726,6 +734,10 @@ def _build_native_block_command(
         str(int(args.test_pool_size)),
         "--batch-size",
         str(int(args.batch_size)),
+        "--target-vars",
+        ",".join(str(target_var) for target_var in target_vars),
+        "--transport-target-vars",
+        ",".join(str(target_var) for target_var in transport_target_vars),
         "--layers",
         ",".join(str(layer) for layer in layers),
         "--block-resolutions",
@@ -752,16 +764,15 @@ def _build_native_block_command(
         str(max(1, int(args.screen_restarts))),
         "--full-restarts",
         str(max(1, int(args.guided_restarts))),
+        "--guided-max-epochs",
+        str(int(args.guided_max_epochs)),
+        "--guided-min-epochs",
+        str(int(args.guided_min_epochs)),
+        "--guided-support-dim-count",
+        str(int(normalized["guided_support_dim_count"])),
         "--full-das-subspace-dims",
         ",".join(str(dim) for dim in normalized["regular_das_subspace_dims"]),
     ]
-    if normalized["guided_subspace_dims"] is not None:
-        command.extend(
-            [
-                "--guided-subspace-dims",
-                ",".join(str(dim) for dim in normalized["guided_subspace_dims"]),
-            ]
-        )
     if guided_mask_names is None:
         guided_mask_names = tuple(str(mask_name) for mask_name in normalized["guided_mask_names"])
     if guided_mask_names:
@@ -825,6 +836,10 @@ def _build_stage_c_a_only_command(
         "full",
         "--das-subspace-dims",
         ",".join(str(dim) for dim in das_subspace_dims),
+        "--das-max-epochs",
+        str(int(args.guided_max_epochs)),
+        "--das-min-epochs",
+        str(int(args.guided_min_epochs)),
         "--das-restarts",
         str(max(1, int(args.guided_restarts))),
         "--signature-modes",
@@ -1306,9 +1321,14 @@ def _entry_metadata(metadata: dict[str, object]) -> dict[str, object]:
         "dim_hint_source",
         "dim_hint_effective_dim",
         "dim_hint_subspace_dims",
+        "selected_top_k",
+        "selected_lambda",
+        "selected_site_total_dim",
+        "selected_site_labels",
         "stage_b_selected_top_k",
         "stage_b_selected_lambda",
         "stage_b_selected_site_total_dim",
+        "stage_b_transport_method",
         "stage_c_target_vars",
     )
     return {field: metadata[field] for field in fields if field in metadata}
@@ -1356,15 +1376,16 @@ def _selected_support_metadata(layer_payload: dict[str, object], target_var: str
 def _dim_hint_subspace_dims(
     effective_dim: int,
     *,
+    min_dim: int = 32,
     max_dim: int = 2304,
     scale_factors: Iterable[float] = DEFAULT_DIM_HINT_SCALE_FACTORS,
 ) -> tuple[int, ...]:
     dims: list[int] = []
     for factor in scale_factors:
         dim = int(round(float(effective_dim) * float(factor)))
-        dim = max(1, min(int(max_dim), dim))
+        dim = max(int(min_dim), min(int(max_dim), dim))
         dims.append(dim)
-    dims.append(max(1, min(int(max_dim), int(effective_dim))))
+    dims.append(max(int(min_dim), min(int(max_dim), int(effective_dim))))
     return tuple(sorted(dict.fromkeys(dims)))
 
 
@@ -1583,13 +1604,39 @@ def _extract_native_rankings(
                     if current is None or _score_tuple(entry) > _score_tuple(current):
                         grouped_ot[key] = entry
         block_output_paths = payload.get("block_output_paths", {})
+        allowed_target_vars = metadata.get("stage_c_target_vars")
+        if isinstance(allowed_target_vars, list) and allowed_target_vars:
+            derived_block_output_paths = {
+                str(target_var): str(
+                    payload_path.parent
+                    / (
+                        f"mcqa_layer-{int(layer)}_pos-last_token_res-{int(resolution)}"
+                        f"_sig-{str(payload.get('signature_mode', 'family_label_delta_norm'))}_{str(target_var)}"
+                        f"_das_native_support.json"
+                    )
+                )
+                for target_var in allowed_target_vars
+            }
+            if isinstance(block_output_paths, dict):
+                block_output_paths = {
+                    str(target_var): (
+                        str(derived_path)
+                        if _stage_output_is_valid(Path(str(derived_path)))
+                        else str(block_output_paths.get(str(target_var), derived_path))
+                    )
+                    for target_var, derived_path in derived_block_output_paths.items()
+                }
+            else:
+                block_output_paths = derived_block_output_paths
         if isinstance(block_output_paths, dict):
             for target_var, block_path_str in block_output_paths.items():
-                allowed_target_vars = metadata.get("stage_c_target_vars")
                 if isinstance(allowed_target_vars, list) and allowed_target_vars:
                     if str(target_var) not in {str(var) for var in allowed_target_vars}:
                         continue
-                block_payload = _load_json(Path(str(block_path_str)))
+                block_path = Path(str(block_path_str))
+                if not _stage_output_is_valid(block_path):
+                    continue
+                block_payload = _load_json(block_path)
                 if not isinstance(block_payload, dict):
                     continue
                 results = block_payload.get("results", [])
@@ -1726,6 +1773,8 @@ def _format_native_summary(*, title: str, rankings: dict[str, list[dict[str, obj
                 parts.append(f"eps={float(entry['epsilon']):g}")
             if entry.get("uot_beta_neural") is not None:
                 parts.append(f"beta={float(entry['uot_beta_neural']):g}")
+            if entry.get("stage_b_transport_method") is not None:
+                parts.append(f"stage_b_method={entry.get('stage_b_transport_method')}")
             if entry.get("site_label") is not None:
                 parts.append(f"site={entry.get('site_label')}")
             if entry.get("selected_top_k") is not None:
@@ -1738,6 +1787,10 @@ def _format_native_summary(*, title: str, rankings: dict[str, list[dict[str, obj
                 parts.append(f"dim={entry.get('subspace_dim')}")
             if entry.get("site_total_dim") is not None:
                 parts.append(f"width={entry.get('site_total_dim')}")
+            if entry.get("dim_hint_effective_dim") is not None:
+                parts.append(f"dim_hint_width={entry.get('dim_hint_effective_dim')}")
+            if entry.get("dim_hint_subspace_dims") is not None:
+                parts.append(f"dim_grid={entry.get('dim_hint_subspace_dims')}")
             if entry.get("runtime_seconds") is not None:
                 parts.append(f"runtime={float(entry['runtime_seconds']):.2f}s")
             lines.append("  - " + " ".join(parts))
@@ -1938,6 +1991,7 @@ def _write_status(
             "pca_basis_source_modes": list(normalized["pca_basis_source_modes"]),
             "pca_num_bands_values": list(normalized["pca_num_bands_values"]),
             "guided_mask_names": list(normalized["guided_mask_names"]),
+            "guided_support_dim_count": int(normalized["guided_support_dim_count"]),
             "guided_subspace_dims": None
             if normalized["guided_subspace_dims"] is None
             else list(normalized["guided_subspace_dims"]),
@@ -2435,6 +2489,7 @@ def main() -> None:
             top_configs_per_var=int(args.stage_c_top_configs_per_var),
         )
         stage_c_native_payload_paths: list[Path] = []
+        stage_c_native_metadata_by_payload_path: dict[str, dict[str, object]] = {}
         for (layer_selection_method, transport_method, token_position_id, layer, resolution), target_vars in selected_native_config_groups.items():
             stage_name = f"stage_c_native_{str(token_position_id)}_L{int(layer):02d}_res{int(resolution)}"
             stage_timestamp = f"{str(normalized['results_timestamp'])}_stageB_native_{str(token_position_id)}"
@@ -2449,13 +2504,20 @@ def main() -> None:
                     )
                 )
             ]
-            for target_var in normalized["target_vars"]:
+            payload_metadata = {
+                "layer_selection_method": str(layer_selection_method),
+                "transport_method": str(transport_method),
+                "stage_c_target_vars": list(target_vars),
+                "category": "stage_c_native_guided_das",
+            }
+            stage_c_native_metadata_by_payload_path[str(Path(expected_outputs[0]))] = payload_metadata
+            for target_var in target_vars:
                 expected_outputs.append(
                     str(
                         layer_dir
                         / (
                             f"mcqa_layer-{int(layer)}_pos-last_token_res-{int(resolution)}"
-                            f"_sig-{str(args.signature_mode)}_{str(target_var)}_das_block.json"
+                            f"_sig-{str(args.signature_mode)}_{str(target_var)}_das_native_support.json"
                         )
                     )
                 )
@@ -2498,6 +2560,8 @@ def main() -> None:
                     skip_full_das=True,
                     skip_guided_das=False,
                     guided_mask_names=tuple(str(mask_name) for mask_name in normalized["guided_mask_names"]),
+                    target_vars=tuple(str(target_var) for target_var in target_vars),
+                    transport_target_vars=tuple(str(target_var) for target_var in normalized["target_vars"]),
                 ),
                 expected_outputs=tuple(expected_outputs),
             )
@@ -2542,12 +2606,136 @@ def main() -> None:
             )
         if stage_c_native_payload_paths:
             _, native_guided_rankings, _ = _extract_native_rankings(
-                payload_paths=list(dict.fromkeys(stage_c_native_payload_paths))
+                payload_paths=list(dict.fromkeys(stage_c_native_payload_paths)),
+                metadata_by_payload_path=stage_c_native_metadata_by_payload_path,
             )
             _write_json(sweep_root / "stage_c_native_guided_rankings.json", native_guided_rankings)
             _write_text(
                 sweep_root / "stage_c_native_guided_rankings.txt",
                 _format_native_summary(title="MCQA Hierarchical Stage C Native Guided DAS Ranking", rankings=native_guided_rankings),
+            )
+
+        stage_c_native_dimension_payload_paths: list[Path] = []
+        stage_c_native_dimension_metadata_by_payload_path: dict[str, dict[str, object]] = {}
+        if bool(normalized["enable_dim_hint_das"]):
+            dim_hint_configs = _select_stage_c_dim_hint_configs(
+                rankings=native_ot_rankings,
+                source="native_support",
+                top_configs_per_var=int(args.stage_c_top_configs_per_var),
+                scale_factors=normalized["dim_hint_scale_factors"],
+            )
+            for entry in dim_hint_configs:
+                target_var = str(entry["variable"])
+                layer_selection_method = str(entry.get("layer_selection_method", "custom"))
+                transport_method = str(entry.get("transport_method", "ot"))
+                token_position_id = str(entry.get("token_position_id", "last_token"))
+                layer = int(entry["layer"])
+                resolution = int(entry["resolution"])
+                dims = tuple(int(dim) for dim in entry.get("dim_hint_subspace_dims", []) if int(dim) > 0)
+                if not dims:
+                    continue
+                stage_name = (
+                    f"stage_c_native_dimension_{layer_selection_method}_{transport_method}_"
+                    f"{token_position_id}_{target_var}_L{int(layer):02d}_res{int(resolution)}"
+                )
+                stage_timestamp = (
+                    f"{str(normalized['results_timestamp'])}_stageC_native_dimension_"
+                    f"{layer_selection_method}_{transport_method}_{token_position_id}_{target_var}_"
+                    f"L{int(layer):02d}_res{int(resolution)}"
+                )
+                output_path = _stage_a_output_path(results_root=results_root, stage_timestamp=stage_timestamp)
+                expected_outputs = [str(output_path)]
+                payload_metadata = {
+                    **entry,
+                    "category": "stage_c_native_dimension_das",
+                    "stage_timestamp": stage_timestamp,
+                    "stage_b_transport_method": transport_method,
+                    "stage_c_target_vars": [target_var],
+                }
+                stage_c_native_dimension_metadata_by_payload_path[str(output_path)] = payload_metadata
+                if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
+                    stage_c_native_dimension_payload_paths.append(output_path)
+                    _mark_stage(
+                        manifest_path=manifest_path,
+                        repo_root=repo_root,
+                        args=args,
+                        normalized=normalized,
+                        stage_statuses=stage_statuses,
+                        stage_name=stage_name,
+                        payload={
+                            "state": "skipped_existing",
+                            "stage_timestamp": stage_timestamp,
+                            "expected_outputs": expected_outputs,
+                            **payload_metadata,
+                            "completed_at": datetime.now().isoformat(),
+                        },
+                    )
+                    continue
+                stage = SweepStage(
+                    name=stage_name,
+                    category="stage_c_native_dimension_das",
+                    description=(
+                        f"Full-layer DAS on native PLOT-selected layer {int(layer)} with dims "
+                        f"around selected support width {int(entry['dim_hint_effective_dim'])}."
+                    ),
+                    stage_timestamp=stage_timestamp,
+                    command=_build_stage_c_a_only_command(
+                        args=args,
+                        normalized=normalized,
+                        stage_timestamp=stage_timestamp,
+                        token_position_id=token_position_id,
+                        layers=(int(layer),),
+                        target_vars=(target_var,),
+                        das_subspace_dims=dims,
+                    ),
+                    expected_outputs=tuple(expected_outputs),
+                )
+                _mark_stage(
+                    manifest_path=manifest_path,
+                    repo_root=repo_root,
+                    args=args,
+                    normalized=normalized,
+                    stage_statuses=stage_statuses,
+                    stage_name=stage.name,
+                    payload={
+                        "state": "running",
+                        "stage_timestamp": stage_timestamp,
+                        "expected_outputs": expected_outputs,
+                        **payload_metadata,
+                        "started_at": datetime.now().isoformat(),
+                    },
+                )
+                stage_runtime_seconds = _run_stage_command(stage=stage, repo_root=repo_root)
+                missing_outputs = [path for path in expected_outputs if not _stage_output_is_valid(Path(path))]
+                if missing_outputs:
+                    raise RuntimeError(f"Stage {stage_name} missing outputs: {missing_outputs}")
+                stage_c_native_dimension_payload_paths.append(output_path)
+                _mark_stage(
+                    manifest_path=manifest_path,
+                    repo_root=repo_root,
+                    args=args,
+                    normalized=normalized,
+                    stage_statuses=stage_statuses,
+                    stage_name=stage.name,
+                    payload={
+                        "state": "completed",
+                        "stage_timestamp": stage_timestamp,
+                        "expected_outputs": expected_outputs,
+                        **payload_metadata,
+                        "runtime_seconds": float(stage_runtime_seconds),
+                        "wall_runtime_seconds": float(stage_runtime_seconds),
+                        "completed_at": datetime.now().isoformat(),
+                    },
+                )
+        if stage_c_native_dimension_payload_paths:
+            native_dimension_rankings = _extract_a_only_rankings(
+                payload_paths=stage_c_native_dimension_payload_paths,
+                metadata_by_payload_path=stage_c_native_dimension_metadata_by_payload_path,
+            )
+            _write_json(sweep_root / "stage_c_native_dimension_rankings.json", native_dimension_rankings)
+            _write_text(
+                sweep_root / "stage_c_native_dimension_rankings.txt",
+                _format_native_summary(title="MCQA Hierarchical Stage C Native Dimension DAS Ranking", rankings=native_dimension_rankings),
             )
 
         selected_config_groups = _select_stage_c_configs(
