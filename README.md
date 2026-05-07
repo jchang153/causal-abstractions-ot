@@ -8,8 +8,6 @@ This repository contains the experiment code for the PLOT paper. The publication
 
 PLOT as a progressive localization engine. The diagram follows one high-level variable, $Z_2$ in red, though OT localization is performed jointly over all high-level variables and candidate neural sites. PLOT first localizes coarse sites such as tokens/layers, then refines within them to coordinates or PCA spans. The resulting signal can be calibrated into a direct handle or used to guide DAS.
 
-Run commands from the repository root.
-
 ## Main Paper Experiments
 
 The following folders correspond to the experiments reported in the main paper.
