@@ -18,6 +18,7 @@ from mcqa_experiment.ot import (
     prepare_alignment_artifacts,
     resolve_recorded_artifact_prepare_seconds,
     save_prepared_alignment_artifacts,
+    solve_ot_transport,
     solve_uot_transport,
 )
 from mcqa_experiment.metrics import build_variable_signature
@@ -39,6 +40,8 @@ DEFAULT_OT_LAMBDAS = (1.0,)
 DEFAULT_DISPLAY_TOP_LAYER_COUNT = 3
 DEFAULT_STAGE_A_INTERVENTION_STRENGTH = 1.0
 DEFAULT_STAGE_A_ROW_TOP_K = 6
+DEFAULT_STAGE_A_TRANSPORT_METHODS = ("uot",)
+SUPPORTED_STAGE_A_TRANSPORT_METHODS = ("uot", "ot")
 
 
 def _synchronize_if_cuda(device: torch.device | str) -> None:
@@ -68,8 +71,22 @@ def _parse_csv_floats(value: str | None) -> list[float] | None:
     return [float(item) for item in items]
 
 
+def _parse_stage_a_transport_methods(value: str | None) -> tuple[str, ...]:
+    raw_methods = _parse_csv_strings(value) or list(DEFAULT_STAGE_A_TRANSPORT_METHODS)
+    methods = tuple(dict.fromkeys(str(method).strip().lower() for method in raw_methods if str(method).strip()))
+    unsupported = sorted(set(methods) - set(SUPPORTED_STAGE_A_TRANSPORT_METHODS))
+    if unsupported:
+        raise ValueError(
+            f"Unsupported Stage A transport methods: {unsupported}. "
+            f"Supported methods are {list(SUPPORTED_STAGE_A_TRANSPORT_METHODS)}."
+        )
+    if not methods:
+        raise ValueError("At least one Stage A transport method is required.")
+    return methods
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Joint layer-level PLOT UOT localization for MCQA.")
+    parser = argparse.ArgumentParser(description="Joint layer-level PLOT transport localization for MCQA.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--model-name", default="google/gemma-2-2b")
     parser.add_argument("--dataset-path", default="jchang153/copycolors_mcqa")
@@ -82,8 +99,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layers", help="Comma-separated layer indices. Default: all layers.")
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
-    parser.add_argument("--ot-epsilons", help="Comma-separated UOT epsilons. Default: 0.5,1,2,4")
-    parser.add_argument("--uot-beta-neurals", help="Comma-separated UOT beta_neural values. Default: 0.1,0.3,1,3")
+    parser.add_argument("--ot-epsilons", help="Comma-separated Stage A OT/UOT epsilons. Default: 0.5,1,2,4")
+    parser.add_argument(
+        "--stage-a-transport-methods",
+        default=",".join(DEFAULT_STAGE_A_TRANSPORT_METHODS),
+        help="Comma-separated Stage A transport methods to sweep: uot,ot. Default: uot",
+    )
+    parser.add_argument("--uot-beta-neurals", help="Comma-separated UOT beta_neural values. Ignored for balanced OT. Default: 0.1,0.3,1,3")
     parser.add_argument(
         "--ot-lambdas",
         help="Deprecated compatibility flag. Stage A now uses a fixed full-strength intervention and ignores lambda sweeps.",
@@ -92,7 +114,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--stage-a-row-top-k",
         type=int,
         default=DEFAULT_STAGE_A_ROW_TOP_K,
-        help="Number of top-ranked layers per UOT row to calibrate directly before selecting the best layer. Default: 6",
+        help="Number of top-ranked layers per transport row to calibrate directly before selecting the best layer. Default: 6",
     )
     parser.add_argument(
         "--calibration-family-weights",
@@ -186,31 +208,43 @@ def _iter_stage_a_transport_payloads(compare_payload: dict[str, object]) -> list
 
 def _build_transport_only_compare_payload(
     *,
+    method: str,
     target_vars: tuple[str, ...],
     variable_signatures_by_var: dict[str, torch.Tensor],
     site_signatures_by_var: dict[str, torch.Tensor],
     epsilon: float,
-    beta_neural: float,
+    beta_neural: float | None,
     signature_mode: str,
     calibration_family_weights: tuple[float, ...],
 ) -> dict[str, object]:
+    method = str(method).lower()
+    if method not in SUPPORTED_STAGE_A_TRANSPORT_METHODS:
+        raise ValueError(f"Unsupported Stage A transport method {method}")
+    resolved_beta_neural = None if method == "ot" else float(beta_neural)
     solve_start = perf_counter()
     config = OTConfig(
-        method="uot",
+        method=method,
         batch_size=1,
         epsilon=float(epsilon),
-        uot_beta_neural=float(beta_neural),
+        uot_beta_neural=1.0 if resolved_beta_neural is None else float(resolved_beta_neural),
         signature_mode=str(signature_mode),
         selection_verbose=True,
         source_target_vars=target_vars,
         calibration_metric=DEFAULT_CALIBRATION_METRIC,
         calibration_family_weights=tuple(float(weight) for weight in calibration_family_weights),
     )
-    transport, transport_meta = solve_uot_transport(
-        variable_signatures_by_var,
-        site_signatures_by_var,
-        config,
-    )
+    if method == "ot":
+        transport, transport_meta = solve_ot_transport(
+            variable_signatures_by_var,
+            site_signatures_by_var,
+            config,
+        )
+    else:
+        transport, transport_meta = solve_uot_transport(
+            variable_signatures_by_var,
+            site_signatures_by_var,
+            config,
+        )
     runtime_seconds = float(perf_counter() - solve_start)
     normalized_transport = normalize_transport_rows(transport)
     method_payloads: list[dict[str, object]] = []
@@ -218,10 +252,10 @@ def _build_transport_only_compare_payload(
         method_payloads.append(
             {
                 "kind": "mcqa_plot_layer_transport_target_row",
-                "method": "uot",
+                "method": method,
                 "target_var": str(target_var),
                 "ot_epsilon": float(epsilon),
-                "uot_beta_neural": float(beta_neural),
+                "uot_beta_neural": resolved_beta_neural,
                 "source_target_vars": [str(var) for var in target_vars],
                 "target_var_row_index": int(target_row_index),
                 "transport": transport.tolist(),
@@ -235,9 +269,10 @@ def _build_transport_only_compare_payload(
         )
     return {
         "kind": "mcqa_plot_layer_transport_only_compare",
-        "method_payloads": {"uot": method_payloads},
+        "method_payloads": {method: method_payloads},
+        "stage_a_transport_method": method,
         "ot_epsilon": float(epsilon),
-        "uot_beta_neural": float(beta_neural),
+        "uot_beta_neural": resolved_beta_neural,
         "source_target_vars": [str(var) for var in target_vars],
         "transport_meta": dict(transport_meta),
         "runtime_seconds": float(runtime_seconds),
@@ -372,6 +407,7 @@ def _evaluate_stage_a_config(
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
     epsilon = float(compare_payload.get("ot_epsilon", 0.0))
     compare_beta = compare_payload.get("uot_beta_neural")
+    compare_method = str(compare_payload.get("stage_a_transport_method", "uot")).lower()
     row_info_by_var: dict[str, dict[str, object]] = {}
     for target_var in target_vars:
         for method_name, payload in _iter_stage_a_transport_payloads(compare_payload):
@@ -528,7 +564,7 @@ def _evaluate_stage_a_config(
 
     if not per_var_records:
         return {
-            "method": "uot",
+            "method": compare_method,
             "epsilon": float(epsilon),
             "uot_beta_neural": None if compare_beta is None else float(compare_beta),
             "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
@@ -561,7 +597,7 @@ def _evaluate_stage_a_config(
             }
         ]
     return {
-        "method": "uot",
+        "method": compare_method,
         "epsilon": float(epsilon),
         "uot_beta_neural": None if compare_beta is None else float(compare_beta),
         "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
@@ -602,7 +638,8 @@ def _format_stage_a_config_line(
         if isinstance(record, dict)
     }
     return (
-        f"[stageA] coupling_result eps={float(candidate_config.get('epsilon', 0.0)):g} "
+        f"[stageA] coupling_result method={candidate_config.get('method', 'transport')} "
+        f"eps={float(candidate_config.get('epsilon', 0.0)):g} "
         + (
             f"beta_neural={float(candidate_config.get('uot_beta_neural')):g} "
             if candidate_config.get("uot_beta_neural") is not None else ""
@@ -632,6 +669,8 @@ def _select_joint_layer_config(
     row_top_k: int,
 ) -> dict[str, object]:
     best_config: dict[str, object] | None = None
+    best_config_by_method: dict[str, dict[str, object]] = {}
+    candidate_configs: list[dict[str, object]] = []
     for compare_payload in ot_compare_payloads:
         candidate_config = _evaluate_stage_a_config(
             model=model,
@@ -663,6 +702,17 @@ def _select_joint_layer_config(
                 runtime_with_signatures_seconds=float(candidate_config["runtime_with_signatures_seconds"]),
             )
         )
+        candidate_configs.append(dict(candidate_config))
+        candidate_method = str(candidate_config.get("method", "transport"))
+        method_best = best_config_by_method.get(candidate_method)
+        if method_best is None or (
+            float(candidate_config["mean_calibration_score"]),
+            float(candidate_config.get("mean_calibration_exact_acc", 0.0)),
+        ) > (
+            float(method_best["mean_calibration_score"]),
+            float(method_best.get("mean_calibration_exact_acc", 0.0)),
+        ):
+            best_config_by_method[candidate_method] = dict(candidate_config)
         if best_config is None or (
             float(candidate_config["mean_calibration_score"]),
             float(candidate_config.get("mean_calibration_exact_acc", 0.0)),
@@ -673,7 +723,10 @@ def _select_joint_layer_config(
             best_config = candidate_config
     if best_config is None:
         return {}
-    return dict(best_config)
+    selected = dict(best_config)
+    selected["candidate_configs"] = candidate_configs
+    selected["best_config_by_method"] = best_config_by_method
+    return selected
 
 
 def _evaluate_selected_stage_a_holdout(
@@ -809,6 +862,7 @@ def _format_summary(
     ]
     per_var_records = selected_config.get("per_var_records", {})
     if isinstance(per_var_records, dict) and per_var_records:
+        selected_method = str(selected_config.get("method", "transport"))
         chosen_layers = {
             str(target_var): int(record.get("layer", -1))
             for target_var, record in per_var_records.items()
@@ -826,7 +880,7 @@ def _format_summary(
         }
         lines.extend(
             [
-                "[selected_uot_coupling]",
+                f"[selected_{selected_method}_coupling]",
                 f"eps={float(selected_config.get('epsilon', 0.0)):g}",
                 (
                     f"beta_n={float(selected_config.get('uot_beta_neural')):g}"
@@ -843,6 +897,35 @@ def _format_summary(
                 "",
             ]
         )
+        best_config_by_method = selected_config.get("best_config_by_method", {})
+        if isinstance(best_config_by_method, dict) and best_config_by_method:
+            lines.append("[best_by_method]")
+            for method, method_config in sorted(best_config_by_method.items()):
+                if not isinstance(method_config, dict):
+                    continue
+                method_records = method_config.get("per_var_records", {})
+                if not isinstance(method_records, dict):
+                    continue
+                method_layers = {
+                    str(target_var): int(record.get("layer", -1))
+                    for target_var, record in method_records.items()
+                    if isinstance(record, dict)
+                }
+                method_tests = {
+                    str(target_var): float(record.get("exact_acc", 0.0))
+                    for target_var, record in method_records.items()
+                    if isinstance(record, dict)
+                }
+                lines.append(
+                    f"{method}: eps={float(method_config.get('epsilon', 0.0)):g} "
+                    + (
+                        f"beta_n={float(method_config.get('uot_beta_neural')):g} "
+                        if method_config.get("uot_beta_neural") is not None else ""
+                    )
+                    + f"layers={method_layers} test_by_var={method_tests} "
+                    + f"avg_test={float(method_config.get('mean_exact_acc', 0.0)):.4f}"
+                )
+            lines.append("")
     for target_var in DEFAULT_TARGET_VARS:
         selected = per_var_records.get(str(target_var), {}) if isinstance(per_var_records, dict) else {}
         lines.append(f"[{target_var}]")
@@ -903,6 +986,7 @@ def main() -> None:
     )
 
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
+    stage_a_transport_methods = _parse_stage_a_transport_methods(args.stage_a_transport_methods)
     uot_beta_neurals = tuple(_parse_csv_floats(args.uot_beta_neurals) or list(DEFAULT_UOT_BETA_NEURALS))
     stage_a_row_top_k = max(1, int(args.stage_a_row_top_k))
     calibration_family_weights = tuple(
@@ -935,7 +1019,7 @@ def main() -> None:
             sites=sites,
             device=device,
             config=OTConfig(
-                method="uot",
+                method=str(stage_a_transport_methods[0]),
                 batch_size=int(args.batch_size),
                 epsilon=float(ot_epsilons[0]),
                 uot_beta_neural=float(uot_beta_neurals[0]),
@@ -975,21 +1059,33 @@ def main() -> None:
     }
 
     ot_compare_payloads: list[dict[str, object]] = []
+    transport_output_paths: list[str] = []
     ot_localization_start = perf_counter()
     print(
-        f"[stageA] running joint layer UOT epsilon_sweep={list(ot_epsilons)} "
+        f"[stageA] running joint layer transport methods={list(stage_a_transport_methods)} "
+        f"epsilon_sweep={list(ot_epsilons)} "
         f"beta_neural_sweep={list(uot_beta_neurals)} "
         f"row_top_k={int(stage_a_row_top_k)}"
     )
-    for epsilon in ot_epsilons:
-        for beta_neural in uot_beta_neurals:
+    for method in stage_a_transport_methods:
+        if method == "ot":
+            method_grid = [(epsilon, None) for epsilon in ot_epsilons]
+        else:
+            method_grid = [
+                (epsilon, beta_neural)
+                for epsilon in ot_epsilons
+                for beta_neural in uot_beta_neurals
+            ]
+        for epsilon, beta_neural in method_grid:
+            beta_suffix = "" if beta_neural is None else f"_betan-{float(beta_neural):g}"
+            beta_log = "" if beta_neural is None else f" beta_neural={float(beta_neural):g}"
             print(
-                f"[stageA] epsilon={float(epsilon):g} beta_neural={float(beta_neural):g} "
-                "joint layer UOT"
+                f"[stageA] method={method} epsilon={float(epsilon):g}{beta_log} "
+                f"joint layer {method.upper()}"
             )
             output_stem = (
                 f"mcqa_plot_layer_pos-{str(args.token_position_id)}_sig-{str(args.signature_mode)}"
-                f"_eps-{float(epsilon):g}_betan-{float(beta_neural):g}_uot"
+                f"_eps-{float(epsilon):g}{beta_suffix}_{method}"
             )
             output_path = sweep_root / f"{output_stem}.json"
             summary_path = sweep_root / f"{output_stem}.txt"
@@ -999,34 +1095,32 @@ def main() -> None:
                 compare_payload = None
             if compare_payload is None:
                 print(
-                    f"[stageA] transport-only UOT solve eps={float(epsilon):g} "
-                    f"beta_neural={float(beta_neural):g}"
+                    f"[stageA] transport-only {method.upper()} solve eps={float(epsilon):g}{beta_log}"
                 )
                 compare_payload = _build_transport_only_compare_payload(
+                    method=method,
                     target_vars=target_vars,
                     variable_signatures_by_var=variable_signatures_by_var,
                     site_signatures_by_var=site_signatures_by_var,
                     epsilon=float(epsilon),
-                    beta_neural=float(beta_neural),
+                    beta_neural=None if beta_neural is None else float(beta_neural),
                     signature_mode=str(args.signature_mode),
                     calibration_family_weights=calibration_family_weights,
                 )
                 write_json(output_path, compare_payload)
-                write_text_report(
-                    summary_path,
-                    "\n".join(
-                        [
-                            "MCQA PLOT Layer Transport-Only UOT",
-                            f"token_position_id: {str(args.token_position_id)}",
-                            f"epsilon: {float(epsilon):g}",
-                            f"uot_beta_neural: {float(beta_neural):g}",
-                            f"layers: {list(int(layer) for layer in resolved_layers)}",
-                        ]
-                    ),
-                )
+                report_lines = [
+                    f"MCQA PLOT Layer Transport-Only {method.upper()}",
+                    f"token_position_id: {str(args.token_position_id)}",
+                    f"epsilon: {float(epsilon):g}",
+                    f"layers: {list(int(layer) for layer in resolved_layers)}",
+                ]
+                if beta_neural is not None:
+                    report_lines.insert(3, f"uot_beta_neural: {float(beta_neural):g}")
+                write_text_report(summary_path, "\n".join(report_lines))
             else:
-                print(f"[stageA] reusing existing UOT payload path={output_path}")
+                print(f"[stageA] reusing existing {method.upper()} payload path={output_path}")
             ot_compare_payloads.append(compare_payload)
+            transport_output_paths.append(str(output_path))
     _synchronize_if_cuda(device)
     ot_localization_seconds = float(perf_counter() - ot_localization_start)
 
@@ -1037,7 +1131,7 @@ def main() -> None:
         )
     )
     print(
-        "[stageA] selecting one shared PLOT(layer) UOT coupling by averaging the "
+        "[stageA] selecting one shared PLOT(layer) transport coupling by averaging the "
         "best shortlisted-layer calibration accuracies across abstract variables"
     )
     selected_config = _select_joint_layer_config(
@@ -1062,6 +1156,21 @@ def main() -> None:
         batch_size=int(args.batch_size),
         selected_config=selected_config,
     )
+    best_config_by_method = selected_config.get("best_config_by_method", {})
+    if isinstance(best_config_by_method, dict):
+        selected_config["best_config_by_method"] = {
+            str(method): _evaluate_selected_stage_a_holdout(
+                model=model,
+                tokenizer=tokenizer,
+                banks_by_split=banks_by_split,
+                sites=sites,
+                device=device,
+                batch_size=int(args.batch_size),
+                selected_config=method_config,
+            )
+            for method, method_config in best_config_by_method.items()
+            if isinstance(method_config, dict)
+        }
     selected_config["row_top_k"] = int(stage_a_row_top_k)
     method_by_var = {
         str(target_var): dict(record)
@@ -1069,7 +1178,7 @@ def main() -> None:
         if isinstance(record, dict)
     }
     support_start = perf_counter()
-    print("[stageA] extracting UOT support diagnostics")
+    print("[stageA] extracting transport support diagnostics")
     support_by_var = extract_ordered_site_support(
         ot_run_payloads=ot_compare_payloads,
         sites=sites,
@@ -1109,6 +1218,7 @@ def main() -> None:
             "layers": [int(layer) for layer in resolved_layers],
             "signature_mode": str(args.signature_mode),
             "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
+            "stage_a_transport_methods": [str(method) for method in stage_a_transport_methods],
             "uot_beta_neurals": [float(beta_neural) for beta_neural in uot_beta_neurals],
             "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
             "stage_a_row_top_k": int(stage_a_row_top_k),
@@ -1122,18 +1232,8 @@ def main() -> None:
             "selected_joint_config": selected_config,
             "display_method_by_var": method_by_var,
             "method_by_var": method_by_var,
-            "stage_a_transport_method": "uot",
-            "ot_output_paths": [
-                str(
-                    sweep_root
-                    / (
-                        f"mcqa_plot_layer_pos-{str(args.token_position_id)}_sig-{str(args.signature_mode)}"
-                        f"_eps-{float(epsilon):g}_betan-{float(beta_neural):g}_uot.json"
-                    )
-                )
-                for epsilon in ot_epsilons
-                for beta_neural in uot_beta_neurals
-            ],
+            "stage_a_transport_method": str(selected_config.get("method", stage_a_transport_methods[0])),
+            "ot_output_paths": transport_output_paths,
             "summary_path": str(summary_path),
             "context_timing_seconds": context_timing_seconds,
             "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),

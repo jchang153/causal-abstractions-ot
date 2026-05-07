@@ -20,6 +20,8 @@ DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
+DEFAULT_STAGE_A_TRANSPORT_METHODS = ("uot",)
+SUPPORTED_STAGE_A_TRANSPORT_METHODS = ("uot", "ot")
 DEFAULT_STAGE_A_UOT_BETA_NEURALS = (0.1, 0.3, 1.0, 3.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 3, 4, 5)
 DEFAULT_OT_LAMBDAS = (
@@ -100,6 +102,20 @@ def _parse_csv_ints(value: str | None) -> tuple[int, ...]:
 
 def _parse_csv_floats(value: str | None) -> tuple[float, ...]:
     return tuple(float(item) for item in _parse_csv_strings(value))
+
+
+def _parse_stage_a_transport_methods(value: str | None) -> tuple[str, ...]:
+    raw_methods = _parse_csv_strings(value) or DEFAULT_STAGE_A_TRANSPORT_METHODS
+    methods = tuple(dict.fromkeys(str(method).strip().lower() for method in raw_methods if str(method).strip()))
+    unsupported = sorted(set(methods) - set(SUPPORTED_STAGE_A_TRANSPORT_METHODS))
+    if unsupported:
+        raise ValueError(
+            f"Unsupported Stage A transport methods: {unsupported}. "
+            f"Supported methods are {list(SUPPORTED_STAGE_A_TRANSPORT_METHODS)}."
+        )
+    if not methods:
+        raise ValueError("At least one Stage A transport method is required.")
+    return methods
 
 
 def _parse_stage_a_fixed_layers(value: str | None) -> dict[str, tuple[int, ...]]:
@@ -345,6 +361,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
     parser.add_argument("--ot-epsilons", default="0.5,1,2,4")
+    parser.add_argument(
+        "--stage-a-transport-methods",
+        default=",".join(DEFAULT_STAGE_A_TRANSPORT_METHODS),
+        help="Comma-separated Stage A transport methods to sweep: uot,ot. Default: uot",
+    )
     parser.add_argument("--stage-a-uot-beta-neurals", default="0.1,0.3,1,3")
     parser.add_argument("--stage-a-row-top-k", type=int, default=6)
     parser.add_argument(
@@ -450,6 +471,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         _parse_csv_ints(args.native_resolutions) or DEFAULT_NATIVE_RESOLUTIONS
     )
     ot_epsilons = _parse_csv_floats(args.ot_epsilons) or DEFAULT_OT_EPSILONS
+    stage_a_transport_methods = _parse_stage_a_transport_methods(args.stage_a_transport_methods)
     stage_a_uot_beta_neurals = _parse_csv_floats(args.stage_a_uot_beta_neurals) or DEFAULT_STAGE_A_UOT_BETA_NEURALS
     ot_top_k_values = _parse_csv_ints(args.ot_top_k_values) or DEFAULT_OT_TOP_K_VALUES
     ot_lambdas = _parse_csv_floats(args.ot_lambdas) or DEFAULT_OT_LAMBDAS
@@ -483,6 +505,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "pca_write_support_artifact": bool(args.pca_write_support_artifact),
         "native_resolutions": tuple(int(resolution) for resolution in native_resolutions),
         "ot_epsilons": tuple(float(epsilon) for epsilon in ot_epsilons),
+        "stage_a_transport_methods": tuple(str(method) for method in stage_a_transport_methods),
         "stage_a_uot_beta_neurals": tuple(float(beta) for beta in stage_a_uot_beta_neurals),
         "stage_a_row_top_k": max(1, int(args.stage_a_row_top_k)),
         "ot_top_k_values": tuple(int(value) for value in ot_top_k_values),
@@ -532,6 +555,8 @@ def _build_stage_a_command(
         str(token_position_id),
         "--ot-epsilons",
         ",".join(str(epsilon).rstrip("0").rstrip(".") if "." in str(epsilon) else str(epsilon) for epsilon in normalized["ot_epsilons"]),
+        "--stage-a-transport-methods",
+        ",".join(str(method) for method in normalized["stage_a_transport_methods"]),
         "--uot-beta-neurals",
         ",".join(
             str(beta).rstrip("0").rstrip(".") if "." in str(beta) else str(beta)
@@ -1976,6 +2001,7 @@ def _write_status(
             "target_vars": list(normalized["target_vars"]),
             "stage_a_token_position_ids": list(normalized["stage_a_token_position_ids"]),
             "stage_a_layer_indices": list(normalized["stage_a_layer_indices"]),
+            "stage_a_transport_methods": list(normalized["stage_a_transport_methods"]),
             "stage_a_uot_beta_neurals": list(normalized["stage_a_uot_beta_neurals"]),
             "stage_a_row_top_k": int(normalized["stage_a_row_top_k"]),
             "stage_b_top_layers_per_var": int(args.stage_b_top_layers_per_var),
