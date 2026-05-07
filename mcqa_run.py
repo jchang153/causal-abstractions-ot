@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import gc
 import hashlib
 import json
 from pathlib import Path
@@ -8,6 +9,7 @@ import os
 from time import perf_counter
 
 from huggingface_hub import login as hf_login
+import torch
 
 from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparison
 import mcqa_experiment.data as mcqa_data

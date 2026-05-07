@@ -10,7 +10,11 @@ from torch.utils.data import DataLoader
 
 from .data import MCQAPairBank, MCQAPairDataset
 from .intervention import DASSubspaceIntervention, run_das_residual_intervention
-from .metrics import cross_entropy_for_bank, metrics_from_logits, prediction_details_from_logits
+from .metrics import (
+    cross_entropy_for_bank,
+    das_metrics_from_logits,
+    das_prediction_details_from_logits,
+)
 from .pca import LayerPCABasis
 from .sites import SiteLike, site_token_position_ids, site_total_width
 
@@ -116,7 +120,7 @@ def train_das_candidate(
     optimizer = torch.optim.Adam(intervention.parameters(), lr=float(learning_rate))
     loader = DataLoader(MCQAPairDataset(bank), batch_size=batch_size, shuffle=True)
     losses: list[float] = []
-    previous_epoch_loss = None
+    previous_loss = None
     plateau_steps = 0
     for epoch_index in range(int(max_epochs)):
         epoch_loss_sum = 0.0
@@ -148,11 +152,17 @@ def train_das_candidate(
             epoch_example_count += batch_size_actual
         epoch_loss = epoch_loss_sum / max(epoch_example_count, 1)
         losses.append(epoch_loss)
-        if previous_epoch_loss is None or epoch_loss < float(previous_epoch_loss) * (1.0 - float(plateau_rel_delta)):
+        if verbose:
+            print(
+                f"[DAS] epoch {epoch_index + 1}/{int(max_epochs)} "
+                f"variable={bank.target_var} site={site.label} dim={int(subspace_dim)} "
+                f"loss={float(epoch_loss):.6f}"
+            )
+        if previous_loss is None or epoch_loss < float(previous_loss) * (1.0 - float(plateau_rel_delta)):
             plateau_steps = 0
         else:
             plateau_steps += 1
-        previous_epoch_loss = epoch_loss
+        previous_loss = epoch_loss
         if epoch_index + 1 >= int(min_epochs) and plateau_steps >= int(plateau_patience):
             break
     return intervention, losses
@@ -187,9 +197,9 @@ def evaluate_das_candidate(
         )
         logits_all.append(logits.detach().cpu())
     full_logits = torch.cat(logits_all, dim=0)
-    metrics = metrics_from_logits(full_logits, bank, tokenizer=tokenizer)
+    metrics = das_metrics_from_logits(full_logits, bank, tokenizer=tokenizer)
     if return_details:
-        metrics["prediction_details"] = prediction_details_from_logits(full_logits, bank, tokenizer=tokenizer)
+        metrics["prediction_details"] = das_prediction_details_from_logits(full_logits, bank, tokenizer=tokenizer)
     return metrics
 
 

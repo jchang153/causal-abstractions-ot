@@ -43,6 +43,12 @@ Both pipelines follow the same high-level pattern:
   - Trains or loads the equality MLP, builds one fixed set of train/calibration/test pair banks, and runs the comparison pipeline.
   - Supports OT-only sweeps over `epsilon` and Gibbs-kernel `tau` while reusing the same pair-bank splits across sweep points.
   - Writes outputs under `results/<timestamp>_equality/`.
+- `equality_calibration_strategy_sweep.py`
+  - Runs the HEQ shared/separate calibration-bank comparison used for the current paper protocol.
+- `equality_clean_epsilon_sweep.py`
+  - Sweeps HEQ OT/UOT performance over entropic regularization while holding the calibration protocol fixed.
+- `equality_paper_figures.py`
+  - Generates the current HEQ paper figures under `paper/plots/`, including the joint accuracy/runtime plots, OT epsilon sweep, and handle visualizations.
 
 These scripts are meant to be edited directly. The config block near the top of
 each file is the intended control surface.
@@ -213,6 +219,13 @@ python equality_run.py
 
 Depending on `RETRAIN_BACKBONE`, this will either train a fresh equality
 backbone or load `models/equality_mlp_seed<seed>.pt`.
+
+To regenerate the current HEQ paper figures from the checked-in HEQ sweep
+results, run:
+
+```bash
+python equality_paper_figures.py
+```
 
 ## Notes on the Equality Pipeline
 
