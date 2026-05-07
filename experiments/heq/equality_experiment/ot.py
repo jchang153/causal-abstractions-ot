@@ -80,7 +80,7 @@ def _require_pot() -> None:
     if pot is None:
         raise ImportError(
             "POT backend requested but the `ot` package is not installed in this environment. "
-            "Use the custom backend or run in an environment such as `torch-metal` where POT is installed."
+            "Use the custom backend or run in an environment where POT is installed."
         )
 
 

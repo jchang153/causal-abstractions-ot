@@ -1,6 +1,10 @@
 # PLOT: Progressive Localization via Optimal Transport
 
-This repository contains the experiment code for the paper sources in `paper/`, especially `paper/neurips_2026.tex`. The publication-facing experiment code is organized under `experiments/` by benchmark.
+This repository contains the experiment code for the PLOT paper. The publication-facing experiment code is organized under `experiments/` by benchmark.
+
+The local `paper/` folder is gitignored. It can contain manuscript sources, generated figures, and other paper-build artifacts on a developer machine, but it is not part of the tracked repository.
+
+Repo-facing figures live under `figs/`, including the PLOT overview diagram at `figs/plot_diagram_new.pdf`.
 
 Run commands from the repository root.
 
@@ -28,7 +32,7 @@ python experiments/heq/equality_clean_epsilon_sweep.py
 python experiments/heq/equality_paper_figures.py
 ```
 
-`equality_paper_figures.py` regenerates the HEQ plots under `paper/plots/` from saved result JSON files.
+`equality_paper_figures.py` regenerates the HEQ plots under the local ignored `paper/plots/` folder from saved result JSON files.
 
 ### 4-Bit Binary Addition
 
@@ -104,7 +108,8 @@ These folders are included under `experiments/` for completeness. They are not t
 - `experiments/heq/`: main-paper HEQ scripts and implementation package.
 - `experiments/binary_addition/`: main-paper 4-bit binary-addition scripts and implementation package.
 - `experiments/mcqa/`: main-paper MCQA scripts, implementation package, and Slurm launchers.
-- `paper/`: paper sources and checked-in plot assets.
+- `figs/`: repo-facing figures that should remain tracked separately from the ignored `paper/` folder.
+- `paper/`: local ignored manuscript sources, generated figures, and paper-build artifacts.
 - `models/`: local checkpoints.
 - `results/`: timestamped experiment outputs.
 
@@ -118,16 +123,9 @@ pip install -r requirements.txt
 
 Some experiments require additional heavy dependencies already implied by the scripts, including PyTorch, pyvene, transformers, datasets, and POT. MCQA runs are intended for GPU execution; HEQ and binary-addition smoke runs can run on CPU.
 
-If using the local `torch-metal` environment:
-
-```bash
-conda activate torch-metal
-export PYTHONPATH=.
-```
-
 ## Outputs
 
-Experiment runs write JSON payloads, text summaries, and plot artifacts under `results/` or the output directory passed on the command line. Paper figure scripts write into `paper/plots/`.
+Experiment runs write JSON payloads, text summaries, and plot artifacts under `results/` or the output directory passed on the command line. Paper figure scripts write into the local ignored `paper/plots/` folder.
 
 ## Quick Checks
 
