@@ -42,8 +42,8 @@ def parse_args() -> argparse.Namespace:
             "site menu and top-k grid, and final handles are selected per row by calibration."
         )
     )
-    ap.add_argument("--base-run-dir", type=str, default=str(Path("eval") / "codex_progressive_plot_10seed"))
-    ap.add_argument("--out-dir", type=str, default=str(Path("eval") / "codex_progressive_plot_resolution_topk"))
+    ap.add_argument("--base-run-dir", type=str, default=str(Path("eval") / "progressive_plot_10seed"))
+    ap.add_argument("--out-dir", type=str, default=str(Path("eval") / "progressive_plot_resolution_topk"))
     ap.add_argument("--hidden-size", type=int, required=True, choices=[8, 16])
     ap.add_argument("--seeds", type=str, default="0,1,2,3,4,5,6,7,8,9")
     ap.add_argument("--rows", type=str, default=ROW_KEYS_DEFAULT)

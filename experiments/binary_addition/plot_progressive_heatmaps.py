@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--run-dir",
         type=str,
-        default=str(Path("eval") / "codex_progressive_plot_10seed"),
+        default=str(Path("eval") / "progressive_plot_10seed"),
         help="Directory containing h8/h16 seed summaries.",
     )
     ap.add_argument("--hidden-size", type=int, required=True, choices=[8, 16])

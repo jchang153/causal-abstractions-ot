@@ -130,7 +130,7 @@ def _parse_rows(text: str) -> tuple[str, ...]:
 def _checkpoint_map(hidden_size: int) -> dict[int, str]:
     if int(hidden_size) == 8:
         mapping = {
-            0: str(ROOT / "eval" / "codex_ot_grid_h8_structured17_top2carry" / "checkpoints" / "gru_h8_seed0.pt"),
+            0: str(ROOT / "eval" / "ot_grid_h8_structured17_top2carry" / "checkpoints" / "gru_h8_seed0.pt"),
             1: str(ROOT / "eval" / "shared_checkpoints" / "gru_h8_seed1.pt"),
             2: str(ROOT / "eval" / "shared_checkpoints" / "gru_h8_seed2.pt"),
         }
@@ -139,7 +139,7 @@ def _checkpoint_map(hidden_size: int) -> dict[int, str]:
         return mapping
     if int(hidden_size) == 16:
         mapping = {
-            0: str(ROOT / "eval" / "codex_binary_backbone_h16_seed0" / "gru_adder.pt"),
+            0: str(ROOT / "eval" / "binary_backbone_h16_seed0" / "gru_adder.pt"),
             1: str(ROOT / "eval" / "shared_checkpoints" / "gru_h16_seed1.pt"),
             2: str(ROOT / "eval" / "shared_checkpoints" / "gru_h16_seed2.pt"),
         }

@@ -13,8 +13,8 @@ Example Stage B rerun:
 
 ```bash
 python experiments/binary_addition/run_progressive_plot_stage_b_resolution_sweep.py \
-  --base-run-dir eval/codex_progressive_plot_10seed \
-  --out-dir eval/codex_progressive_plot_resolution_topk \
+  --base-run-dir eval/progressive_plot_10seed \
+  --out-dir eval/progressive_plot_resolution_topk \
   --hidden-size 16 \
   --seeds 0,1,2,3,4,5,6,7,8,9 \
   --resolutions 1,2
