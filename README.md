@@ -4,7 +4,11 @@ This repository contains the experiment code for the PLOT paper. The publication
 
 The local `paper/` folder is gitignored. It can contain manuscript sources, generated figures, and other paper-build artifacts on a developer machine, but it is not part of the tracked repository.
 
-Repo-facing figures live under `figs/`, including the PLOT overview diagram at `figs/plot_diagram_new.pdf`.
+<p align="center">
+  <img src="figs/plot_diagram.png" alt="PLOT progressive localization diagram" width="100%">
+</p>
+
+*Figure: PLOT as a progressive localization engine. The diagram follows one high-level variable, $Z_2$ in red, though OT localization is performed jointly over all high-level variables and candidate neural sites. PLOT first localizes coarse sites such as tokens/layers, then refines within them to coordinates or PCA spans. The resulting signal can be calibrated into a direct handle or used to guide DAS.*
 
 Run commands from the repository root.
 
@@ -108,7 +112,6 @@ These folders are included under `experiments/` for completeness. They are not t
 - `experiments/heq/`: main-paper HEQ scripts and implementation package.
 - `experiments/binary_addition/`: main-paper 4-bit binary-addition scripts and implementation package.
 - `experiments/mcqa/`: main-paper MCQA scripts, implementation package, and Slurm launchers.
-- `figs/`: repo-facing figures that should remain tracked separately from the ignored `paper/` folder.
 - `paper/`: local ignored manuscript sources, generated figures, and paper-build artifacts.
 - `models/`: local checkpoints.
 - `results/`: timestamped experiment outputs.
