@@ -2,8 +2,6 @@
 
 This repository contains the experiment code for the PLOT paper. The publication-facing experiment code is organized under `experiments/` by benchmark.
 
-The local `paper/` folder is gitignored. It can contain manuscript sources, generated figures, and other paper-build artifacts on a developer machine, but it is not part of the tracked repository.
-
 <p align="center">
   <img src="figs/plot_diagram.png" alt="PLOT progressive localization diagram" width="100%">
 </p>
