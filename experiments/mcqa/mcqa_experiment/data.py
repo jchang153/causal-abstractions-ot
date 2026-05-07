@@ -1,0 +1,862 @@
+"""MCQA task definitions, dataset loading, and factual filtering."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import random
+import re
+from time import perf_counter
+from typing import Callable
+
+from datasets import get_dataset_split_names, load_dataset
+import torch
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
+from .checking import causalab_substring_checker
+from .runtime import resolve_device
+
+
+DATASET_PATH = os.environ.get("MCQA_DATASET_PATH", "mib-bench/copycolors_mcqa")
+DATASET_NAME = os.environ.get("MCQA_DATASET_CONFIG", "4_answer_choices")
+_DATASET_CONFIG_UNSET = object()
+LAST_PIPELINE_TIMING_SECONDS: dict[str, float] = {}
+
+CANONICAL_ANSWER_STRINGS = (" A", " B", " C", " D")
+CANONICAL_ANSWER_LABELS = ("A", "B", "C", "D")
+ALPHABET_LABELS = tuple(chr(codepoint) for codepoint in range(ord("A"), ord("Z") + 1))
+COUNTERFACTUAL_FAMILIES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
+TARGET_VAR_ALIASES = {
+    "answer_pointer": "answer_pointer",
+    "ans_index": "answer_pointer",
+    "answer": "answer_token",
+    "answer_token": "answer_token",
+    "ans_value": "answer_token",
+}
+
+
+def canonicalize_target_var(target_var: str) -> str:
+    canonical = TARGET_VAR_ALIASES.get(str(target_var))
+    if canonical is None:
+        raise ValueError(f"Unsupported MCQA target variable {target_var}")
+    return canonical
+
+
+class MCQACausalModel:
+    """Small self-contained copy of the Simple MCQA causal model logic."""
+
+    def __init__(self) -> None:
+        self.variables = (
+            "question",
+            "raw_input",
+            "symbol0",
+            "symbol1",
+            "symbol2",
+            "symbol3",
+            "choice0",
+            "choice1",
+            "choice2",
+            "choice3",
+            "answer_pointer",
+            "answer",
+            "raw_output",
+        )
+
+    def run_forward(self, input_dict: dict[str, object]) -> dict[str, object]:
+        output = dict(input_dict)
+        question = tuple(output["question"])
+        choices = [str(output[f"choice{index}"]) for index in range(4)]
+        symbols = [str(output[f"symbol{index}"]) for index in range(4)]
+        pointer = None
+        for index, choice in enumerate(choices):
+            if choice == question[0]:
+                pointer = index
+                break
+        if pointer is None:
+            raise ValueError(f"Could not resolve answer_pointer from question={question} and choices={choices}")
+        answer = " " + symbols[pointer]
+        output["answer_pointer"] = int(pointer)
+        output["answer"] = answer
+        output["raw_output"] = answer
+        return output
+
+    def run_interchange(
+        self,
+        base_input: dict[str, object],
+        source_input: dict[str, object],
+        target_variables: tuple[str, ...] | list[str],
+    ) -> dict[str, object]:
+        base_setting = self.run_forward(base_input)
+        source_setting = self.run_forward(source_input)
+        canonical_targets = {canonicalize_target_var(str(variable)) for variable in target_variables}
+
+        setting = dict(base_setting)
+        if "answer_pointer" in canonical_targets:
+            setting["answer_pointer"] = int(source_setting["answer_pointer"])
+        if "answer_token" in canonical_targets:
+            setting["answer"] = str(source_setting["answer"])
+
+        # Recompute descendants in topological order for the supported MCQA DAG.
+        if "answer_pointer" in canonical_targets and "answer_token" not in canonical_targets:
+            pointer = int(setting["answer_pointer"])
+            setting["answer"] = " " + str(setting[f"symbol{pointer}"])
+        if canonical_targets:
+            setting["raw_output"] = str(setting["answer"])
+        return setting
+
+
+@dataclass(frozen=True)
+class TokenPosition:
+    """Minimal task-local token-position descriptor."""
+
+    resolver: Callable[[dict[str, object], object], list[int]]
+    id: str
+
+    def resolve(self, input_dict: dict[str, object], tokenizer) -> int:
+        positions = self.resolver(input_dict, tokenizer)
+        if not positions:
+            raise ValueError(f"Token position {self.id} returned no indices")
+        return int(positions[0])
+
+
+@dataclass(frozen=True)
+class MCQAPairBank:
+    """Tokenized base/source split for one MCQA target variable."""
+
+    split: str
+    target_var: str
+    dataset_names: tuple[str, ...]
+    base_input_ids: torch.Tensor
+    base_attention_mask: torch.Tensor
+    source_input_ids: torch.Tensor
+    source_attention_mask: torch.Tensor
+    labels: torch.Tensor
+    base_inputs: list[dict[str, object]]
+    source_inputs: list[dict[str, object]]
+    base_outputs: list[dict[str, object]]
+    source_outputs: list[dict[str, object]]
+    base_position_by_id: dict[str, torch.Tensor]
+    source_position_by_id: dict[str, torch.Tensor]
+    symbol_token_ids: torch.Tensor
+    symbol_variant_token_ids: torch.Tensor
+    source_symbol_token_ids: torch.Tensor
+    source_symbol_variant_token_ids: torch.Tensor
+    alphabet_token_ids: torch.Tensor
+    alphabet_variant_token_ids: torch.Tensor
+    canonical_answer_token_ids: torch.Tensor
+    answer_token_ids: torch.Tensor
+    base_answer_token_ids: torch.Tensor
+    changed_mask: torch.Tensor
+    counterfactual_family_names: list[str]
+    expected_answer_texts: list[str]
+
+    @property
+    def size(self) -> int:
+        return int(self.labels.shape[0])
+
+    def metadata(self) -> dict[str, object]:
+        family_counts: dict[str, int] = {}
+        for family_name in self.counterfactual_family_names:
+            family_counts[str(family_name)] = family_counts.get(str(family_name), 0) + 1
+        return {
+            "split": self.split,
+            "target_var": self.target_var,
+            "size": self.size,
+            "dataset_names": list(self.dataset_names),
+            "changed_count": int(self.changed_mask.sum().item()),
+            "changed_rate": float(self.changed_mask.float().mean().item()) if self.size else 0.0,
+            "family_counts": family_counts,
+        }
+
+
+class MCQAPairDataset(torch.utils.data.Dataset):
+    """Dataset view for DAS training and evaluation."""
+
+    def __init__(self, bank: MCQAPairBank):
+        self.bank = bank
+
+    def __len__(self) -> int:
+        return self.bank.size
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        return {
+            "base_input_ids": self.bank.base_input_ids[index],
+            "base_attention_mask": self.bank.base_attention_mask[index],
+            "source_input_ids": self.bank.source_input_ids[index],
+            "source_attention_mask": self.bank.source_attention_mask[index],
+            "labels": self.bank.labels[index],
+            "symbol_token_ids": self.bank.symbol_token_ids[index],
+            "symbol_variant_token_ids": self.bank.symbol_variant_token_ids[index],
+            "source_symbol_token_ids": self.bank.source_symbol_token_ids[index],
+            "source_symbol_variant_token_ids": self.bank.source_symbol_variant_token_ids[index],
+            "alphabet_token_ids": self.bank.alphabet_token_ids[index],
+            "alphabet_variant_token_ids": self.bank.alphabet_variant_token_ids[index],
+            "answer_token_id": self.bank.answer_token_ids[index],
+            "base_answer_token_id": self.bank.base_answer_token_ids[index],
+            "counterfactual_family_name": self.bank.counterfactual_family_names[index],
+            "base_positions": {key: value[index] for key, value in self.bank.base_position_by_id.items()},
+            "source_positions": {key: value[index] for key, value in self.bank.source_position_by_id.items()},
+            "expected_answer_text": self.bank.expected_answer_texts[index],
+        }
+
+
+def parse_mcqa_example(row: dict[str, object]) -> dict[str, object]:
+    """Parse one HF MCQA row into the copied causal-model input format."""
+    prompt_str = str(row.get("prompt", ""))
+    question_text = prompt_str
+    if " is " in question_text:
+        noun, color = question_text.split(" is ", 1)
+    elif " are " in question_text:
+        noun, color = question_text.split(" are ", 1)
+    else:
+        raise ValueError(f"Could not parse MCQA question text from prompt: {prompt_str}")
+    noun = noun.strip().lower()
+    color = color.split(".", 1)[0].strip().lower()
+    variables_dict: dict[str, object] = {
+        "question": (color, noun),
+        "raw_input": prompt_str,
+    }
+    labels = row["choices"]["label"]
+    texts = row["choices"]["text"]
+    for index, label in enumerate(labels):
+        variables_dict[f"symbol{index}"] = str(label)
+        variables_dict[f"choice{index}"] = str(texts[index])
+    return variables_dict
+
+
+def _find_correct_symbol_index(input_dict: dict[str, object], tokenizer, causal_model: MCQACausalModel) -> list[int]:
+    output = causal_model.run_forward(input_dict)
+    pointer = int(output["answer_pointer"])
+    correct_symbol = str(output[f"symbol{pointer}"])
+    prompt = str(input_dict["raw_input"])
+    matches = list(re.finditer(r"\b[A-Z]\b", prompt))
+    symbol_match = None
+    for match in matches:
+        if prompt[match.start() : match.end()] == correct_symbol:
+            symbol_match = match
+            break
+    if symbol_match is None:
+        raise ValueError(f"Could not find correct symbol {correct_symbol} in prompt: {prompt}")
+    substring = prompt[: symbol_match.end()]
+    tokenized = tokenizer(substring, add_special_tokens=True, return_attention_mask=False)["input_ids"]
+    return [len(tokenized) - 1]
+
+
+def get_token_positions(tokenizer, causal_model: MCQACausalModel) -> list[TokenPosition]:
+    """Copied token-position logic for Simple MCQA."""
+
+    def correct_symbol(input_dict: dict[str, object], current_tokenizer) -> list[int]:
+        return _find_correct_symbol_index(input_dict, current_tokenizer, causal_model)
+
+    def correct_symbol_period(input_dict: dict[str, object], current_tokenizer) -> list[int]:
+        return [correct_symbol(input_dict, current_tokenizer)[0] + 1]
+
+    def last_token(input_dict: dict[str, object], current_tokenizer) -> list[int]:
+        prompt = str(input_dict["raw_input"])
+        tokenized = current_tokenizer(prompt, add_special_tokens=True, return_attention_mask=False)["input_ids"]
+        return [len(tokenized) - 1]
+
+    return [
+        TokenPosition(correct_symbol, "correct_symbol"),
+        TokenPosition(correct_symbol_period, "correct_symbol_period"),
+        TokenPosition(last_token, "last_token"),
+    ]
+
+
+def _load_counterfactual_rows(
+    *,
+    split: str,
+    size: int | None = None,
+    hf_token: str | None = None,
+    dataset_path: str | None = None,
+    dataset_name: str | None | object = _DATASET_CONFIG_UNSET,
+) -> dict[str, list[dict[str, object]]]:
+    token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    resolved_dataset_path = dataset_path or DATASET_PATH
+    resolved_dataset_name = DATASET_NAME if dataset_name is _DATASET_CONFIG_UNSET else dataset_name
+    dataset_path_obj = Path(resolved_dataset_path)
+    if dataset_path_obj.exists():
+        split_file = dataset_path_obj / f"{split}.jsonl"
+        if not split_file.exists():
+            raise FileNotFoundError(f"Expected local MCQA dataset file at {split_file}")
+        dataset = load_dataset("json", data_files={split: str(split_file)}, split=split)
+    else:
+        if resolved_dataset_name:
+            dataset = load_dataset(resolved_dataset_path, resolved_dataset_name, split=split, token=token)
+        else:
+            dataset = load_dataset(resolved_dataset_path, split=split, token=token)
+    if size is not None:
+        dataset = dataset.select(range(min(int(size), len(dataset))))
+    sample = dataset[0]
+    counterfactual_names = [
+        key
+        for key in sample.keys()
+        if key.endswith("_counterfactual") and "noun" not in key and "color" not in key and "symbol" not in key
+    ]
+    datasets: dict[str, list[dict[str, object]]] = {}
+    for counterfactual_name in counterfactual_names:
+        dataset_name = counterfactual_name.replace("_counterfactual", f"_{split}")
+        counterfactual_family = counterfactual_name.replace("_counterfactual", "")
+        rows: list[dict[str, object]] = []
+        for row in dataset:
+            base_input = parse_mcqa_example(row)
+            counterfactual_row = row[counterfactual_name]
+            source_input = parse_mcqa_example(counterfactual_row)
+            rows.append(
+                {
+                    "input": base_input,
+                    "counterfactual_inputs": [source_input],
+                    "counterfactual_family": counterfactual_family,
+                }
+            )
+        datasets[dataset_name] = rows
+    return datasets
+
+
+def load_public_mcqa_datasets(
+    *,
+    size: int | None = None,
+    hf_token: str | None = None,
+    dataset_path: str | None = None,
+    dataset_name: str | None | object = _DATASET_CONFIG_UNSET,
+) -> dict[str, list[dict[str, object]]]:
+    """Load public train/validation/test MCQA splits in the copied MIB structure."""
+    datasets: dict[str, list[dict[str, object]]] = {}
+    resolved_dataset_path = dataset_path or DATASET_PATH
+    resolved_dataset_name = DATASET_NAME if dataset_name is _DATASET_CONFIG_UNSET else dataset_name
+    dataset_path_obj = Path(resolved_dataset_path)
+    if dataset_path_obj.exists():
+        candidate_splits = tuple(
+            split_file.stem for split_file in sorted(dataset_path_obj.glob("*.jsonl")) if split_file.stem
+        )
+        if not candidate_splits:
+            raise FileNotFoundError(f"No .jsonl splits found under local dataset path {dataset_path_obj}")
+    else:
+        if resolved_dataset_name:
+            candidate_splits = tuple(
+                get_dataset_split_names(resolved_dataset_path, resolved_dataset_name, token=hf_token)
+            )
+        else:
+            candidate_splits = tuple(get_dataset_split_names(resolved_dataset_path, token=hf_token))
+    for split in candidate_splits:
+        datasets.update(
+            _load_counterfactual_rows(
+                split=split,
+                size=size,
+                hf_token=hf_token,
+                dataset_path=resolved_dataset_path,
+                dataset_name=resolved_dataset_name,
+            )
+        )
+    return datasets
+
+
+def _build_position_ids_from_left_padded_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    position_ids = attention_mask.to(torch.long).cumsum(dim=-1) - 1
+    return position_ids.masked_fill(attention_mask == 0, 0)
+
+
+def _infer_next_token_ids(model, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    position_ids = _build_position_ids_from_left_padded_attention_mask(attention_mask)
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+        )
+    logits = outputs.logits
+    reversed_mask = torch.flip(attention_mask.to(torch.long), dims=(1,))
+    trailing_pad = torch.argmax(reversed_mask, dim=1)
+    last_indices = logits.shape[1] - 1 - trailing_pad
+    batch_indices = torch.arange(logits.shape[0], device=logits.device)
+    return logits[batch_indices, last_indices].argmax(dim=-1)
+
+
+def normalize_answer_text(text: str) -> str:
+    return str(text).strip()
+
+
+def filter_correct_examples(
+    *,
+    model,
+    tokenizer,
+    causal_model: MCQACausalModel,
+    datasets_by_name: dict[str, list[dict[str, object]]],
+    batch_size: int,
+    device: torch.device,
+) -> dict[str, list[dict[str, object]]]:
+    """Keep only examples where Gemma predicts both the base and source answer tokens."""
+
+    def expected_answer(input_dict: dict[str, object]) -> str:
+        output = causal_model.run_forward(input_dict)
+        if "answer" in output:
+            return normalize_answer_text(str(output["answer"]))
+        return normalize_answer_text(str(output["raw_output"]))
+
+    def predict_next_token_ids(prompts: list[str], *, progress_label: str) -> list[int]:
+        predicted_ids_all: list[int] = []
+        batch_starts = range(0, len(prompts), batch_size)
+        batch_iterator = batch_starts
+        if tqdm is not None:
+            batch_iterator = tqdm(
+                batch_starts,
+                desc=progress_label,
+                leave=False,
+                total=(len(prompts) + batch_size - 1) // batch_size,
+            )
+        for start in batch_iterator:
+            end = min(start + batch_size, len(prompts))
+            encoded = tokenizer(
+                prompts[start:end],
+                padding=True,
+                return_tensors="pt",
+                add_special_tokens=True,
+            )
+            input_ids = encoded["input_ids"].to(device)
+            attention_mask = encoded["attention_mask"].to(device)
+            predicted_ids = _infer_next_token_ids(model, input_ids, attention_mask)
+            predicted_ids_all.extend(int(item) for item in predicted_ids.detach().cpu().tolist())
+        return predicted_ids_all
+
+    filtered: dict[str, list[dict[str, object]]] = {}
+    for dataset_name, rows in datasets_by_name.items():
+        print(f"[filter] dataset={dataset_name} total_rows={len(rows)}")
+        base_prompts = [str(row["input"]["raw_input"]) for row in rows]
+        source_prompts = [str(row["counterfactual_inputs"][0]["raw_input"]) for row in rows]
+        base_expected_answers = [expected_answer(row["input"]) for row in rows]
+        source_expected_answers = [expected_answer(row["counterfactual_inputs"][0]) for row in rows]
+        base_expected_answer_variant_ids = [
+            _encode_symbol_token_variants(expected, tokenizer) for expected in base_expected_answers
+        ]
+        source_expected_answer_variant_ids = [
+            _encode_symbol_token_variants(expected, tokenizer) for expected in source_expected_answers
+        ]
+        print(f"[filter] dataset={dataset_name} checking base prompts")
+        base_predicted_ids = predict_next_token_ids(
+            base_prompts,
+            progress_label=f"Filtering base prompts ({dataset_name})",
+        )
+        print(f"[filter] dataset={dataset_name} checking source prompts")
+        source_predicted_ids = predict_next_token_ids(
+            source_prompts,
+            progress_label=f"Filtering source prompts ({dataset_name})",
+        )
+        keep_mask: list[bool] = []
+        for (
+            base_predicted_id,
+            source_predicted_id,
+            base_expected,
+            source_expected,
+            base_expected_variants,
+            source_expected_variants,
+        ) in zip(
+            base_predicted_ids,
+            source_predicted_ids,
+            base_expected_answers,
+            source_expected_answers,
+            base_expected_answer_variant_ids,
+            source_expected_answer_variant_ids,
+        ):
+            base_decoded = normalize_answer_text(tokenizer.decode([int(base_predicted_id)]))
+            source_decoded = normalize_answer_text(tokenizer.decode([int(source_predicted_id)]))
+            base_correct = int(base_predicted_id) in base_expected_variants or causalab_substring_checker(
+                base_decoded,
+                base_expected,
+            )
+            source_correct = int(source_predicted_id) in source_expected_variants or causalab_substring_checker(
+                source_decoded,
+                source_expected,
+            )
+            keep_mask.append(bool(base_correct and source_correct))
+        filtered[dataset_name] = [row for row, keep in zip(rows, keep_mask) if keep]
+        print(f"[filter] dataset={dataset_name} kept={len(filtered[dataset_name])}/{len(rows)}")
+    return filtered
+
+
+def _validate_answer_tokenization(tokenizer) -> torch.Tensor:
+    token_ids = []
+    for token_text in CANONICAL_ANSWER_STRINGS:
+        ids = tokenizer.encode(token_text, add_special_tokens=False)
+        if len(ids) != 1:
+            raise ValueError(
+                f"Expected {token_text!r} to map to a single token, but got token ids {ids}. "
+                "MCQA v1 requires single-token answer letters."
+            )
+        token_ids.append(int(ids[0]))
+    return torch.tensor(token_ids, dtype=torch.long)
+
+
+def _encode_symbol_token(symbol: str, tokenizer) -> int:
+    ids = tokenizer.encode(" " + str(symbol), add_special_tokens=False)
+    if len(ids) != 1:
+        ids = tokenizer.encode(str(symbol), add_special_tokens=False)
+        if len(ids) != 1:
+            raise ValueError(f"Expected symbol {symbol!r} to map to one token, but got ids {ids}")
+    return int(ids[0])
+
+
+def _encode_symbol_token_variants(symbol: str, tokenizer) -> tuple[int, int]:
+    if not hasattr(tokenizer, "encode"):
+        return (-1, -1)
+    symbol = normalize_answer_text(symbol)
+    variant_ids = []
+    for candidate in (" " + symbol, symbol):
+        ids = tokenizer.encode(candidate, add_special_tokens=False)
+        if len(ids) == 1:
+            variant_ids.append(int(ids[0]))
+    if not variant_ids:
+        raise ValueError(f"Expected symbol {symbol!r} to have at least one single-token encoding")
+    if len(variant_ids) == 1:
+        variant_ids.append(variant_ids[0])
+    return (variant_ids[0], variant_ids[1])
+
+
+def _alphabet_index(symbol: str) -> int:
+    normalized = normalize_answer_text(symbol)
+    if len(normalized) != 1 or normalized not in ALPHABET_LABELS:
+        raise ValueError(f"Expected uppercase alphabet symbol, got {symbol!r}")
+    return ALPHABET_LABELS.index(normalized)
+
+
+def _compute_row_change_masks(
+    rows: list[dict[str, object]],
+    causal_model: MCQACausalModel,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, list[bool]]]:
+    base_inputs = [row["input"] for row in rows]
+    source_inputs = [row["counterfactual_inputs"][0] for row in rows]
+    base_outputs = [causal_model.run_forward(base_input) for base_input in base_inputs]
+    source_outputs = [causal_model.run_forward(source_input) for source_input in source_inputs]
+    changed_pointer_masks = [
+        int(base_output["answer_pointer"]) != int(source_output["answer_pointer"])
+        for base_output, source_output in zip(base_outputs, source_outputs)
+    ]
+    changed_answer_masks = [
+        str(base_output["answer"]) != str(source_output["answer"])
+        for base_output, source_output in zip(base_outputs, source_outputs)
+    ]
+    changed_masks = {
+        "answer_pointer": changed_pointer_masks,
+        "answer": changed_answer_masks,
+        "answer_token": changed_answer_masks,
+        "ans_index": changed_pointer_masks,
+        "ans_value": changed_answer_masks,
+    }
+    return base_outputs, source_outputs, changed_masks
+
+
+def build_pair_banks(
+    *,
+    tokenizer,
+    causal_model: MCQACausalModel,
+    token_positions: list[TokenPosition],
+    datasets_by_name: dict[str, list[dict[str, object]]],
+    counterfactual_names: tuple[str, ...],
+    target_vars: tuple[str, ...],
+    split_seed: int = 0,
+    train_pool_size: int | None = None,
+    calibration_pool_size: int | None = None,
+    test_pool_size: int | None = None,
+    pooled_total_examples: int | None = None,
+) -> tuple[dict[str, dict[str, MCQAPairBank]], dict[str, object]]:
+    """Build pooled train/calibration/test banks with target-specific sensitive calibration/test sizes."""
+    canonical_target_vars = tuple(canonicalize_target_var(target_var) for target_var in target_vars)
+    canonical_answer_token_ids = _validate_answer_tokenization(tokenizer)
+    def make_bank(output_split: str, split_dataset_names: list[str], combined_rows: list[dict[str, object]]) -> dict[str, MCQAPairBank]:
+        base_inputs = [row["input"] for row in combined_rows]
+        source_inputs = [row["counterfactual_inputs"][0] for row in combined_rows]
+        counterfactual_family_names = [str(row["counterfactual_family"]) for row in combined_rows]
+        base_outputs = [causal_model.run_forward(base_input) for base_input in base_inputs]
+        source_outputs = [causal_model.run_forward(source_input) for source_input in source_inputs]
+
+        base_prompts = [str(base_input["raw_input"]) for base_input in base_inputs]
+        source_prompts = [str(source_input["raw_input"]) for source_input in source_inputs]
+        base_encoded = tokenizer(base_prompts, padding=True, return_tensors="pt", add_special_tokens=True)
+        source_encoded = tokenizer(source_prompts, padding=True, return_tensors="pt", add_special_tokens=True)
+
+        base_position_by_id = {
+            token_position.id: torch.tensor(
+                [token_position.resolve(base_input, tokenizer) for base_input in base_inputs],
+                dtype=torch.long,
+            )
+            for token_position in token_positions
+        }
+        source_position_by_id = {
+            token_position.id: torch.tensor(
+                [token_position.resolve(source_input, tokenizer) for source_input in source_inputs],
+                dtype=torch.long,
+            )
+            for token_position in token_positions
+        }
+        symbol_token_ids = torch.tensor(
+            [
+                [_encode_symbol_token(str(base_input[f"symbol{index}"]), tokenizer) for index in range(4)]
+                for base_input in base_inputs
+            ],
+            dtype=torch.long,
+        )
+        symbol_variant_token_ids = torch.tensor(
+            [
+                [_encode_symbol_token_variants(str(base_input[f"symbol{index}"]), tokenizer) for index in range(4)]
+                for base_input in base_inputs
+            ],
+            dtype=torch.long,
+        )
+        source_symbol_token_ids = torch.tensor(
+            [
+                [_encode_symbol_token(str(source_input[f"symbol{index}"]), tokenizer) for index in range(4)]
+                for source_input in source_inputs
+            ],
+            dtype=torch.long,
+        )
+        source_symbol_variant_token_ids = torch.tensor(
+            [
+                [_encode_symbol_token_variants(str(source_input[f"symbol{index}"]), tokenizer) for index in range(4)]
+                for source_input in source_inputs
+            ],
+            dtype=torch.long,
+        )
+        alphabet_variant_token_ids = torch.tensor(
+            [
+                [_encode_symbol_token_variants(letter, tokenizer) for letter in ALPHABET_LABELS]
+                for _ in base_inputs
+            ],
+            dtype=torch.long,
+        )
+        alphabet_token_ids = alphabet_variant_token_ids[:, :, 0]
+        base_answer_token_ids = torch.tensor(
+            [_encode_symbol_token(str(base_output["raw_output"]).strip(), tokenizer) for base_output in base_outputs],
+            dtype=torch.long,
+        )
+        answer_label_indices = torch.tensor(
+            [_alphabet_index(str(source_output["answer"])) for source_output in source_outputs],
+            dtype=torch.long,
+        )
+        pointer_label_indices = torch.tensor(
+            [int(source_output["answer_pointer"]) for source_output in source_outputs],
+            dtype=torch.long,
+        )
+        changed_pointer = torch.tensor(
+            [
+                int(base_output["answer_pointer"]) != int(source_output["answer_pointer"])
+                for base_output, source_output in zip(base_outputs, source_outputs)
+            ],
+            dtype=torch.bool,
+        )
+        changed_answer = torch.tensor(
+            [
+                str(base_output["answer"]) != str(source_output["answer"])
+                for base_output, source_output in zip(base_outputs, source_outputs)
+            ],
+            dtype=torch.bool,
+        )
+        banks: dict[str, MCQAPairBank] = {}
+        for target_var in canonical_target_vars:
+            if target_var == "answer_pointer":
+                labels = pointer_label_indices
+                changed_mask = changed_pointer
+            elif target_var == "answer_token":
+                labels = answer_label_indices
+                changed_mask = changed_answer
+            else:
+                raise ValueError(f"Unsupported MCQA target variable {target_var}")
+            interchange_outputs = [
+                causal_model.run_interchange(base_input, source_input, (target_var,))
+                for base_input, source_input in zip(base_inputs, source_inputs)
+            ]
+            answer_token_ids = torch.tensor(
+                [_encode_symbol_token(str(setting["raw_output"]).strip(), tokenizer) for setting in interchange_outputs],
+                dtype=torch.long,
+            )
+            banks[target_var] = MCQAPairBank(
+                split=output_split,
+                target_var=target_var,
+                dataset_names=tuple(split_dataset_names),
+                base_input_ids=base_encoded["input_ids"].to(torch.long),
+                base_attention_mask=base_encoded["attention_mask"].to(torch.long),
+                source_input_ids=source_encoded["input_ids"].to(torch.long),
+                source_attention_mask=source_encoded["attention_mask"].to(torch.long),
+                labels=labels,
+                base_inputs=base_inputs,
+                source_inputs=source_inputs,
+                base_outputs=base_outputs,
+                source_outputs=source_outputs,
+                base_position_by_id=base_position_by_id,
+                source_position_by_id=source_position_by_id,
+                symbol_token_ids=symbol_token_ids,
+                symbol_variant_token_ids=symbol_variant_token_ids,
+                source_symbol_token_ids=source_symbol_token_ids,
+                source_symbol_variant_token_ids=source_symbol_variant_token_ids,
+                alphabet_token_ids=alphabet_token_ids,
+                alphabet_variant_token_ids=alphabet_variant_token_ids,
+                canonical_answer_token_ids=canonical_answer_token_ids,
+                answer_token_ids=answer_token_ids,
+                base_answer_token_ids=base_answer_token_ids,
+                changed_mask=changed_mask,
+                counterfactual_family_names=counterfactual_family_names,
+                expected_answer_texts=[
+                    normalize_answer_text(str(setting["raw_output"]))
+                    for setting in interchange_outputs
+                ],
+            )
+        return banks
+
+    banks_by_split: dict[str, dict[str, MCQAPairBank]] = {"train": {}, "calibration": {}, "test": {}}
+    pooled_dataset_names = []
+    pooled_rows: list[dict[str, object]] = []
+    for dataset_name in sorted(datasets_by_name):
+        counterfactual_name, _, _split_name = dataset_name.rpartition("_")
+        if counterfactual_name in counterfactual_names:
+            pooled_dataset_names.append(dataset_name)
+            pooled_rows.extend(datasets_by_name[dataset_name])
+    if not pooled_rows:
+        raise ValueError("No MCQA rows found for pooled bank construction")
+    rng = random.Random(int(split_seed))
+    shuffled_rows = list(pooled_rows)
+    rng.shuffle(shuffled_rows)
+    if pooled_total_examples is not None:
+        shuffled_rows = shuffled_rows[: min(int(pooled_total_examples), len(shuffled_rows))]
+    total = len(shuffled_rows)
+    resolved_train_pool_size = total if train_pool_size is None else int(train_pool_size)
+    resolved_calibration_pool_size = 0 if calibration_pool_size is None else int(calibration_pool_size)
+    resolved_test_pool_size = 0 if test_pool_size is None else int(test_pool_size)
+    if resolved_train_pool_size < 0 or resolved_calibration_pool_size < 0 or resolved_test_pool_size < 0:
+        raise ValueError(
+            "train_pool_size, calibration_pool_size, and test_pool_size must be non-negative"
+        )
+    if resolved_train_pool_size > total:
+        raise ValueError(
+            f"Requested train_pool_size={resolved_train_pool_size}, but only {total} filtered MCQA rows are available"
+        )
+    train_rows = shuffled_rows[:resolved_train_pool_size]
+    holdout_candidate_rows = shuffled_rows[resolved_train_pool_size:]
+    if not train_rows:
+        raise ValueError("No MCQA rows found for pooled train split")
+
+    # Train banks share the same raw train rows across target variables.
+    train_rng = random.Random(f"{int(split_seed)}:train:shared")
+    shared_train_rows = list(train_rows)
+    train_rng.shuffle(shared_train_rows)
+    banks_by_split["train"] = {}
+    train_banks = make_bank("train", pooled_dataset_names, shared_train_rows)
+    for target_var in canonical_target_vars:
+        banks_by_split["train"][target_var] = train_banks[target_var]
+
+    # Calibration/test are target-specific and sized by number of sensitive examples.
+    _base_outputs, _source_outputs, holdout_changed_masks = _compute_row_change_masks(holdout_candidate_rows, causal_model)
+    for target_var in canonical_target_vars:
+        changed_mask = holdout_changed_masks[target_var]
+        positive_rows = [row for row, changed in zip(holdout_candidate_rows, changed_mask) if changed]
+        local_rng = random.Random(f"{int(split_seed)}:holdout:{target_var}")
+        local_rng.shuffle(positive_rows)
+        required = resolved_calibration_pool_size + resolved_test_pool_size
+        if len(positive_rows) < required:
+            raise ValueError(
+                f"Requested calibration_pool_size={resolved_calibration_pool_size} and "
+                f"test_pool_size={resolved_test_pool_size} for target_var={target_var}, "
+                f"but only {len(positive_rows)} sensitive rows are available after train allocation"
+            )
+        calibration_rows = positive_rows[:resolved_calibration_pool_size]
+        test_rows = positive_rows[resolved_calibration_pool_size:required]
+        if resolved_calibration_pool_size > 0:
+            banks_by_split["calibration"][target_var] = make_bank(
+                "calibration",
+                pooled_dataset_names,
+                calibration_rows,
+            )[target_var]
+        if resolved_test_pool_size > 0:
+            banks_by_split["test"][target_var] = make_bank(
+                "test",
+                pooled_dataset_names,
+                test_rows,
+            )[target_var]
+
+    if resolved_calibration_pool_size == 0:
+        banks_by_split["calibration"] = {}
+    if resolved_test_pool_size == 0:
+        banks_by_split["test"] = {}
+    metadata = {
+        split: {target_var: bank.metadata() for target_var, bank in banks.items()}
+        for split, banks in banks_by_split.items()
+    }
+    return banks_by_split, metadata
+
+
+def load_filtered_mcqa_pipeline(
+    *,
+    model_name: str,
+    device: str | None = None,
+    batch_size: int = 16,
+    dataset_size: int | None = None,
+    hf_token: str | None = None,
+    dataset_path: str | None = None,
+    dataset_name: str | None | object = _DATASET_CONFIG_UNSET,
+) -> tuple[object, object, MCQACausalModel, list[TokenPosition], dict[str, list[dict[str, object]]]]:
+    """Load Gemma-2-2B, copy the MCQA task setup, and filter to correct examples."""
+    import transformers
+
+    global LAST_PIPELINE_TIMING_SECONDS
+    pipeline_start = perf_counter()
+    torch_device = resolve_device(device)
+    print(f"[load] device={torch_device} model={model_name}")
+    model_start = perf_counter()
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name, token=hf_token)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    dtype = torch.float16 if torch_device.type in {"cuda", "mps"} else torch.float32
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        token=hf_token,
+        attn_implementation="eager",
+    )
+    model.to(torch_device)
+    model.eval()
+    if torch_device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(torch_device)
+    model_load_seconds = float(perf_counter() - model_start)
+    print(f"[load] model and tokenizer ready dtype={dtype}")
+    causal_model = MCQACausalModel()
+    token_positions = get_token_positions(tokenizer, causal_model)
+    print(f"[load] token_positions={[token_position.id for token_position in token_positions]}")
+    resolved_dataset_path = dataset_path or DATASET_PATH
+    resolved_dataset_name = DATASET_NAME if dataset_name is _DATASET_CONFIG_UNSET else dataset_name
+    print(
+        f"[load] loading MCQA datasets path={resolved_dataset_path} "
+        f"config={resolved_dataset_name!r} size_cap={dataset_size}"
+    )
+    data_start = perf_counter()
+    public_datasets = load_public_mcqa_datasets(
+        size=dataset_size,
+        hf_token=hf_token,
+        dataset_path=resolved_dataset_path,
+        dataset_name=resolved_dataset_name,
+    )
+    data_load_seconds = float(perf_counter() - data_start)
+    print(f"[load] loaded datasets={sorted(public_datasets.keys())}")
+    print("[load] starting factual filtering")
+    filter_start = perf_counter()
+    filtered_datasets = filter_correct_examples(
+        model=model,
+        tokenizer=tokenizer,
+        causal_model=causal_model,
+        datasets_by_name=public_datasets,
+        batch_size=batch_size,
+        device=torch_device,
+    )
+    if torch_device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(torch_device)
+    filter_seconds = float(perf_counter() - filter_start)
+    LAST_PIPELINE_TIMING_SECONDS = {
+        "t_model_load": float(model_load_seconds),
+        "t_data_load": float(data_load_seconds),
+        "t_factual_filter": float(filter_seconds),
+        "t_pipeline_total_wall": float(perf_counter() - pipeline_start),
+    }
+    print("[load] factual filtering complete")
+    return model, tokenizer, causal_model, token_positions, filtered_datasets

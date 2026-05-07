@@ -1,237 +1,138 @@
-# Causal Abstractions for Addition and Hierarchical Equality
+# PLOT: Progressive Localization via Optimal Transport
 
-This repo is organized around Python experiment scripts rather than notebooks.
-It currently supports three task families:
+This repository contains the experiment code for the paper sources in `paper/`, especially `paper/neurips_2026.tex`. The publication-facing experiment code is organized under `experiments/` by benchmark.
 
-- two-digit addition
-- three-bit binary addition with a fixed `C1` carry benchmark
-- hierarchical equality (the `WX`, `YZ`, `O` task)
+Run commands from the repository root.
 
-Both pipelines follow the same high-level pattern:
+## Main Paper Experiments
 
-- train or load a backbone MLP
-- build symbolic counterfactual pair banks from an SCM
-- compare transport-based alignment methods and DAS on held-out counterfactual data
-
-## Main Entry Points
-
-### Binary Addition (`C1`)
-
-- `binary_addition_train.py`
-  - Trains or loads the fixed factual MLP used in the binary carry benchmark.
-- `binary_addition_das.py`
-  - Runs DAS sweeps over layer, subspace size, learning rate, and calibration strategy.
-- `binary_addition_ot_uot.py`
-  - Runs OT and UOT sweeps over entropic regularization, support size, intervention strength, site resolution, and calibration strategy.
-- `binary_addition_plots.py`
-  - Produces the binary-addition accuracy, runtime, and cross-layer plots from the DAS and OT/UOT result JSON files.
-
-### Addition
-
-- `addition_train.py`
-  - Trains the addition MLP and writes a checkpoint plus factual validation metrics.
-- `addition_run.py`
-  - Loads one checkpoint per seed and runs the comparison pipeline.
-  - Supports sweeps over OT `epsilon` and Gibbs-kernel `tau`.
-  - Writes per-sweep and aggregate summaries under `results/<timestamp>_addition/`.
-- `addition_run_gradient.py`
-  - Runs the gradient-based transport-policy variant for the addition task.
+The following folders correspond to the experiments reported in the main paper.
 
 ### Hierarchical Equality
 
-- `equality_run.py`
-  - Trains or loads the equality MLP, builds one fixed set of train/calibration/test pair banks, and runs the comparison pipeline.
-  - Supports OT-only sweeps over `epsilon` and Gibbs-kernel `tau` while reusing the same pair-bank splits across sweep points.
-  - Writes outputs under `results/<timestamp>_equality/`.
-- `equality_calibration_strategy_sweep.py`
-  - Runs the HEQ shared/separate calibration-bank comparison used for the current paper protocol.
-- `equality_clean_epsilon_sweep.py`
-  - Sweeps HEQ OT/UOT performance over entropic regularization while holding the calibration protocol fixed.
-- `equality_paper_figures.py`
-  - Generates the current HEQ paper figures under `paper/plots/`, including the joint accuracy/runtime plots, OT epsilon sweep, and handle visualizations.
+Location: `experiments/heq/`
 
-These scripts are meant to be edited directly. The config block near the top of
-each file is the intended control surface.
+Task: hierarchical equality over inputs `W, X, Y, Z`, with abstract variables `WX = [W == X]` and `YZ = [Y == Z]`.
 
-## Tasks
+Methods:
 
-### Addition Task
+- `PLOT`: OT/UOT transport handles over individual hidden-neuron sites.
+- `DAS`: rotated subspace intervention search on the same factual backbone.
 
-- Input:
-  - Two 2-digit numbers encoded as concatenated one-hot digit vectors.
-  - Input dimension is `40`.
-- Abstract variables:
-  - `S1`, `C1`, `S2`, `C2`
-- Output:
-  - `200`-class classification over sums `0..199`
-- Default backbone:
-  - ReLU MLP with hidden width `192`
+Entry points:
 
-### Binary Addition Task
+```bash
+python experiments/heq/equality_run.py
+python experiments/heq/equality_calibration_strategy_sweep.py
+python experiments/heq/equality_clean_epsilon_sweep.py
+python experiments/heq/equality_paper_figures.py
+```
 
-- Input:
-  - Two 3-bit numbers encoded as concatenated one-hot bit vectors.
-  - Input dimension is `12`.
-- Abstract variable:
-  - `C1`, the carry from the least significant bit.
-- Output:
-  - `16`-class classification over 4-bit sums `0..15`.
-- Default backbone:
-  - ReLU MLP with hidden widths `(13, 13)`
+`equality_paper_figures.py` regenerates the HEQ plots under `paper/plots/` from saved result JSON files.
 
-### Hierarchical Equality Task
+### 4-Bit Binary Addition
 
-- Input:
-  - Four entity slots `W, X, Y, Z`, each represented by an `EMBEDDING_DIM` vector
-- Abstract variables:
-  - `WX = [W == X]`
-  - `YZ = [Y == Z]`
-- Output:
-  - binary label `O = int(WX == YZ)`
-- Default backbone:
-  - ReLU MLP with hidden widths `(16, 16, 16)`
+Location: `experiments/binary_addition/`
 
-The equality task is implemented in `equality_experiment/` and is intended to
-mirror the notebook’s causal structure while using the same repo-style pipeline
-for single-variable DAS and OT/GW/FGW evaluation.
+Task: 4-bit ripple-carry addition with a GRUCell backbone. The abstract variables are the internal carries `C1`, `C2`, and `C3`; the output is `(C4, S3, S2, S1, S0)`.
 
-## Methods Implemented
+Methods:
 
-- `gw`
-  - Entropic Gromov-Wasserstein on relational effect geometry
-- `ot`
-  - Entropic optimal transport on direct abstract-to-neural signature costs
-- `fgw`
-  - Fused Gromov-Wasserstein
-- `das`
-  - Rotated-space intervention search with calibration-based model selection
+- `PLOT`: Stage A timestep localization.
+- `PLOT-native`: Stage A plus native-coordinate Stage B handles.
+- `PLOT-PCA`: Stage A plus PCA-basis Stage B handles.
+- `PLOT-DAS`: DAS restricted to the Stage A timestep.
+- `Full DAS`: DAS over all recurrent timesteps and subspace sizes.
 
-For OT-family methods, both experiment runners now expose:
+Entry points:
 
-- `OT_EPSILONS`
-  - entropic regularization sweep
-- `OT_TAUS`
-  - Gibbs-kernel temperature sweep
+```bash
+python experiments/binary_addition/run_train_backbone.py --help
+python experiments/binary_addition/run_progressive_plot.py --help
+python experiments/binary_addition/run_progressive_plot_stage_b_resolution_sweep.py --help
+python experiments/binary_addition/plot_progressive_heatmaps.py --help
+```
 
-The current implementation uses `tau` directly as the entropic denominator in
-the transport solve, so:
+### MCQA
 
-- smaller `tau` sharpens the kernel
-- larger `tau` smooths the kernel
+Location: `experiments/mcqa/`
 
-## Outputs and Metrics
+Task: Gemma-2-2B multiple-choice question answering on the CopyColors-style MCQA benchmark. The abstract variables are `answer_pointer` and `answer_token`.
 
-All runs write JSON outputs, text summaries, and plots under `results/`.
+Methods:
 
-Top-level text summaries include:
+- `PLOT`: Stage A UOT layer localization.
+- `PLOT-native`: Stage A plus native-coordinate Stage B handles.
+- `PLOT-PCA`: Stage A plus PCA-basis Stage B handles.
+- `PLOT-DAS`: DAS restricted to the Stage A layer.
+- `PLOT-native-DAS`: DAS guided by the native Stage B support.
+- `PLOT-PCA-DAS`: DAS guided by the PCA Stage B support.
+- `Full DAS`: DAS over all layers and the full subspace grid.
 
-- the relevant experiment hyperparameters
-- per-split pair-bank change statistics such as:
-  - total pairs
-  - `changed_any`
-  - per-variable changed counts and rates
+Main local/serial entry points:
 
-### Addition Metrics
+```bash
+python experiments/mcqa/mcqa_delta_hierarchical_sweep.py --help
+python experiments/mcqa/mcqa_run_cloud.py --help
+python experiments/mcqa/mcqa_paper_runtime.py --help
+```
 
-- `exact_acc`
-  - predicted counterfactual sum matches exactly
-- `mean_shared_digits`
-  - average number of matching digits in `(C2, S2, S1)`
+Cluster launchers are in `experiments/mcqa/slurm/`. For the staged Delta workflow:
 
-### Equality Metrics
+```bash
+bash experiments/mcqa/slurm/submit_delta_mcqa_hierarchical_parallel_all.sh <timestamp>
+```
 
-- `exact_acc`
-  - predicted counterfactual binary label matches exactly
+MCQA requires access to the model and dataset. Set `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` before launching non-interactive runs.
 
-The equality pipeline does not report a separate `shared` metric.
+## Additional Experiment Folders
+
+These folders are included under `experiments/` for completeness. They are not the main-paper experiment folders listed above.
+
+- `experiments/binary_addition_c1/`: fixed-`C1` MLP binary-addition benchmark.
+- `experiments/two_digit_addition/`: two-digit decimal addition experiments and helpers.
+- `experiments/heq_intervention_heatmaps/`: HEQ intervention-heatmap plotting utility.
+- `experiments/mcqa_broad_sweep/`: broad MCQA Delta sweep and launcher.
+- `experiments/mcqa_layerwise/`: MCQA layerwise OT analysis.
+- `experiments/mcqa_block_focus/`: MCQA OT/DAS block-focus run.
+- `experiments/mcqa_diagnostics/`: MCQA filter diagnostic notebook.
+- `experiments/notebook_demos/`: notebook demos for basic interventions, DAS, and addition variants.
 
 ## Repository Layout
 
-- `addition_experiment/`
-  - task-specific implementation for addition SCMs, pair banks, backbone training, OT/GW/FGW, DAS, reporting, and plotting
-- `equality_experiment/`
-  - task-specific implementation for hierarchical equality
-- `models/`
-  - checkpoint storage such as `addition_mlp_seed<seed>.pt` and `equality_mlp_seed<seed>.pt`
-- `results/`
-  - timestamped run folders like `results/<timestamp>_addition/` and `results/<timestamp>_equality/`
-- `paper/`
-  - draft paper materials
+- `experiments/common/`: shared runtime helpers, pyvene helpers, and variable-width MLP utilities.
+- `experiments/heq/`: main-paper HEQ scripts and implementation package.
+- `experiments/binary_addition/`: main-paper 4-bit binary-addition scripts and implementation package.
+- `experiments/mcqa/`: main-paper MCQA scripts, implementation package, and Slurm launchers.
+- `paper/`: paper sources and checked-in plot assets.
+- `models/`: local checkpoints.
+- `results/`: timestamped experiment outputs.
 
-## Typical Workflow
+## Setup
 
-### Addition
-
-1. Edit the config block in `addition_train.py`.
-2. Run:
+Install the Python dependencies:
 
 ```bash
-python addition_train.py
+pip install -r requirements.txt
 ```
 
-3. Edit the config block in `addition_run.py`.
-4. Run:
+Some experiments require additional heavy dependencies already implied by the scripts, including PyTorch, pyvene, transformers, datasets, and POT. MCQA runs are intended for GPU execution; HEQ and binary-addition smoke runs can run on CPU.
+
+If using the local `torch-metal` environment:
 
 ```bash
-python addition_run.py
+conda activate torch-metal
+export PYTHONPATH=.
 ```
 
-For the gradient-based transport-policy workflow:
+## Outputs
+
+Experiment runs write JSON payloads, text summaries, and plot artifacts under `results/` or the output directory passed on the command line. Paper figure scripts write into `paper/plots/`.
+
+## Quick Checks
+
+After editing code, a lightweight import and syntax check is:
 
 ```bash
-python addition_run_gradient.py
+PYTHONPATH=. python -m compileall -q experiments
 ```
-
-### Binary Addition
-
-1. Train or load the fixed factual model:
-
-```bash
-python binary_addition_train.py
-```
-
-2. Run the DAS sweep:
-
-```bash
-python binary_addition_das.py
-```
-
-3. Run the OT/UOT sweep:
-
-```bash
-python binary_addition_ot_uot.py
-```
-
-4. Generate the paper plots:
-
-```bash
-python binary_addition_plots.py --das-results <path-to-das_results.json> --ot-results <path-to-ot_uot_results.json>
-```
-
-### Hierarchical Equality
-
-1. Edit the config block in `equality_run.py`.
-2. Run:
-
-```bash
-python equality_run.py
-```
-
-Depending on `RETRAIN_BACKBONE`, this will either train a fresh equality
-backbone or load `models/equality_mlp_seed<seed>.pt`.
-
-To regenerate the current HEQ paper figures from the checked-in HEQ sweep
-results, run:
-
-```bash
-python equality_paper_figures.py
-```
-
-## Notes on the Equality Pipeline
-
-- Equality OT epsilon/tau sweeps reuse a single prebuilt train/calibration/test
-  pair-bank split so different sweep points are directly comparable.
-- If `METHODS` includes both OT-family methods and `das`, the non-OT methods run
-  once outside the epsilon/tau sweep.
-- The equality task currently uses its own task-specific OT, DAS, reporting, and
-  pair-bank code rather than sharing those files with the addition task.
