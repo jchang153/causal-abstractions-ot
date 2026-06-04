@@ -2,6 +2,8 @@
 
 This repository contains the experiment code for the PLOT paper. The paper-facing experiment code is organized under `experiments/` by benchmark.
 
+Preprint: [PLOT: Progressive Localization via Optimal Transport](https://arxiv.org/abs/2605.06979)
+
 <p align="center">
   <img src="figs/plot_diagram.png" alt="PLOT progressive localization diagram" width="100%">
 </p>
