@@ -21,6 +21,8 @@ METHOD_PASTEL_COLORS = {
     "gw": "#4e79a7",
     "ot": "#b07aa1",
     "uot": "#e15759",
+    "cosine": "#76b7b2",
+    "bruteforce": "#edc948",
 }
 
 DEFAULT_PASTEL_COLORS = (

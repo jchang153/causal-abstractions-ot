@@ -62,7 +62,7 @@ def summarize_method_records(records: list[dict[str, object]]) -> list[dict[str,
 
 def build_method_selection_summary(method: str, payload: dict[str, object]) -> dict[str, object]:
     """Build a compact per-method summary for saved artifacts."""
-    if method in {"gw", "ot", "uot", "fgw"}:
+    if method in {"gw", "ot", "uot", "fgw", "cosine", "bruteforce"}:
         return {
             "method": method,
             "failed": bool(payload.get("failed", False)),
@@ -116,7 +116,7 @@ def format_method_selection_summary(summary: dict[str, object]) -> str:
     method = str(summary["method"]).upper()
     lines = [method]
 
-    if method in {"GW", "OT", "UOT", "FGW"}:
+    if method in {"GW", "OT", "UOT", "FGW", "COSINE", "BRUTEFORCE"}:
         failed = bool(summary.get("failed", False))
         failure_reason = summary.get("failure_reason")
         transport_meta = dict(summary.get("transport_meta", {}))
@@ -184,7 +184,7 @@ def format_method_selection_summary(summary: dict[str, object]) -> str:
 def format_method_candidate_sweep(method: str, payload: dict[str, object]) -> str:
     """Format only the candidate-sweep section for one method."""
     lines = [str(method).upper()]
-    if method in {"gw", "ot", "uot", "fgw"}:
+    if method in {"gw", "ot", "uot", "fgw", "cosine"}:
         layer_candidate_summaries = dict(payload.get("layer_candidate_summaries", {}))
         if layer_candidate_summaries:
             lines.append("layer candidate sweep:")

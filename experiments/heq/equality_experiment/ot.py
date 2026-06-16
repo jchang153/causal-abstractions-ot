@@ -1,4 +1,4 @@
-"""Transport-based alignment methods: OT, GW, and fused GW."""
+"""Signature-alignment methods: OT, GW, fused GW, and cosine baselines."""
 
 from __future__ import annotations
 
@@ -66,6 +66,7 @@ class OTConfig:
     selection_verbose: bool = True
     calibration_progress_interval: int = 250
     signature_mode: str = "prob_delta"
+    brute_force_temperature: float = 1.0
 
 
 def _squared_euclidean_cost(u_points: torch.Tensor, v_points: torch.Tensor) -> torch.Tensor:
@@ -773,6 +774,110 @@ def solve_fgw_transport(
     return transport, transport_meta
 
 
+def solve_cosine_alignment(
+    variable_signatures: torch.Tensor,
+    site_signatures: torch.Tensor,
+    config: OTConfig,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Build row-wise site weights from abstract-to-site cosine similarities."""
+    temperature = float(config.tau)
+    if temperature <= 0.0:
+        raise ValueError("tau must be > 0 for cosine row softmax")
+    variable_norm = F.normalize(variable_signatures.to(dtype=torch.float32), dim=1)
+    site_norm = F.normalize(site_signatures.to(dtype=torch.float32), dim=1)
+    similarities = variable_norm @ site_norm.transpose(0, 1)
+    weights = torch.softmax(similarities / temperature, dim=1)
+    alignment = weights.detach().cpu().numpy()
+    similarity_np = similarities.detach().cpu().numpy()
+    return alignment, {
+        "method": "cosine",
+        "solver": "row_softmax_cosine_similarity",
+        "tau_used": temperature,
+        "matched_mass": float(alignment.sum()),
+        "row_mass_min": float(alignment.sum(axis=1).min()) if alignment.size else 0.0,
+        "row_mass_max": float(alignment.sum(axis=1).max()) if alignment.size else 0.0,
+        "similarity_min": float(similarity_np.min()) if similarity_np.size else 0.0,
+        "similarity_max": float(similarity_np.max()) if similarity_np.size else 0.0,
+    }
+
+
+def solve_bruteforce_alignment(
+    model: VariableWidthMLPForClassification,
+    fit_bank: PairBank,
+    sites: list[CanonicalSite],
+    target_vars: tuple[str, ...],
+    config: OTConfig,
+    device: torch.device | str,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Score every site directly on the fit bank for each abstract variable."""
+    temperature = float(config.brute_force_temperature)
+    if temperature <= 0.0:
+        raise ValueError("brute_force_temperature must be > 0")
+
+    device = torch.device(device)
+    score_rows = []
+    fit_site_scores: dict[str, list[dict[str, object]]] = {}
+    for variable in target_vars:
+        row_scores = []
+        row_records = []
+        for site_index, site in enumerate(sites):
+            transport_weights = np.zeros((1, len(sites)), dtype=float)
+            transport_weights[0, int(site_index)] = 1.0
+            rankings = {
+                variable: [
+                    {
+                        "site_index": int(site_index),
+                        "layer": int(site.layer),
+                        "dims": list(site.dims),
+                        "site_label": site.label,
+                        "transport_mass": 1.0,
+                    }
+                ]
+            }
+            records, _ = evaluate_soft_transport_interventions(
+                method_name="bruteforce",
+                model=model,
+                evaluation_bank=fit_bank,
+                sites=sites,
+                transport_weights=transport_weights,
+                rankings=rankings,
+                target_vars=(variable,),
+                top_k_by_variable={variable: 1},
+                lambda_by_variable={variable: 1.0},
+                batch_size=config.batch_size,
+                device=device,
+            )
+            exact_acc = float(records[0]["exact_acc"]) if records else 0.0
+            row_scores.append(exact_acc)
+            row_records.append(
+                {
+                    "site_index": int(site_index),
+                    "site_label": site.label,
+                    "layer": int(site.layer),
+                    "dims": list(site.dims),
+                    "fit_exact_acc": exact_acc,
+                }
+            )
+        score_rows.append(torch.tensor(row_scores, dtype=torch.float32))
+        fit_site_scores[variable] = row_records
+
+    scores = torch.stack(score_rows, dim=0)
+    weights = torch.softmax(scores / temperature, dim=1)
+    alignment = weights.detach().cpu().numpy()
+    score_np = scores.detach().cpu().numpy()
+    return alignment, {
+        "method": "bruteforce",
+        "solver": "direct_fit_site_score_softmax",
+        "brute_force_temperature": temperature,
+        "matched_mass": float(alignment.sum()),
+        "row_mass_min": float(alignment.sum(axis=1).min()) if alignment.size else 0.0,
+        "row_mass_max": float(alignment.sum(axis=1).max()) if alignment.size else 0.0,
+        "score_min": float(score_np.min()) if score_np.size else 0.0,
+        "score_max": float(score_np.max()) if score_np.size else 0.0,
+        "fit_site_scores": fit_site_scores,
+    }
+
+
 def build_rankings(
     transport: np.ndarray,
     sites: list[CanonicalSite],
@@ -1179,8 +1284,19 @@ def run_alignment_pipeline(
             transport, transport_meta = solve_uot_transport(variable_signatures, site_signatures, config)
         elif config.method == "fgw":
             transport, transport_meta = solve_fgw_transport(cost_cross, cost_var, cost_site, p, q, config)
+        elif config.method == "cosine":
+            transport, transport_meta = solve_cosine_alignment(variable_signatures, site_signatures, config)
+        elif config.method in {"bruteforce", "brute-force"}:
+            transport, transport_meta = solve_bruteforce_alignment(
+                model=model,
+                fit_bank=fit_bank,
+                sites=sites,
+                target_vars=tuple(config.target_vars),
+                config=config,
+                device=device,
+            )
         else:
-            raise ValueError(f"Unsupported transport method {config.method}")
+            raise ValueError(f"Unsupported alignment method {config.method}")
 
     if bool(transport_meta.get("failed", False)):
         return {

@@ -90,6 +90,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fit-family-profile", type=str, default="all")
     ap.add_argument("--fit-stratify-mode", type=str, default="none")
     ap.add_argument("--cost-metric", type=str, default="sq_l2", choices=["sq_l2", "l1", "cosine"])
+    ap.add_argument("--alignment-method", type=str, default="ot", choices=["ot", "cosine", "bruteforce", "brute-force"])
+    ap.add_argument("--cosine-temperature", type=float, default=1.0)
+    ap.add_argument("--bruteforce-temperature", type=float, default=1.0)
     ap.add_argument("--stage-a-epsilons", type=str, default="0.01,0.03")
     ap.add_argument("--stage-b-epsilons", type=str, default="0.003,0.01,0.03,0.1")
     ap.add_argument("--stage-a-top-k-grid", type=str, default="1")
@@ -111,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--das-epochs", type=int, default=12)
     ap.add_argument("--das-train-records-per-epoch", type=int, default=256)
     ap.add_argument("--das-batch-size", type=int, default=64)
+    ap.add_argument("--skip-das", action="store_true")
     ap.add_argument("--skip-existing", action="store_true")
     return ap.parse_args()
 
@@ -287,9 +291,133 @@ def _make_transport_config(
     )
 
 
-def _run_ot_stage(
+def _cosine_alignment_from_diagnostics(
+    diagnostics: dict[str, object],
+    *,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if float(temperature) <= 0.0:
+        raise ValueError("cosine temperature must be > 0")
+    abstract_table = torch.tensor(diagnostics["abstract_signatures"], dtype=torch.float32)
+    neural_table = torch.tensor(diagnostics["neural_signatures"], dtype=torch.float32)
+    if abstract_table.ndim != 2:
+        raise ValueError(f"expected rank-2 abstract signatures, got {tuple(abstract_table.shape)}")
+    if neural_table.ndim == 2:
+        neural_table = neural_table.unsqueeze(0).expand(abstract_table.size(0), -1, -1)
+    if neural_table.ndim != 3:
+        raise ValueError(f"expected rank-3 neural signatures, got {tuple(neural_table.shape)}")
+    if neural_table.size(0) != abstract_table.size(0) or neural_table.size(2) != abstract_table.size(1):
+        raise ValueError(
+            "signature table shapes are incompatible: "
+            f"abstract={tuple(abstract_table.shape)} neural={tuple(neural_table.shape)}"
+        )
+
+    abstract_unit = abstract_table / abstract_table.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    neural_unit = neural_table / neural_table.norm(dim=2, keepdim=True).clamp_min(1e-30)
+    scores = torch.sum(abstract_unit[:, None, :] * neural_unit, dim=2)
+    row_weights = torch.softmax(scores / float(temperature), dim=1)
+    return row_weights.to(torch.float32), scores.to(torch.float32)
+
+
+def _single_site_exact_match_rate(
+    model: GRUAdder,
+    records: Sequence[EndogenousPairRecord],
+    site: Site,
+    *,
+    device: torch.device,
+    run_cache: RunCache,
+    batch_size: int,
+    rotation_map: dict[int, RotatedBasis] | None,
+) -> float:
+    if not records:
+        return 0.0
+    hits = 0
+    for start in range(0, len(records), int(batch_size)):
+        batch_records = records[start : start + int(batch_size)]
+        batch_logits = intervene_with_site_handle_batch(
+            model,
+            [rec.base for rec in batch_records],
+            [rec.source for rec in batch_records],
+            [(site, 1.0)],
+            lambda_scale=1.0,
+            device=device,
+            run_cache=run_cache,
+            rotation_map=rotation_map,
+        )
+        pred_bits = (torch.sigmoid(batch_logits) >= 0.5).to(torch.int64)
+        tgt_bits = torch.tensor([rec.counterfactual.output_bits_lsb for rec in batch_records], dtype=torch.int64)
+        hits += int((pred_bits == tgt_bits).all(dim=1).sum().item())
+    return float(hits / len(records))
+
+
+def _bruteforce_alignment_from_fit(
+    model: GRUAdder,
+    *,
+    row_keys: Sequence[str],
+    banks: dict[str, object],
+    sites: Sequence[Site],
+    device: torch.device,
+    run_cache: RunCache,
+    batch_size: int,
+    rotation_map: dict[int, RotatedBasis] | None,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
+    if float(temperature) <= 0.0:
+        raise ValueError("bruteforce temperature must be > 0")
+    fit_positive = _partition_records(banks["fit_by_row"], active=True)
+    fit_invariant = _partition_records(banks["fit_by_row"], active=False)
+    score_rows = []
+    fit_scores = {}
+    for row_key in row_keys:
+        row_scores = []
+        row_diagnostics = []
+        for site in sites:
+            sens = _single_site_exact_match_rate(
+                model,
+                fit_positive[row_key],
+                site,
+                device=device,
+                run_cache=run_cache,
+                batch_size=int(batch_size),
+                rotation_map=rotation_map,
+            )
+            inv = _single_site_exact_match_rate(
+                model,
+                fit_invariant[row_key],
+                site,
+                device=device,
+                run_cache=run_cache,
+                batch_size=int(batch_size),
+                rotation_map=rotation_map,
+            )
+            combined = 0.5 * (float(sens) + float(inv))
+            row_scores.append(combined)
+            row_diagnostics.append(
+                {
+                    "site_key": site.key(),
+                    "fit_sensitivity": float(sens),
+                    "fit_invariance": float(inv),
+                    "fit_combined": float(combined),
+                    "count_positive": int(len(fit_positive[row_key])),
+                    "count_invariant": int(len(fit_invariant[row_key])),
+                }
+            )
+        score_rows.append(torch.tensor(row_scores, dtype=torch.float32))
+        fit_scores[row_key] = row_diagnostics
+    scores = torch.stack(score_rows, dim=0)
+    row_weights = torch.softmax(scores / float(temperature), dim=1)
+    diagnostics = {
+        "fit_site_scores": fit_scores,
+        "score_matrix": scores.tolist(),
+        "bruteforce_temperature": float(temperature),
+    }
+    return row_weights.to(torch.float32), scores.to(torch.float32), diagnostics
+
+
+def _run_alignment_stage(
     *,
     stage_name: str,
+    alignment_method: str,
     model: GRUAdder,
     specs: Sequence[EndogenousRowSpec],
     row_keys: Sequence[str],
@@ -307,37 +435,73 @@ def _run_ot_stage(
     fit_stratify_mode: str,
     fit_family_profile: str,
     cost_metric: str,
+    cosine_temperature: float,
+    bruteforce_temperature: float,
     rotation_map: dict[int, RotatedBasis] | None,
     row_allowed_timesteps: dict[str, set[int]] | None = None,
 ) -> dict[str, object]:
     start_time = time.perf_counter()
-    cost, diagnostics = _fit_cost_matrix(
-        model,
-        specs=specs,
-        fit_by_row=banks["fit_by_row"],
-        sites=sites,
-        family_order=family_order,
-        device=device,
-        run_cache=run_cache,
-        batch_size=int(batch_size),
-        normalize_signatures=bool(normalize_signatures),
-        fit_signature_mode=str(fit_signature_mode),
-        fit_stratify_mode=str(fit_stratify_mode),
-        fit_family_profile=str(fit_family_profile),
-        cost_metric=str(cost_metric),
-        rotation_map=rotation_map,
-    )
+    alignment_method = str(alignment_method).replace("-", "")
+    if alignment_method == "bruteforce":
+        cost = None
+        coupling, brute_scores, diagnostics = _bruteforce_alignment_from_fit(
+            model,
+            row_keys=row_keys,
+            banks=banks,
+            sites=sites,
+            device=device,
+            run_cache=run_cache,
+            batch_size=int(batch_size),
+            rotation_map=rotation_map,
+            temperature=float(bruteforce_temperature),
+        )
+    else:
+        cost, diagnostics = _fit_cost_matrix(
+            model,
+            specs=specs,
+            fit_by_row=banks["fit_by_row"],
+            sites=sites,
+            family_order=family_order,
+            device=device,
+            run_cache=run_cache,
+            batch_size=int(batch_size),
+            normalize_signatures=bool(normalize_signatures),
+            fit_signature_mode=str(fit_signature_mode),
+            fit_stratify_mode=str(fit_stratify_mode),
+            fit_family_profile=str(fit_family_profile),
+            cost_metric=str(cost_metric),
+            rotation_map=rotation_map,
+        )
 
     trials = []
     best_trial = None
     best_key = None
-    for eps in transport_cfg.epsilon_grid:
-        coupling = sinkhorn_uniform_ot(
-            cost,
-            epsilon=float(eps),
-            n_iter=int(transport_cfg.sinkhorn_iters),
-            temperature=float(transport_cfg.temperature),
+    if alignment_method == "ot":
+        alignment_trials = [
+            (
+                float(eps),
+                sinkhorn_uniform_ot(
+                    cost,
+                    epsilon=float(eps),
+                    n_iter=int(transport_cfg.sinkhorn_iters),
+                    temperature=float(transport_cfg.temperature),
+                ),
+                None,
+            )
+            for eps in transport_cfg.epsilon_grid
+        ]
+    elif alignment_method == "cosine":
+        coupling, cosine_scores = _cosine_alignment_from_diagnostics(
+            diagnostics,
+            temperature=float(cosine_temperature),
         )
+        alignment_trials = [(None, coupling, cosine_scores)]
+    elif alignment_method == "bruteforce":
+        alignment_trials = [(None, coupling, brute_scores)]
+    else:
+        raise ValueError(f"unknown alignment_method: {alignment_method!r}")
+
+    for eps, coupling, cosine_scores in alignment_trials:
         per_row = {}
         calib_sens = []
         calib_inv = []
@@ -403,11 +567,19 @@ def _run_ot_stage(
             "subset": _subset_summary({k: v["test"] for k, v in per_row.items()}, row_keys),
         }
         trial = {
-            "epsilon": float(eps),
+            "alignment_method": alignment_method,
+            "epsilon": None if eps is None else float(eps),
             "coupling": coupling.tolist(),
             "calibration": calibration,
             "test": test,
         }
+        if cosine_scores is not None:
+            score_key = "bruteforce_scores" if alignment_method == "bruteforce" else "cosine_scores"
+            trial[score_key] = cosine_scores.tolist()
+            if alignment_method == "bruteforce":
+                trial["bruteforce_temperature"] = float(bruteforce_temperature)
+            else:
+                trial["cosine_temperature"] = float(cosine_temperature)
         trials.append(trial)
         key = (float(calibration["mean_combined"]), float(calibration["mean_sensitivity"]), float(calibration["mean_invariance"]))
         if best_key is None or key > best_key:
@@ -417,12 +589,63 @@ def _run_ot_stage(
     elapsed = time.perf_counter() - start_time
     return {
         "stage": str(stage_name),
+        "alignment_method": alignment_method,
         "runtime_seconds": float(elapsed),
         "sites": [site.key() for site in sites],
         "fit_diagnostics": diagnostics,
         "trials": trials,
         "best_trial": best_trial,
     }
+
+
+def _run_ot_stage(
+    *,
+    stage_name: str,
+    model: GRUAdder,
+    specs: Sequence[EndogenousRowSpec],
+    row_keys: Sequence[str],
+    banks: dict[str, object],
+    sites: Sequence[Site],
+    family_order: Sequence[str],
+    transport_cfg: TransportConfig,
+    selection_rule: str,
+    invariance_floor: float,
+    device: torch.device,
+    run_cache: RunCache,
+    batch_size: int,
+    normalize_signatures: bool,
+    fit_signature_mode: str,
+    fit_stratify_mode: str,
+    fit_family_profile: str,
+    cost_metric: str,
+    rotation_map: dict[int, RotatedBasis] | None,
+    row_allowed_timesteps: dict[str, set[int]] | None = None,
+) -> dict[str, object]:
+    return _run_alignment_stage(
+        stage_name=stage_name,
+        alignment_method="ot",
+        model=model,
+        specs=specs,
+        row_keys=row_keys,
+        banks=banks,
+        sites=sites,
+        family_order=family_order,
+        transport_cfg=transport_cfg,
+        selection_rule=selection_rule,
+        invariance_floor=invariance_floor,
+        device=device,
+        run_cache=run_cache,
+        batch_size=batch_size,
+        normalize_signatures=normalize_signatures,
+        fit_signature_mode=fit_signature_mode,
+        fit_stratify_mode=fit_stratify_mode,
+        fit_family_profile=fit_family_profile,
+        cost_metric=cost_metric,
+        cosine_temperature=1.0,
+        bruteforce_temperature=1.0,
+        rotation_map=rotation_map,
+        row_allowed_timesteps=row_allowed_timesteps,
+    )
 
 
 def _stage_a_timesteps(stage_a: dict[str, object], row_keys: Sequence[str]) -> dict[str, int]:
@@ -717,8 +940,40 @@ def _run_das_stage(
     device: torch.device,
     run_cache: RunCache,
     rotation_map: dict[int, RotatedBasis] | None,
+    skip: bool = False,
 ) -> dict[str, object]:
     start_time = time.perf_counter()
+    if bool(skip):
+        per_row = {
+            row_key: {
+                "calibration": {"sensitivity": 0.0, "invariance": 0.0, "combined": 0.0},
+                "test": {
+                    "sensitivity": 0.0,
+                    "invariance": 0.0,
+                    "combined": 0.0,
+                    "count_positive": int(len(banks["test_positive_by_row"][row_key])),
+                    "count_invariant": int(len(banks["test_invariant_by_row"][row_key])),
+                },
+                "support": {},
+                "subspace_dim": 0,
+                "lr": 0.0,
+                "lambda": 0.0,
+            }
+            for row_key in row_keys
+        }
+        return {
+            "stage": str(stage_name),
+            "runtime_seconds": float(time.perf_counter() - start_time),
+            "skipped": True,
+            "trials": [],
+            "test": {
+                "per_row": per_row,
+                "mean_sensitivity": 0.0,
+                "mean_invariance": 0.0,
+                "mean_combined": 0.0,
+                "subset": _subset_summary({key: val["test"] for key, val in per_row.items()}, row_keys),
+            },
+        }
     per_row = {}
     all_trials = []
     calib_sens = []
@@ -944,6 +1199,17 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     for param in model.parameters():
         param.requires_grad_(False)
     run_cache = build_run_cache(model, examples, device=device)
+    alignment_method = str(args.alignment_method).replace("-", "")
+    alignment_label = {"cosine": "Cosine", "bruteforce": "Brute-force"}.get(alignment_method, "OT")
+    alignment_suffix = {"cosine": "cosine", "bruteforce": "bruteforce"}.get(alignment_method, "ot")
+    native_method_name = {
+        "cosine": "cosine-native",
+        "bruteforce": "brute-force-native",
+    }.get(alignment_method, "PLOT-native")
+    pca_method_name = {
+        "cosine": "cosine-pca",
+        "bruteforce": "brute-force-pca",
+    }.get(alignment_method, "PLOT-PCA")
 
     specs_all = _row_specs("all_endogenous", int(args.width))
     specs = tuple(spec for spec in specs_all if spec.key in set(row_keys))
@@ -971,8 +1237,9 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     )
 
     full_state_sites = tuple(FullStateSite(timestep=t) for t in range(int(args.width)))
-    stage_a = _run_ot_stage(
-        stage_name="stage_a_full_timestep_ot",
+    stage_a = _run_alignment_stage(
+        stage_name=f"stage_a_full_timestep_{alignment_suffix}",
+        alignment_method=alignment_method,
         model=model,
         specs=specs,
         row_keys=row_keys,
@@ -990,6 +1257,8 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         fit_stratify_mode=str(args.fit_stratify_mode),
         fit_family_profile=str(args.fit_family_profile),
         cost_metric=str(args.cost_metric),
+        cosine_temperature=float(args.cosine_temperature),
+        bruteforce_temperature=float(args.bruteforce_temperature),
         rotation_map=None,
     )
     stage_a_timesteps = _stage_a_timesteps(stage_a, row_keys)
@@ -1006,8 +1275,9 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
                 resolution=int(resolution),
             )
         )
-    stage_b_canonical = _run_ot_stage(
-        stage_name="stage_b_canonical_ot_inside_stage_a_timesteps",
+    stage_b_canonical = _run_alignment_stage(
+        stage_name=f"stage_b_canonical_{alignment_suffix}_inside_stage_a_timesteps",
+        alignment_method=alignment_method,
         model=model,
         specs=specs,
         row_keys=row_keys,
@@ -1025,6 +1295,8 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         fit_stratify_mode=str(args.fit_stratify_mode),
         fit_family_profile=str(args.fit_family_profile),
         cost_metric=str(args.cost_metric),
+        cosine_temperature=float(args.cosine_temperature),
+        bruteforce_temperature=float(args.bruteforce_temperature),
         rotation_map=None,
         row_allowed_timesteps=row_allowed_timesteps,
     )
@@ -1046,8 +1318,9 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         resolutions=pca_resolutions,
         site_menu=str(args.pca_site_menu),
     )
-    stage_b_pca = _run_ot_stage(
-        stage_name="stage_b_pca_ot_inside_stage_a_timesteps",
+    stage_b_pca = _run_alignment_stage(
+        stage_name=f"stage_b_pca_{alignment_suffix}_inside_stage_a_timesteps",
+        alignment_method=alignment_method,
         model=model,
         specs=specs,
         row_keys=row_keys,
@@ -1065,6 +1338,8 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         fit_stratify_mode=str(args.fit_stratify_mode),
         fit_family_profile=str(args.fit_family_profile),
         cost_metric=str(args.cost_metric),
+        cosine_temperature=float(args.cosine_temperature),
+        bruteforce_temperature=float(args.bruteforce_temperature),
         rotation_map=rotation_map,
         row_allowed_timesteps=row_allowed_timesteps,
     )
@@ -1182,6 +1457,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         device=device,
         run_cache=run_cache,
         rotation_map=None,
+        skip=bool(args.skip_das),
     )
     stage_b_das_canonical = _run_das_stage(
         stage_name="stage_b_das_inside_canonical_ot_support",
@@ -1202,6 +1478,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         device=device,
         run_cache=run_cache,
         rotation_map=None,
+        skip=bool(args.skip_das),
     )
     stage_b_das_pca = _run_das_stage(
         stage_name="stage_b_das_inside_pca_ot_support",
@@ -1222,6 +1499,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         device=device,
         run_cache=run_cache,
         rotation_map=rotation_map,
+        skip=bool(args.skip_das),
     )
     full_das_supports = {
         row_key: tuple(
@@ -1254,23 +1532,24 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         device=device,
         run_cache=run_cache,
         rotation_map=None,
+        skip=bool(args.skip_das),
     )
 
     methods = {
-        "stage_a_ot": _method_record(
-            name="PLOT Stage-A OT",
+        f"stage_a_{alignment_suffix}": _method_record(
+            name=f"PLOT Stage-A {alignment_label}",
             accuracy_source=stage_a["best_trial"],
             runtime_seconds=float(stage_a["runtime_seconds"]),
             row_keys=row_keys,
         ),
         "plot_in_timestep": _method_record(
-            name="PLOT in timestep",
+            name=native_method_name,
             accuracy_source=stage_b_canonical["best_trial"],
             runtime_seconds=float(stage_a["runtime_seconds"]) + float(stage_b_canonical["runtime_seconds"]),
             row_keys=row_keys,
         ),
         "plot_pca_in_timestep": _method_record(
-            name="PLOT-PCA in timestep",
+            name=pca_method_name,
             accuracy_source=stage_b_pca["best_trial"],
             runtime_seconds=float(stage_a["runtime_seconds"]) + float(pca_fit_seconds) + float(stage_b_pca["runtime_seconds"]),
             row_keys=row_keys,
@@ -1300,6 +1579,14 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
             row_keys=row_keys,
         ),
     }
+    if bool(args.skip_das):
+        for method_key in (
+            "plot_guided_das_full_timestep",
+            "plot_guided_das_canonical_support",
+            "plot_pca_guided_das",
+            "full_das",
+        ):
+            methods.pop(method_key, None)
 
     stage_a_expected = {f"C{i}": i - 1 for i in range(1, int(args.width))}
     stage_a_hits = [
@@ -1342,8 +1629,8 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         "canonical_ot_supports": {row_key: [support.as_dict() for support in canonical_ot_supports[row_key]] for row_key in row_keys},
         "stages": {
             "stage_a": stage_a,
-            "stage_b_canonical_ot": stage_b_canonical,
-            "stage_b_pca_ot": stage_b_pca,
+            f"stage_b_canonical_{alignment_suffix}": stage_b_canonical,
+            f"stage_b_pca_{alignment_suffix}": stage_b_pca,
             "stage_b_das_full_timestep": stage_b_das_full,
             "stage_b_das_canonical_support": stage_b_das_canonical,
             "stage_b_das_pca_support": stage_b_das_pca,

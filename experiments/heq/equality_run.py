@@ -37,13 +37,13 @@ OUTPUT_PATH = RUN_DIR / "equality_run_results.json"
 SUMMARY_PATH = RUN_DIR / "equality_run_summary.txt"
 RETRAIN_BACKBONE = False
 
-METHODS = ["ot", "das"]
+METHODS = ["ot", "cosine", "bruteforce", "das"]
 TARGET_VARS = ["WX", "YZ"]
-TRANSPORT_METHODS = tuple(method for method in METHODS if method in {"ot", "uot", "gw", "fgw"})
-NON_TRANSPORT_METHODS = tuple(method for method in METHODS if method not in {"ot", "uot", "gw", "fgw"})
-HEQ_METHOD_ORDER = ("ot", "uot", "das")
-HEQ_METHOD_LABELS = {"ot": "OT", "uot": "UOT", "das": "DAS"}
-HEQ_METHOD_COLORS = {"ot": "#59a14f", "uot": "#76b7b2", "das": "#e15759"}
+TRANSPORT_METHODS = tuple(method for method in METHODS if method in {"ot", "uot", "gw", "fgw", "cosine", "bruteforce"})
+NON_TRANSPORT_METHODS = tuple(method for method in METHODS if method not in {"ot", "uot", "gw", "fgw", "cosine", "bruteforce"})
+HEQ_METHOD_ORDER = ("ot", "uot", "cosine", "bruteforce", "das")
+HEQ_METHOD_LABELS = {"ot": "OT", "uot": "UOT", "cosine": "Cosine", "bruteforce": "Brute-force", "das": "DAS"}
+HEQ_METHOD_COLORS = {"ot": "#59a14f", "uot": "#76b7b2", "cosine": "#b07aa1", "bruteforce": "#edc948", "das": "#e15759"}
 
 NUM_ENTITIES = 100
 EMBEDDING_DIM = 4
@@ -912,7 +912,7 @@ def _plot_heq_handle_summary(seed_payload: dict[str, object], output_path: Path)
         variable: {method: np.zeros(len(layer_labels), dtype=float) for method in methods}
         for variable in variables
     }
-    transport_methods = [method for method in methods if method in {"ot", "uot"}]
+    transport_methods = [method for method in methods if method in {"ot", "uot", "cosine", "bruteforce"}]
     transport_candidate_heatmaps = {
         method: {variable: np.zeros((3, 16), dtype=float) for variable in variables}
         for method in transport_methods
@@ -929,7 +929,7 @@ def _plot_heq_handle_summary(seed_payload: dict[str, object], output_path: Path)
         comparison = seed_payload["best_method_runs"][method]["comparison"]
         method_payload = comparison["method_payloads"][method]
         method_selection = comparison["method_selections"][method]
-        if method in {"ot", "uot"}:
+        if method in {"ot", "uot", "cosine", "bruteforce"}:
             transport_matrix = np.asarray(method_payload["transport"], dtype=float)
             target_vars = [str(variable) for variable in method_payload["target_vars"]]
             site_labels = [str(label) for label in method_payload["sites"]]
@@ -1041,7 +1041,7 @@ def _plot_heq_handle_summary(seed_payload: dict[str, object], output_path: Path)
             pair_grid = variable_blocks[variable]
             first_ax = fig.add_subplot(pair_grid[row_idx, 0])
             second_ax = fig.add_subplot(pair_grid[row_idx, 1], sharey=first_ax)
-            if method in {"ot", "uot"}:
+            if method in {"ot", "uot", "cosine", "bruteforce"}:
                 first_values = np.asarray(transport_candidate_heatmaps[method][variable], dtype=float)
                 second_values = np.asarray(transport_topk_heatmaps[method][variable], dtype=float)
                 first_title = "pre-top$K$"
@@ -1426,9 +1426,10 @@ def _run_single_seed(seed: int) -> dict[str, object]:
         for method in TRANSPORT_METHODS:
             beta_abstracts = UOT_BETA_ABSTRACTS if method == "uot" else (UOT_BETA_ABSTRACTS[0],)
             beta_neurals = UOT_BETA_NEURALS if method == "uot" else (UOT_BETA_NEURALS[0],)
-            signature_modes = SIGNATURE_MODES if method in {"ot", "uot", "gw", "fgw"} else (SIGNATURE_MODES[0],)
+            signature_modes = SIGNATURE_MODES if method in {"ot", "uot", "gw", "fgw", "cosine", "bruteforce"} else (SIGNATURE_MODES[0],)
+            epsilon_values = (OT_EPSILONS[0],) if method in {"cosine", "bruteforce"} else OT_EPSILONS
             for signature_mode in signature_modes:
-                for ot_epsilon in OT_EPSILONS:
+                for ot_epsilon in epsilon_values:
                     for ot_tau in OT_TAUS:
                         for uot_beta_abstract in beta_abstracts:
                             for uot_beta_neural in beta_neurals:

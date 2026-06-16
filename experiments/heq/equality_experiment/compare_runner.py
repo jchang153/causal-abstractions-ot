@@ -304,7 +304,7 @@ def run_comparison_with_banks(
     for method_index, method in enumerate(config.methods, start=1):
         print(f"[{method_index}/{len(config.methods)}] Starting {method.upper()}")
         method_start_time = perf_counter()
-        if method in {"gw", "ot", "uot", "fgw"}:
+        if method in {"gw", "ot", "uot", "fgw", "cosine", "bruteforce", "brute-force"}:
             ot_config = OTConfig(
                 method=method,
                 batch_size=config.batch_size,
