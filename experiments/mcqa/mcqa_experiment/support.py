@@ -22,7 +22,7 @@ def _iter_transport_method_payloads(compare_payload: dict[str, object]) -> list[
     if not isinstance(method_payloads, dict):
         return []
     payloads: list[dict[str, object]] = []
-    for method_name in ("ot", "uot"):
+    for method_name in ("ot", "uot", "cosine", "bruteforce-coupling", "brute-force-coupling"):
         method_entries = method_payloads.get(method_name, [])
         if not isinstance(method_entries, list):
             continue

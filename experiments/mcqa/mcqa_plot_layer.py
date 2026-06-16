@@ -18,6 +18,8 @@ from mcqa_experiment.ot import (
     prepare_alignment_artifacts,
     resolve_recorded_artifact_prepare_seconds,
     save_prepared_alignment_artifacts,
+    solve_bruteforce_coupling_transport,
+    solve_cosine_transport,
     solve_ot_transport,
     solve_uot_transport,
 )
@@ -41,7 +43,7 @@ DEFAULT_DISPLAY_TOP_LAYER_COUNT = 3
 DEFAULT_STAGE_A_INTERVENTION_STRENGTH = 1.0
 DEFAULT_STAGE_A_ROW_TOP_K = 6
 DEFAULT_STAGE_A_TRANSPORT_METHODS = ("uot",)
-SUPPORTED_STAGE_A_TRANSPORT_METHODS = ("uot", "ot")
+SUPPORTED_STAGE_A_TRANSPORT_METHODS = ("uot", "ot", "cosine", "bruteforce-coupling", "brute-force-coupling", "bruteforce")
 
 
 def _synchronize_if_cuda(device: torch.device | str) -> None:
@@ -74,7 +76,8 @@ def _parse_csv_floats(value: str | None) -> list[float] | None:
 def _parse_stage_a_transport_methods(value: str | None) -> tuple[str, ...]:
     raw_methods = _parse_csv_strings(value) or list(DEFAULT_STAGE_A_TRANSPORT_METHODS)
     methods = tuple(dict.fromkeys(str(method).strip().lower() for method in raw_methods if str(method).strip()))
-    unsupported = sorted(set(methods) - set(SUPPORTED_STAGE_A_TRANSPORT_METHODS))
+    methods = tuple("bruteforce-coupling" if method in {"bruteforce", "brute-force-coupling"} else method for method in methods)
+    unsupported = sorted(set(methods) - {"uot", "ot", "cosine", "bruteforce-coupling"})
     if unsupported:
         raise ValueError(
             f"Unsupported Stage A transport methods: {unsupported}. "
@@ -106,6 +109,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated Stage A transport methods to sweep: uot,ot. Default: uot",
     )
     parser.add_argument("--uot-beta-neurals", help="Comma-separated UOT beta_neural values. Ignored for balanced OT. Default: 0.1,0.3,1,3")
+    parser.add_argument("--cosine-temperature", type=float, default=1.0)
+    parser.add_argument("--bruteforce-temperature", type=float, default=1.0)
     parser.add_argument(
         "--ot-lambdas",
         help="Compatibility flag. Stage A now uses a fixed full-strength intervention and ignores lambda sweeps.",
@@ -196,7 +201,7 @@ def _iter_stage_a_transport_payloads(compare_payload: dict[str, object]) -> list
     if not isinstance(method_payloads, dict):
         return []
     payloads: list[tuple[str, dict[str, object]]] = []
-    for method_name in ("uot", "ot"):
+    for method_name in ("uot", "ot", "cosine", "bruteforce-coupling"):
         entries = method_payloads.get(method_name, [])
         if not isinstance(entries, list):
             continue
@@ -216,11 +221,21 @@ def _build_transport_only_compare_payload(
     beta_neural: float | None,
     signature_mode: str,
     calibration_family_weights: tuple[float, ...],
+    model=None,
+    tokenizer=None,
+    fit_banks_by_var: dict[str, object] | None = None,
+    sites=None,
+    device=None,
+    batch_size: int = 16,
+    cosine_temperature: float = 1.0,
+    bruteforce_temperature: float = 1.0,
 ) -> dict[str, object]:
     method = str(method).lower()
+    if method in {"bruteforce", "brute-force-coupling"}:
+        method = "bruteforce-coupling"
     if method not in SUPPORTED_STAGE_A_TRANSPORT_METHODS:
         raise ValueError(f"Unsupported Stage A transport method {method}")
-    resolved_beta_neural = None if method == "ot" else float(beta_neural)
+    resolved_beta_neural = float(beta_neural) if method == "uot" and beta_neural is not None else None
     solve_start = perf_counter()
     config = OTConfig(
         method=method,
@@ -232,6 +247,8 @@ def _build_transport_only_compare_payload(
         source_target_vars=target_vars,
         calibration_metric=DEFAULT_CALIBRATION_METRIC,
         calibration_family_weights=tuple(float(weight) for weight in calibration_family_weights),
+        cosine_temperature=float(cosine_temperature),
+        bruteforce_temperature=float(bruteforce_temperature),
     )
     if method == "ot":
         transport, transport_meta = solve_ot_transport(
@@ -240,11 +257,30 @@ def _build_transport_only_compare_payload(
             config,
         )
     else:
-        transport, transport_meta = solve_uot_transport(
-            variable_signatures_by_var,
-            site_signatures_by_var,
-            config,
-        )
+        if method == "cosine":
+            transport, transport_meta = solve_cosine_transport(
+                variable_signatures_by_var,
+                site_signatures_by_var,
+                config,
+            )
+        elif method == "bruteforce-coupling":
+            if model is None or tokenizer is None or fit_banks_by_var is None or sites is None or device is None:
+                raise ValueError("bruteforce-coupling Stage A requires model, tokenizer, fit_banks_by_var, sites, and device")
+            transport, transport_meta = solve_bruteforce_coupling_transport(
+                model=model,
+                fit_banks_by_var=fit_banks_by_var,
+                sites=list(sites),
+                batch_size=int(batch_size),
+                device=torch.device(device),
+                tokenizer=tokenizer,
+                config=config,
+            )
+        else:
+            transport, transport_meta = solve_uot_transport(
+                variable_signatures_by_var,
+                site_signatures_by_var,
+                config,
+            )
     runtime_seconds = float(perf_counter() - solve_start)
     normalized_transport = normalize_transport_rows(transport)
     method_payloads: list[dict[str, object]] = []
@@ -1070,12 +1106,14 @@ def main() -> None:
     for method in stage_a_transport_methods:
         if method == "ot":
             method_grid = [(epsilon, None) for epsilon in ot_epsilons]
-        else:
+        elif method == "uot":
             method_grid = [
                 (epsilon, beta_neural)
                 for epsilon in ot_epsilons
                 for beta_neural in uot_beta_neurals
             ]
+        else:
+            method_grid = [(epsilon, None) for epsilon in ot_epsilons]
         for epsilon, beta_neural in method_grid:
             beta_suffix = "" if beta_neural is None else f"_betan-{float(beta_neural):g}"
             beta_log = "" if beta_neural is None else f" beta_neural={float(beta_neural):g}"
@@ -1106,6 +1144,14 @@ def main() -> None:
                     beta_neural=None if beta_neural is None else float(beta_neural),
                     signature_mode=str(args.signature_mode),
                     calibration_family_weights=calibration_family_weights,
+                    model=model,
+                    tokenizer=tokenizer,
+                    fit_banks_by_var=train_banks,
+                    sites=sites,
+                    device=device,
+                    batch_size=int(args.batch_size),
+                    cosine_temperature=float(args.cosine_temperature),
+                    bruteforce_temperature=float(args.bruteforce_temperature),
                 )
                 write_json(output_path, compare_payload)
                 report_lines = [

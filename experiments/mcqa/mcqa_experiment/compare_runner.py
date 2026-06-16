@@ -35,6 +35,8 @@ class CompareExperimentConfig:
     calibration_family_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
     ot_top_k_values_by_var: dict[str, tuple[int, ...]] | None = None
     ot_lambdas_by_var: dict[str, tuple[float, ...]] | None = None
+    cosine_temperature: float = 1.0
+    bruteforce_temperature: float = 1.0
     das_max_epochs: int = 5
     das_min_epochs: int = 1
     das_plateau_patience: int = 2
@@ -91,9 +93,12 @@ def run_comparison(
         print(f"[method] start method={method} targets={list(target_vars)}")
         prepared_artifacts = None
         ot_config = None
-        if method in {"ot", "uot"} and target_vars:
+        method_key = str(method).lower()
+        if method_key == "brute-force-coupling":
+            method_key = "bruteforce-coupling"
+        if method_key in {"ot", "uot", "cosine"} and target_vars:
             ot_config = OTConfig(
-                method=method,
+                method=method_key,
                 batch_size=config.batch_size,
                 epsilon=config.ot_epsilon,
                 uot_beta_neural=config.uot_beta_neural,
@@ -105,6 +110,8 @@ def run_comparison(
                 calibration_family_weights=config.calibration_family_weights,
                 top_k_values_by_var=config.ot_top_k_values_by_var,
                 lambda_values_by_var=config.ot_lambdas_by_var,
+                cosine_temperature=float(config.cosine_temperature),
+                bruteforce_temperature=float(config.bruteforce_temperature),
             )
             prepared_artifacts = prepared_ot_artifacts
             if prepared_artifacts is None:
@@ -122,9 +129,9 @@ def run_comparison(
             train_bank = banks_by_split["train"][target_var]
             calibration_bank = banks_by_split["calibration"][target_var]
             test_bank = banks_by_split["test"][target_var]
-            if method in {"ot", "uot"}:
+            if method_key in {"ot", "uot", "cosine", "bruteforce-coupling"}:
                 current_ot_config = ot_config or OTConfig(
-                    method=method,
+                    method=method_key,
                     batch_size=config.batch_size,
                     epsilon=config.ot_epsilon,
                     uot_beta_neural=config.uot_beta_neural,
@@ -136,6 +143,8 @@ def run_comparison(
                     calibration_family_weights=config.calibration_family_weights,
                     top_k_values_by_var=config.ot_top_k_values_by_var,
                     lambda_values_by_var=config.ot_lambdas_by_var,
+                    cosine_temperature=float(config.cosine_temperature),
+                    bruteforce_temperature=float(config.bruteforce_temperature),
                 )
                 payload = run_alignment_pipeline(
                     model=model,
@@ -148,7 +157,7 @@ def run_comparison(
                     config=current_ot_config,
                     prepared_artifacts=prepared_artifacts,
                 )
-            elif method == "bruteforce":
+            elif method_key == "bruteforce":
                 current_ot_config = OTConfig(
                     method=method,
                     batch_size=config.batch_size,

@@ -380,6 +380,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--calibration-metric", default=DEFAULT_CALIBRATION_METRIC)
     parser.add_argument("--calibration-family-weights", default="1,1,1")
+    parser.add_argument(
+        "--plot-alignment-method",
+        default="ot",
+        choices=("ot", "cosine", "bruteforce", "bruteforce-coupling"),
+        help="Stage B PLOT-native/PLOT-PCA row-score method. Default: ot",
+    )
+    parser.add_argument("--cosine-temperature", type=float, default=1.0)
+    parser.add_argument("--bruteforce-temperature", type=float, default=1.0)
     parser.add_argument("--stage-b-top-layers-per-var", type=int, default=1)
     parser.add_argument("--stage-b-neighbor-radius", type=int, default=0)
     parser.add_argument("--stage-b-max-layers-per-var", type=int, default=1)
@@ -476,6 +484,7 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
     ot_top_k_values = _parse_csv_ints(args.ot_top_k_values) or DEFAULT_OT_TOP_K_VALUES
     ot_lambdas = _parse_csv_floats(args.ot_lambdas) or DEFAULT_OT_LAMBDAS
     calibration_family_weights = _parse_csv_floats(args.calibration_family_weights) or DEFAULT_CALIBRATION_FAMILY_WEIGHTS
+    plot_alignment_method = "bruteforce-coupling" if str(args.plot_alignment_method) == "bruteforce" else str(args.plot_alignment_method)
     guided_mask_names = DEFAULT_GUIDED_MASK_NAMES
     guided_subspace_dims = None
     if args.guided_subspace_dims is not None:
@@ -511,6 +520,9 @@ def _normalize_args(args: argparse.Namespace) -> dict[str, object]:
         "ot_top_k_values": tuple(int(value) for value in ot_top_k_values),
         "ot_lambdas": tuple(float(value) for value in ot_lambdas),
         "calibration_family_weights": tuple(float(weight) for weight in calibration_family_weights),
+        "plot_alignment_method": str(plot_alignment_method),
+        "cosine_temperature": float(args.cosine_temperature),
+        "bruteforce_temperature": float(args.bruteforce_temperature),
         "guided_mask_names": tuple(str(mask_name) for mask_name in guided_mask_names),
         "guided_support_dim_count": max(1, int(args.guided_support_dim_count)),
         "guided_subspace_dims": None if guided_subspace_dims is None else tuple(int(dim) for dim in guided_subspace_dims),
@@ -562,6 +574,10 @@ def _build_stage_a_command(
             str(beta).rstrip("0").rstrip(".") if "." in str(beta) else str(beta)
             for beta in normalized["stage_a_uot_beta_neurals"]
         ),
+        "--cosine-temperature",
+        str(float(normalized["cosine_temperature"])),
+        "--bruteforce-temperature",
+        str(float(normalized["bruteforce_temperature"])),
         "--stage-a-row-top-k",
         str(int(normalized["stage_a_row_top_k"])),
         "--calibration-family-weights",
@@ -638,6 +654,12 @@ def _build_stage_b_or_c_command(
         ",".join(str(value) for value in normalized["ot_top_k_values"]),
         "--ot-lambdas",
         ",".join(str(value).rstrip("0").rstrip(".") if "." in str(value) else str(value) for value in normalized["ot_lambdas"]),
+        "--alignment-method",
+        str(normalized["plot_alignment_method"]),
+        "--cosine-temperature",
+        str(float(normalized["cosine_temperature"])),
+        "--bruteforce-temperature",
+        str(float(normalized["bruteforce_temperature"])),
         "--calibration-family-weights",
         ",".join(
             str(weight).rstrip("0").rstrip(".") if "." in str(weight) else str(weight)
@@ -738,6 +760,12 @@ def _build_native_block_command(
         ",".join(str(value) for value in normalized["ot_top_k_values"]),
         "--ot-lambdas",
         ",".join(str(value).rstrip("0").rstrip(".") if "." in str(value) else str(value) for value in normalized["ot_lambdas"]),
+        "--alignment-method",
+        str(normalized["plot_alignment_method"]),
+        "--cosine-temperature",
+        str(float(normalized["cosine_temperature"])),
+        "--bruteforce-temperature",
+        str(float(normalized["bruteforce_temperature"])),
         "--calibration-family-weights",
         ",".join(
             str(weight).rstrip("0").rstrip(".") if "." in str(weight) else str(weight)

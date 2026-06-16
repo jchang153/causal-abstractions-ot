@@ -226,6 +226,8 @@ class OTConfig:
     top_k_values_by_var: dict[str, tuple[int, ...]] | None = None
     lambda_values_by_var: dict[str, tuple[float, ...]] | None = None
     store_prediction_details: bool = True
+    cosine_temperature: float = 1.0
+    bruteforce_temperature: float = 1.0
 
 
 def load_prepared_alignment_artifacts(
@@ -703,6 +705,39 @@ def solve_uot_transport(
     return transport, meta
 
 
+def _row_softmax(scores: torch.Tensor, *, temperature: float) -> np.ndarray:
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    weights = torch.softmax(scores.to(torch.float32) / float(temperature), dim=1)
+    return weights.detach().cpu().numpy()
+
+
+def solve_cosine_transport(
+    variable_signatures_by_var: dict[str, torch.Tensor],
+    site_signatures_by_var: dict[str, torch.Tensor],
+    config: OTConfig,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Build a transport-like row distribution from cosine signature similarity."""
+    rows = []
+    raw_rows = []
+    for target_var in config.source_target_vars:
+        variable_signature = variable_signatures_by_var[target_var].reshape(1, -1).to(torch.float32)
+        site_signatures = site_signatures_by_var[target_var].reshape(site_signatures_by_var[target_var].shape[0], -1).to(torch.float32)
+        similarities = torch.nn.functional.cosine_similarity(variable_signature, site_signatures, dim=1)
+        raw_rows.append(similarities)
+        rows.append(similarities.reshape(1, -1))
+    score_matrix = torch.cat(rows, dim=0)
+    transport = _row_softmax(score_matrix, temperature=float(config.cosine_temperature))
+    return transport, {
+        "method": "cosine",
+        "score_type": "cosine_similarity",
+        "temperature": float(config.cosine_temperature),
+        "matched_mass": float(np.sum(transport)),
+        "row_max_scores": [float(row.max().item()) for row in raw_rows],
+        "row_min_scores": [float(row.min().item()) for row in raw_rows],
+    }
+
+
 def _site_weights_from_transport(selected_transport: np.ndarray, sites: list[SiteLike]) -> dict[SiteLike, float]:
     column_mass = selected_transport.sum(axis=0)
     return {
@@ -879,6 +914,61 @@ def _evaluate_single_site_intervention(
     if include_details:
         record["prediction_details"] = prediction_details_from_logits(logits, bank, tokenizer=tokenizer)
     return record, ranking
+
+
+def solve_bruteforce_coupling_transport(
+    *,
+    model,
+    fit_banks_by_var: dict[str, MCQAPairBank],
+    sites: list[SiteLike],
+    batch_size: int,
+    device: torch.device,
+    tokenizer,
+    config: OTConfig,
+    pca_bases_by_id: dict[str, LayerPCABasis] | None = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Build row scores by evaluating every site on the fit bank for each abstract variable."""
+    row_scores: list[list[float]] = []
+    row_exact_accs: dict[str, list[float]] = {}
+    start = perf_counter()
+    for target_var in config.source_target_vars:
+        bank = fit_banks_by_var[str(target_var)]
+        scores: list[float] = []
+        site_iterator = list(enumerate(sites))
+        if config.selection_verbose and tqdm is not None:
+            site_iterator = tqdm(
+                site_iterator,
+                desc=f"BRUTEFORCE coupling scores ({target_var})",
+                leave=False,
+            )
+        for site_index, site in site_iterator:
+            result, _ranking = _evaluate_single_site_intervention(
+                model=model,
+                bank=bank,
+                site=site,
+                site_index=int(site_index),
+                strength=1.0,
+                batch_size=int(batch_size),
+                device=device,
+                tokenizer=tokenizer,
+                include_details=False,
+                pca_bases_by_id=pca_bases_by_id,
+            )
+            scores.append(float(result.get("exact_acc", 0.0)))
+        row_scores.append(scores)
+        row_exact_accs[str(target_var)] = [float(score) for score in scores]
+    score_tensor = torch.tensor(row_scores, dtype=torch.float32, device=device)
+    transport = _row_softmax(score_tensor, temperature=float(config.bruteforce_temperature))
+    return transport, {
+        "method": "bruteforce-coupling",
+        "score_type": "fit_bank_single_site_exact_acc",
+        "temperature": float(config.bruteforce_temperature),
+        "matched_mass": float(np.sum(transport)),
+        "score_runtime_seconds": float(perf_counter() - start),
+        "row_max_scores": [float(max(scores) if scores else 0.0) for scores in row_scores],
+        "row_min_scores": [float(min(scores) if scores else 0.0) for scores in row_scores],
+        "row_exact_accs": row_exact_accs,
+    }
 
 
 def _select_hyperparameters(
@@ -1072,7 +1162,11 @@ def run_alignment_pipeline(
     target_vars: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     """Run OT or UOT for one MCQA target variable using a two-source abstraction."""
-    if target_vars is not None and config.method == "ot" and len(tuple(target_vars)) < 2:
+    method_key = str(config.method).lower()
+    if method_key == "brute-force-coupling":
+        method_key = "bruteforce-coupling"
+    signature_based_method = method_key in {"ot", "uot", "cosine"}
+    if target_vars is not None and method_key == "ot" and len(tuple(target_vars)) < 2:
         raise ValueError("degenerate balanced OT alignment requires at least two source target variables")
     if fit_banks_by_var is None and fit_banks is not None:
         fit_banks_by_var = fit_banks
@@ -1094,7 +1188,7 @@ def run_alignment_pipeline(
         )
     signature_prepare_wall_seconds = 0.0
     artifact_prepare_load_seconds = 0.0
-    if prepared_artifacts is None:
+    if signature_based_method and prepared_artifacts is None:
         if config.selection_verbose:
             print(f"[{config.method.upper()}] no prepared artifacts supplied; building signatures inline")
         signature_start = perf_counter()
@@ -1108,7 +1202,7 @@ def run_alignment_pipeline(
         )
         _synchronize_if_cuda(device)
         signature_prepare_wall_seconds = float(perf_counter() - signature_start)
-    else:
+    elif signature_based_method:
         artifact_prepare_load_seconds = 0.0
         if config.selection_verbose:
             print(
@@ -1116,21 +1210,21 @@ def run_alignment_pipeline(
                 f"cache_hit={bool(prepared_artifacts.get('artifact_cache_hit', False))} "
                 f"loaded_from_disk={bool(prepared_artifacts.get('loaded_from_disk', False))}"
             )
-    artifact_cache_hit = bool(prepared_artifacts.get("loaded_from_disk", False))
+    artifact_cache_hit = bool(prepared_artifacts.get("loaded_from_disk", False)) if signature_based_method else False
     artifact_prepare_create_seconds = float(signature_prepare_wall_seconds)
     artifact_prepare_recorded_seconds = resolve_recorded_artifact_prepare_seconds(
         prepared_artifacts,
         artifact_prepare_create_seconds=artifact_prepare_create_seconds,
-    )
+    ) if signature_based_method else 0.0
     signature_prepare_runtime_seconds = float(signature_prepare_wall_seconds)
-    site_signatures_by_var = prepared_artifacts["site_signatures_by_var"]
+    site_signatures_by_var = prepared_artifacts["site_signatures_by_var"] if signature_based_method else {}
     variable_signature_start = perf_counter()
-    if config.selection_verbose:
+    if signature_based_method and config.selection_verbose:
         print(f"[{config.method.upper()}] building abstract variable signatures for sources={list(config.source_target_vars)}")
     variable_signatures_by_var = {
         target_var: build_variable_signature(fit_banks_by_var[target_var], config.signature_mode)
         for target_var in config.source_target_vars
-    }
+    } if signature_based_method else {}
     _synchronize_if_cuda(device)
     variable_signature_seconds = float(perf_counter() - variable_signature_start)
     if config.selection_verbose:
@@ -1139,10 +1233,23 @@ def run_alignment_pipeline(
             f"cols={len(sites)}"
         )
     transport_start = perf_counter()
-    if config.method == "ot":
+    if method_key == "ot":
         transport, transport_meta = solve_ot_transport(variable_signatures_by_var, site_signatures_by_var, config)
-    elif config.method == "uot":
+    elif method_key == "uot":
         transport, transport_meta = solve_uot_transport(variable_signatures_by_var, site_signatures_by_var, config)
+    elif method_key == "cosine":
+        transport, transport_meta = solve_cosine_transport(variable_signatures_by_var, site_signatures_by_var, config)
+    elif method_key == "bruteforce-coupling":
+        transport, transport_meta = solve_bruteforce_coupling_transport(
+            model=model,
+            fit_banks_by_var=fit_banks_by_var,
+            sites=sites,
+            batch_size=int(config.batch_size),
+            device=device,
+            tokenizer=tokenizer,
+            config=config,
+            pca_bases_by_id=pca_bases_by_id,
+        )
     else:
         raise ValueError(f"Unsupported MCQA transport method {config.method}")
     _synchronize_if_cuda(device)
@@ -1155,7 +1262,7 @@ def run_alignment_pipeline(
     )
     target_normalized_transport = normalized_transport[target_row_index : target_row_index + 1]
     selection_transport, renormalize_selected_transport = _selection_transport_for_target(
-        method=config.method,
+        method=method_key,
         target_transport=target_transport,
         target_normalized_transport=target_normalized_transport,
     )
@@ -1220,7 +1327,7 @@ def run_alignment_pipeline(
         + selected_calibration_eval_seconds
         + holdout_eval_seconds
     )
-    holdout_result["method"] = config.method
+    holdout_result["method"] = method_key
     holdout_result["selection_exact_acc"] = float(selected["result"]["exact_acc"])
     holdout_result["calibration_exact_acc"] = float(selected["result"]["exact_acc"])
     holdout_result["selection_score"] = float(selected["calibration_score"])

@@ -34,6 +34,7 @@ DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
 DEFAULT_OT_LAMBDAS = (0.5, 1.0, 2.0, 4.0)
+SUPPORTED_ALIGNMENT_METHODS = ("ot", "cosine", "bruteforce-coupling", "bruteforce")
 
 
 def _synchronize_if_cuda(device: torch.device | str) -> None:
@@ -128,6 +129,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional comma-separated native support widths. Runs the full OT sweep separately for each width.",
     )
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
+    parser.add_argument(
+        "--alignment-method",
+        default="ot",
+        choices=SUPPORTED_ALIGNMENT_METHODS,
+        help="Stage-B PLOT row-score method: ot, cosine, or bruteforce. Default: ot",
+    )
+    parser.add_argument("--cosine-temperature", type=float, default=1.0)
+    parser.add_argument("--bruteforce-temperature", type=float, default=1.0)
     parser.add_argument("--ot-top-k-values", help="Comma-separated OT top-k values. Default: 1,2,4")
     parser.add_argument("--ot-lambdas", help="Comma-separated OT lambdas. Default: 0.5,1,2,4")
     parser.add_argument(
@@ -197,14 +206,22 @@ def _compare_payload_matches_target_vars(
     )
 
 
-def _best_ot_method_payloads(
+def _canonical_alignment_method(method: str) -> str:
+    method = str(method).lower()
+    return "bruteforce-coupling" if method == "bruteforce" else method
+
+
+def _best_alignment_method_payloads(
     ot_compare_payloads: list[dict[str, object]],
+    *,
+    method: str,
 ) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
     best_records_by_var: dict[str, dict[str, object]] = {}
     best_method_payload_by_var: dict[str, dict[str, object]] = {}
+    method = _canonical_alignment_method(method)
     for compare_payload in ot_compare_payloads:
         epsilon = float(compare_payload.get("ot_epsilon", 0.0))
-        for payload in compare_payload.get("method_payloads", {}).get("ot", []):
+        for payload in compare_payload.get("method_payloads", {}).get(method, []):
             result = payload.get("results", [{}])[0]
             target_var = str(payload.get("target_var"))
             candidate = {
@@ -212,6 +229,7 @@ def _best_ot_method_payloads(
                 "selection_score": float(result.get("selection_score", 0.0)),
                 "site_label": str(result.get("site_label", "")),
                 "epsilon": float(epsilon),
+                "method": method,
                 "selected_hyperparameters": dict(payload.get("selected_hyperparameters", {})),
             }
             previous = best_records_by_var.get(target_var)
@@ -294,6 +312,7 @@ def main() -> None:
     ot_epsilons = tuple(_parse_csv_floats(args.ot_epsilons) or list(DEFAULT_OT_EPSILONS))
     ot_top_k_values = tuple(_parse_csv_ints(args.ot_top_k_values) or list(DEFAULT_OT_TOP_K_VALUES))
     ot_lambdas = tuple(_parse_csv_floats(args.ot_lambdas) or list(DEFAULT_OT_LAMBDAS))
+    alignment_method = _canonical_alignment_method(str(args.alignment_method))
     calibration_family_weights = tuple(
         _parse_csv_floats(args.calibration_family_weights) or list(DEFAULT_CALIBRATION_FAMILY_WEIGHTS)
     )
@@ -350,11 +369,15 @@ def main() -> None:
                 signature_mode=str(args.signature_mode),
                 cache_spec=cache_spec,
             )
-            artifact_load_start = perf_counter()
-            prepared_artifacts = load_prepared_alignment_artifacts(cache_path, expected_spec=cache_spec)
-            artifact_prepare_load_seconds = float(perf_counter() - artifact_load_start)
+            signature_based_method = alignment_method in {"ot", "cosine", "uot"}
+            artifact_prepare_load_seconds = 0.0
+            prepared_artifacts = None
+            if signature_based_method:
+                artifact_load_start = perf_counter()
+                prepared_artifacts = load_prepared_alignment_artifacts(cache_path, expected_spec=cache_spec)
+                artifact_prepare_load_seconds = float(perf_counter() - artifact_load_start)
             artifact_prepare_create_seconds = 0.0
-            if prepared_artifacts is None:
+            if signature_based_method and prepared_artifacts is None:
                 print(
                     f"[stageB native] signature cache miss layer={int(layer)} width={int(native_resolution)} "
                     f"sites={len(sites)}; building one shared neural-site signature pass "
@@ -367,7 +390,7 @@ def main() -> None:
                     sites=sites,
                     device=device,
                     config=OTConfig(
-                        method="ot",
+                        method=alignment_method,
                         batch_size=int(args.batch_size),
                         epsilon=1.0,
                         signature_mode=str(args.signature_mode),
@@ -378,6 +401,8 @@ def main() -> None:
                         calibration_family_weights=calibration_family_weights,
                         top_k_values_by_var={target_var: ot_top_k_values for target_var in transport_target_vars},
                         lambda_values_by_var={target_var: ot_lambdas for target_var in transport_target_vars},
+                        cosine_temperature=float(args.cosine_temperature),
+                        bruteforce_temperature=float(args.bruteforce_temperature),
                     ),
                 )
                 artifact_prepare_create_seconds = float(perf_counter() - artifact_prepare_start)
@@ -390,7 +415,7 @@ def main() -> None:
                     f"[stageB native] signature cache saved layer={int(layer)} width={int(native_resolution)} "
                     f"path={cache_path}"
                 )
-            else:
+            elif signature_based_method:
                 print(
                     f"[stageB native] signature cache hit layer={int(layer)} width={int(native_resolution)} "
                     f"path={cache_path} loaded_from_disk={bool(prepared_artifacts.get('loaded_from_disk', False))}"
@@ -403,7 +428,7 @@ def main() -> None:
             artifact_prepare_recorded_seconds = resolve_recorded_artifact_prepare_seconds(
                 prepared_artifacts,
                 artifact_prepare_create_seconds=artifact_prepare_create_seconds,
-            )
+            ) if signature_based_method else 0.0
 
             selected_target_vars = layer_target_vars.get(int(layer), transport_target_vars)
             unknown_target_vars = tuple(
@@ -439,7 +464,7 @@ def main() -> None:
                     output_stem = (
                         f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
                         f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}"
-                        f"{target_suffix}_eps-{float(epsilon):g}_ot"
+                        f"{target_suffix}_eps-{float(epsilon):g}_{alignment_method}"
                     )
                     output_path = layer_dir / f"{output_stem}.json"
                     summary_path = layer_dir / f"{output_stem}.txt"
@@ -462,7 +487,7 @@ def main() -> None:
                                 model_name=base_run.MODEL_NAME,
                                 output_path=output_path,
                                 summary_path=summary_path,
-                                methods=("ot",),
+                                methods=(alignment_method,),
                                 target_vars=target_vars,
                                 ot_source_target_vars=transport_target_vars,
                                 batch_size=int(args.batch_size),
@@ -474,6 +499,8 @@ def main() -> None:
                                 calibration_family_weights=calibration_family_weights,
                                 ot_top_k_values_by_var={target_var: ot_top_k_values},
                                 ot_lambdas_by_var={target_var: ot_lambdas},
+                                cosine_temperature=float(args.cosine_temperature),
+                                bruteforce_temperature=float(args.bruteforce_temperature),
                                 resolution=int(native_resolution),
                                 layers=(int(layer),),
                                 token_position_ids=(DEFAULT_TOKEN_POSITION_ID,),
@@ -490,13 +517,16 @@ def main() -> None:
                 ot_localization_seconds = float(perf_counter() - ot_localization_start)
 
                 support_start = perf_counter()
-                best_ot_by_var, best_method_payload_by_var = _best_ot_method_payloads(ot_compare_payloads)
+                best_ot_by_var, best_method_payload_by_var = _best_alignment_method_payloads(
+                    ot_compare_payloads,
+                    method=alignment_method,
+                )
                 support_by_var: dict[str, dict[str, object]] = {}
                 best_method_payload = best_method_payload_by_var.get(target_var)
                 if not isinstance(best_method_payload, dict):
                     continue
                 extracted = extract_ordered_site_support(
-                    ot_run_payloads=[{"method_payloads": {"ot": [best_method_payload]}}],
+                    ot_run_payloads=[{"method_payloads": {alignment_method: [best_method_payload]}}],
                     sites=sites,
                     score_slack=0.0,
                 )
@@ -558,7 +588,7 @@ def main() -> None:
                     "support_by_var": support_by_var,
                     "support_source_by_var": {
                         target_var: {
-                            "mode": "selected_best_ot_row_only",
+                            "mode": f"selected_best_{alignment_method}_row_only",
                             "epsilon": float(best_ot_by_var.get(target_var, {}).get("epsilon", 0.0)),
                         }
                     }
@@ -571,7 +601,7 @@ def main() -> None:
                             / (
                                 f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
                                 f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}"
-                                f"{target_suffix}_eps-{float(epsilon):g}_ot.json"
+                                f"{target_suffix}_eps-{float(epsilon):g}_{alignment_method}.json"
                             )
                         )
                         for epsilon in ot_epsilons
@@ -596,7 +626,7 @@ def main() -> None:
                         "t_native_width_total_wall": float(target_wall_seconds),
                         "t_native_width_total_effective": float(effective_width_total_seconds),
                     },
-                    "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)),
+                    "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)) if prepared_artifacts else False,
                     "wall_runtime_seconds": float(target_wall_seconds),
                     "localization_runtime_seconds": float(effective_width_total_seconds),
                     "runtime_seconds": float(effective_width_total_seconds),

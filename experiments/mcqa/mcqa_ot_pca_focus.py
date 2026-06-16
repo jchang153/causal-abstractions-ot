@@ -74,6 +74,7 @@ DEFAULT_OT_LAMBDAS = (
 )
 DEFAULT_BAND_SCHEME = "equal"
 DEFAULT_BASIS_SOURCE_MODE = "all_variants"
+SUPPORTED_ALIGNMENT_METHODS = ("ot", "cosine", "bruteforce-coupling", "bruteforce")
 DEFAULT_SCREEN_MAX_EPOCHS = 25
 DEFAULT_SCREEN_MIN_EPOCHS = 2
 DEFAULT_SCREEN_MASK_NAMES = ("Selected",)
@@ -173,6 +174,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="PCA fit point cloud source. pair_bank is a compatibility alias for the canonical broad all_variants cloud.",
     )
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
+    parser.add_argument(
+        "--alignment-method",
+        default="ot",
+        choices=SUPPORTED_ALIGNMENT_METHODS,
+        help="PCA PLOT row-score method: ot, cosine, or bruteforce. Default: ot",
+    )
+    parser.add_argument("--cosine-temperature", type=float, default=1.0)
+    parser.add_argument("--bruteforce-temperature", type=float, default=1.0)
     parser.add_argument("--ot-top-k-values", help="Comma-separated OT top-k values. Default: 1,2,3,4,5")
     parser.add_argument("--ot-lambdas", help="Comma-separated OT lambdas. Default: 10,11,...,30")
     parser.add_argument(
@@ -451,6 +460,11 @@ def _canonical_basis_source_mode(value: str) -> str:
     return mode
 
 
+def _canonical_alignment_method(method: str) -> str:
+    method = str(method).lower()
+    return "bruteforce-coupling" if method == "bruteforce" else method
+
+
 def _pca_signature_cache_spec(
     *,
     fit_bank,
@@ -503,11 +517,16 @@ def _pca_signature_cache_path(*, cache_spec: dict[str, object]) -> Path:
     return base_run.SIGNATURES_DIR / stem
 
 
-def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+def _best_ot_records(
+    ot_compare_payloads: list[dict[str, object]],
+    *,
+    method: str = "ot",
+) -> dict[str, dict[str, object]]:
     best_by_var: dict[str, dict[str, object]] = {}
+    method = _canonical_alignment_method(method)
     for compare_payload in ot_compare_payloads:
         epsilon = float(compare_payload.get("ot_epsilon", 0.0))
-        for payload in compare_payload.get("method_payloads", {}).get("ot", []):
+        for payload in compare_payload.get("method_payloads", {}).get(method, []):
             result = payload.get("results", [{}])[0]
             selected_hyperparameters = payload.get("selected_hyperparameters", {})
             if not isinstance(selected_hyperparameters, dict):
@@ -518,6 +537,7 @@ def _best_ot_records(ot_compare_payloads: list[dict[str, object]]) -> dict[str, 
                 "selection_score": float(result.get("selection_score", 0.0)),
                 "site_label": str(result.get("site_label")),
                 "epsilon": float(epsilon),
+                "method": method,
                 "selected_hyperparameters": {
                     "top_k": int(selected_hyperparameters.get("top_k", result.get("top_k", 0)) or 0),
                     "lambda": float(selected_hyperparameters.get("lambda", result.get("lambda", 0.0)) or 0.0),
@@ -786,13 +806,14 @@ def _format_layer_summary(
     basis: LayerPCABasis,
     site_metrics: list[dict[str, object]],
     ot_compare_payloads: list[dict[str, object]],
+    alignment_method: str,
     support_by_var: dict[str, dict[str, object]],
     support_extraction_mode: str,
     screen_payloads: dict[str, dict[str, object]],
     guided_payloads: dict[str, dict[str, object]],
 ) -> str:
     lines = [
-        "MCQA PCA OT Summary",
+        f"MCQA PCA {str(alignment_method).upper()} Summary",
         f"layer: {int(layer)}",
         f"token_position: {token_position_id}",
         f"signature_mode: {signature_mode}",
@@ -815,10 +836,10 @@ def _format_layer_summary(
             f"var={float(metric['variance_share']):.4f}"
         )
     lines.append("")
-    lines.append("best OT by epsilon:")
-    for target_var, record in _best_ot_records(ot_compare_payloads).items():
+    lines.append(f"best {str(alignment_method).upper()} by epsilon:")
+    for target_var, record in _best_ot_records(ot_compare_payloads, method=alignment_method).items():
         lines.append(
-            f"OT[{target_var}] exact={float(record['exact_acc']):.4f} "
+            f"{str(alignment_method).upper()}[{target_var}] exact={float(record['exact_acc']):.4f} "
             f"cal={float(record['selection_score']):.4f} "
             f"eps={float(record['epsilon']):g} site={record['site_label']}"
         )
@@ -861,9 +882,9 @@ def _format_layer_summary(
     return "\n".join(lines)
 
 
-def _write_epsilon_summary(path: Path, *, payload: dict[str, object]) -> None:
+def _write_epsilon_summary(path: Path, *, payload: dict[str, object], alignment_method: str = "ot") -> None:
     lines = [
-        "MCQA PCA OT Epsilon Summary",
+        f"MCQA PCA {str(alignment_method).upper()} Epsilon Summary",
         f"layer: {int(payload['layer'])}",
         f"token_position: {payload['token_position_id']}",
         f"site_menu: {payload['site_menu']}",
@@ -875,10 +896,10 @@ def _write_epsilon_summary(path: Path, *, payload: dict[str, object]) -> None:
         f"basis_id: {payload['basis']['basis_id']}",
         "",
     ]
-    for result_payload in payload.get("method_payloads", {}).get("ot", []):
+    for result_payload in payload.get("method_payloads", {}).get(_canonical_alignment_method(alignment_method), []):
         result = result_payload.get("results", [{}])[0]
         lines.append(
-            f"OT[{result_payload.get('target_var')}] exact={float(result.get('exact_acc', 0.0)):.4f} "
+            f"{str(alignment_method).upper()}[{result_payload.get('target_var')}] exact={float(result.get('exact_acc', 0.0)):.4f} "
             f"cal={float(result.get('selection_score', 0.0)):.4f} "
             f"site={result.get('site_label')}"
         )
@@ -919,6 +940,8 @@ def _run_pca_band(
             f"got {list(target_vars)}"
         )
     target_var = str(target_vars[0])
+    alignment_method = _canonical_alignment_method(str(args.alignment_method))
+    signature_based_method = alignment_method in {"ot", "cosine", "uot"}
     target_suffix = _target_file_suffix(target_var)
     site_catalog_tag = _site_catalog_tag(
         site_menu=str(args.site_menu),
@@ -926,7 +949,7 @@ def _run_pca_band(
         band_scheme=str(args.band_scheme),
     )
     print(
-        f"[PCA OT] layer={int(layer)} bands={int(num_bands)} "
+        f"[PCA {alignment_method.upper()}] layer={int(layer)} bands={int(num_bands)} "
         f"calibrating target_var={target_var} epsilons={list(float(e) for e in ot_epsilons)}"
     )
     site_build_start = perf_counter()
@@ -955,7 +978,7 @@ def _run_pca_band(
     cache_path = _pca_signature_cache_path(cache_spec=cache_spec)
     artifact_prepare_load_seconds = 0.0
     prepared_artifacts = None
-    if bool(args.cache_signatures):
+    if signature_based_method and bool(args.cache_signatures):
         artifact_prepare_load_start = perf_counter()
         prepared_artifacts = load_prepared_alignment_artifacts(
             cache_path,
@@ -969,7 +992,7 @@ def _run_pca_band(
         output_stem = (
             f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
             f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}"
-            f"{target_suffix}_eps-{float(epsilon):g}_ot"
+            f"{target_suffix}_eps-{float(epsilon):g}_{alignment_method}"
         )
         output_path = layer_dir / f"{output_stem}.json"
         summary_path = layer_dir / f"{output_stem}.txt"
@@ -983,7 +1006,7 @@ def _run_pca_band(
                 compare_payload = None
         if compare_payload is None:
             ot_config = OTConfig(
-                method="ot",
+                method=alignment_method,
                 batch_size=int(args.batch_size),
                 epsilon=float(epsilon),
                 signature_mode=str(args.signature_mode),
@@ -995,8 +1018,10 @@ def _run_pca_band(
                 top_k_values_by_var={target_var: ot_top_k_values},
                 lambda_values_by_var={target_var: ot_lambdas},
                 store_prediction_details=False,
+                cosine_temperature=float(args.cosine_temperature),
+                bruteforce_temperature=float(args.bruteforce_temperature),
             )
-            if prepared_artifacts is None:
+            if signature_based_method and prepared_artifacts is None:
                 artifact_prepare_start = perf_counter()
                 prepared_artifacts = prepare_alignment_artifacts(
                     model=model,
@@ -1060,12 +1085,12 @@ def _run_pca_band(
                 "site_labels": [site.label for site in pca_sites],
                 "site_metrics": site_metrics,
                 "data": data_metadata,
-                "method_payloads": {"ot": method_payloads},
+                "method_payloads": {alignment_method: method_payloads},
             }
             compare_payload = _compact_compare_payload(compare_payload)
             if bool(args.write_epsilon_artifacts):
                 write_json(output_path, compare_payload)
-                _write_epsilon_summary(summary_path, payload=compare_payload)
+                _write_epsilon_summary(summary_path, payload=compare_payload, alignment_method=alignment_method)
         else:
             compare_payload = _compact_compare_payload(compare_payload)
         ot_compare_payloads.append(compare_payload)
@@ -1082,7 +1107,7 @@ def _run_pca_band(
             method_payloads = compare_payload.get("method_payloads", {})
             if not isinstance(method_payloads, dict):
                 continue
-            for method_payload in method_payloads.get("ot", []):
+            for method_payload in method_payloads.get(alignment_method, []):
                 if not isinstance(method_payload, dict):
                     continue
                 artifact_prepare_recorded_seconds = max(
@@ -1105,7 +1130,7 @@ def _run_pca_band(
         )
         write_json(support_path, support_by_var)
     support_extract_seconds = float(perf_counter() - support_start)
-    best_ot_by_var = _best_ot_records(ot_compare_payloads)
+    best_ot_by_var = _best_ot_records(ot_compare_payloads, method=alignment_method)
 
     das_screen_start = perf_counter()
     screen_payloads = _run_pca_das_from_support(
@@ -1210,6 +1235,7 @@ def _run_pca_band(
             basis=basis,
             site_metrics=site_metrics,
             ot_compare_payloads=ot_compare_payloads,
+            alignment_method=alignment_method,
             support_by_var=support_by_var,
             support_extraction_mode="selected_only",
             screen_payloads=screen_payloads,
@@ -1229,6 +1255,7 @@ def _run_pca_band(
         "basis_source_mode": str(args.basis_source_mode),
         "signature_mode": str(args.signature_mode),
         "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
+        "alignment_method": str(alignment_method),
         "basis_path": str(basis_path),
         "basis": _basis_metadata(basis=basis, basis_path=basis_path, prompt_records=prompt_records),
         "fit_prompt_record_count": 0 if prompt_records is None else len(prompt_records),
@@ -1264,7 +1291,7 @@ def _run_pca_band(
             "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
             "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
             "t_signature_prepare": float(artifact_prepare_recorded_seconds),
-            "t_stageB_pca_ot_fit_cal": float(ot_fit_cal_seconds),
+            f"t_stageB_pca_{alignment_method}_fit_cal": float(ot_fit_cal_seconds),
             "t_support_extract": float(support_extract_seconds),
             "t_stageB_pca_localization": float(localization_runtime_seconds),
             "t_layer_total_wall": float(localization_wall_runtime_seconds),
@@ -1293,7 +1320,7 @@ def _run_pca_band(
                 layer_dir / (
                     f"mcqa_layer-{int(layer)}_pos-{str(args.token_position_id)}_pca-{site_catalog_tag}"
                     f"_basis-{str(args.basis_source_mode)}_sig-{str(args.signature_mode)}"
-                    f"{target_suffix}_eps-{float(epsilon):g}_ot.json"
+                    f"{target_suffix}_eps-{float(epsilon):g}_{alignment_method}.json"
                 )
             )
             for epsilon in ot_epsilons
