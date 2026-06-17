@@ -21,7 +21,7 @@ DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_STAGE_A_TRANSPORT_METHODS = ("uot",)
-SUPPORTED_STAGE_A_TRANSPORT_METHODS = ("uot", "ot")
+SUPPORTED_STAGE_A_TRANSPORT_METHODS = ("uot", "ot", "cosine", "bruteforce-coupling", "bruteforce")
 DEFAULT_STAGE_A_UOT_BETA_NEURALS = (0.1, 0.3, 1.0, 3.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 3, 4, 5)
 DEFAULT_OT_LAMBDAS = (
@@ -107,6 +107,7 @@ def _parse_csv_floats(value: str | None) -> tuple[float, ...]:
 def _parse_stage_a_transport_methods(value: str | None) -> tuple[str, ...]:
     raw_methods = _parse_csv_strings(value) or DEFAULT_STAGE_A_TRANSPORT_METHODS
     methods = tuple(dict.fromkeys(str(method).strip().lower() for method in raw_methods if str(method).strip()))
+    methods = tuple("bruteforce-coupling" if method == "bruteforce" else method for method in methods)
     unsupported = sorted(set(methods) - set(SUPPORTED_STAGE_A_TRANSPORT_METHODS))
     if unsupported:
         raise ValueError(
