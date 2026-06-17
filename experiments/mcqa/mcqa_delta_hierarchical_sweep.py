@@ -2086,7 +2086,7 @@ def main() -> None:
     if not hf_token and not bool(args.prompt_hf_login):
         raise ValueError("HF_TOKEN (or HUGGING_FACE_HUB_TOKEN) is required unless --prompt-hf-login is set.")
 
-    repo_root = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[2]
     results_root = Path(args.results_root)
     sweep_root = results_root / f"{str(normalized['results_timestamp'])}_mcqa_hierarchical_sweep"
     manifest_path = sweep_root / "hierarchical_sweep_manifest.json"
