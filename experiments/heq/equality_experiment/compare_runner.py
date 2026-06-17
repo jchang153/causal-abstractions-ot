@@ -305,10 +305,12 @@ def run_comparison_with_banks(
 
     method_payloads: dict[str, dict[str, object]] = {}
     method_runtime_seconds: dict[str, float] = {}
+    method_runtime_breakdown_seconds: dict[str, dict[str, float]] = {}
     all_records: list[dict[str, object]] = []
     for method_index, method in enumerate(config.methods, start=1):
         print(f"[{method_index}/{len(config.methods)}] Starting {method.upper()}")
         method_start_time = perf_counter()
+        prepare_runtime_embedded_in_wall = False
         if method in {"gw", "ot", "uot", "fgw", "cosine", "bruteforce", "brute-force"}:
             ot_config = OTConfig(
                 method=method,
@@ -376,6 +378,7 @@ def run_comparison_with_banks(
                         "prepare_runtime_seconds": float(perf_counter() - prepare_start_time),
                     }
                     transport_prepare_cache[cache_key] = prepared
+                    prepare_runtime_embedded_in_wall = True
                 prepare_runtime_seconds = float(prepared.get("prepare_runtime_seconds", 0.0))
             payload = run_alignment_pipeline(
                 model=model,
@@ -411,11 +414,37 @@ def run_comparison_with_banks(
         else:
             raise ValueError(f"Unsupported method {method}")
         runtime_seconds = perf_counter() - method_start_time
-        reported_runtime_seconds = float(runtime_seconds) + float(payload.get("signature_prepare_runtime_seconds", 0.0))
+        embedded_prepare_runtime_seconds = (
+            float(payload.get("signature_prepare_runtime_seconds", 0.0))
+            if prepare_runtime_embedded_in_wall
+            else 0.0
+        )
+        reported_runtime_seconds = (
+            float(runtime_seconds)
+            + float(payload.get("signature_prepare_runtime_seconds", 0.0))
+            - float(embedded_prepare_runtime_seconds)
+        )
         payload["runtime_seconds"] = reported_runtime_seconds
         payload["wall_runtime_seconds"] = float(runtime_seconds)
+        if embedded_prepare_runtime_seconds:
+            payload["embedded_signature_prepare_runtime_seconds"] = float(embedded_prepare_runtime_seconds)
+        runtime_breakdown = {
+            "reported_runtime_seconds": float(reported_runtime_seconds),
+            "wall_runtime_seconds": float(runtime_seconds),
+            "signature_prepare_runtime_seconds": float(payload.get("signature_prepare_runtime_seconds", 0.0)),
+            "embedded_signature_prepare_runtime_seconds": float(embedded_prepare_runtime_seconds),
+            "non_embedded_signature_prepare_runtime_seconds": float(
+                payload.get("signature_prepare_runtime_seconds", 0.0)
+            )
+            - float(embedded_prepare_runtime_seconds),
+        }
+        if isinstance(payload.get("timing_seconds"), dict):
+            for key, value in payload["timing_seconds"].items():
+                runtime_breakdown[f"payload_{key}"] = float(value)
+        payload["runtime_breakdown_seconds"] = runtime_breakdown
         method_payloads[method] = payload
         method_runtime_seconds[method] = reported_runtime_seconds
+        method_runtime_breakdown_seconds[method] = runtime_breakdown
         all_records.extend(payload["results"])
         print(
             f"{method.upper()} runtime: {float(reported_runtime_seconds):.2f}s "
@@ -472,6 +501,7 @@ def run_comparison_with_banks(
         "method_selections": method_selections,
         "method_payloads": method_payloads,
         "method_runtime_seconds": method_runtime_seconds,
+        "method_runtime_breakdown_seconds": method_runtime_breakdown_seconds,
     }
     if methods_use_epsilon:
         payload["ot_epsilon"] = float(config.ot_epsilon)

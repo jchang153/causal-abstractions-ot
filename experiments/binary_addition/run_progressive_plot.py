@@ -473,35 +473,36 @@ def _run_alignment_stage(
             rotation_map=rotation_map,
         )
 
+    setup_seconds = time.perf_counter() - start_time
     trials = []
     best_trial = None
     best_key = None
     if alignment_method == "ot":
-        alignment_trials = [
-            (
-                float(eps),
-                sinkhorn_uniform_ot(
-                    cost,
-                    epsilon=float(eps),
-                    n_iter=int(transport_cfg.sinkhorn_iters),
-                    temperature=float(transport_cfg.temperature),
-                ),
-                None,
-            )
-            for eps in transport_cfg.epsilon_grid
-        ]
+        alignment_trial_specs = [(float(eps), None, None, None) for eps in transport_cfg.epsilon_grid]
     elif alignment_method == "cosine":
+        solve_start_time = time.perf_counter()
         coupling, cosine_scores = _cosine_alignment_from_diagnostics(
             diagnostics,
             temperature=float(cosine_temperature),
         )
-        alignment_trials = [(None, coupling, cosine_scores)]
+        solve_seconds = time.perf_counter() - solve_start_time
+        alignment_trial_specs = [(None, coupling, cosine_scores, solve_seconds)]
     elif alignment_method == "bruteforce":
-        alignment_trials = [(None, coupling, brute_scores)]
+        alignment_trial_specs = [(None, coupling, brute_scores, 0.0)]
     else:
         raise ValueError(f"unknown alignment_method: {alignment_method!r}")
 
-    for eps, coupling, cosine_scores in alignment_trials:
+    for eps, coupling, cosine_scores, transport_solve_seconds in alignment_trial_specs:
+        if alignment_method == "ot":
+            solve_start_time = time.perf_counter()
+            coupling = sinkhorn_uniform_ot(
+                cost,
+                epsilon=float(eps),
+                n_iter=int(transport_cfg.sinkhorn_iters),
+                temperature=float(transport_cfg.temperature),
+            )
+            transport_solve_seconds = time.perf_counter() - solve_start_time
+        trial_start_time = time.perf_counter()
         per_row = {}
         calib_sens = []
         calib_inv = []
@@ -581,17 +582,26 @@ def _run_alignment_stage(
                 trial["bruteforce_temperature"] = float(bruteforce_temperature)
             else:
                 trial["cosine_temperature"] = float(cosine_temperature)
+        trial["transport_solve_runtime_seconds"] = float(transport_solve_seconds or 0.0)
+        trial["calibration_test_runtime_seconds"] = float(time.perf_counter() - trial_start_time)
+        trial["trial_runtime_seconds"] = float(
+            float(trial["transport_solve_runtime_seconds"]) + float(trial["calibration_test_runtime_seconds"])
+        )
+        trial["runtime_seconds"] = float(setup_seconds + float(trial["trial_runtime_seconds"]))
         trials.append(trial)
         key = (float(calibration["mean_combined"]), float(calibration["mean_sensitivity"]), float(calibration["mean_invariance"]))
         if best_key is None or key > best_key:
             best_key = key
             best_trial = trial
 
-    elapsed = time.perf_counter() - start_time
+    wall_elapsed = time.perf_counter() - start_time
+    selected_runtime = float(best_trial.get("runtime_seconds", wall_elapsed)) if isinstance(best_trial, dict) else float(wall_elapsed)
     return {
         "stage": str(stage_name),
         "alignment_method": alignment_method,
-        "runtime_seconds": float(elapsed),
+        "runtime_seconds": float(selected_runtime),
+        "wall_runtime_seconds": float(wall_elapsed),
+        "setup_runtime_seconds": float(setup_seconds),
         "sites": [site.key() for site in sites],
         "fit_diagnostics": diagnostics,
         "trials": trials,
@@ -1159,11 +1169,18 @@ def _method_record(
     accuracy_source: dict[str, object],
     runtime_seconds: float,
     row_keys: Sequence[str],
+    runtime_breakdown: dict[str, float] | None = None,
 ) -> dict[str, object]:
     test = accuracy_source["test"]
+    breakdown = {
+        str(key): float(value)
+        for key, value in (runtime_breakdown or {}).items()
+    }
+    breakdown["reported_runtime_seconds"] = float(runtime_seconds)
     return {
         "method": str(name),
         "runtime_seconds": float(runtime_seconds),
+        "runtime_breakdown_seconds": breakdown,
         "mean_sensitivity": float(test["subset"]["mean_sensitivity"]),
         "mean_invariance": float(test["subset"]["mean_invariance"]),
         "mean_combined": float(test["subset"]["mean_combined"]),
@@ -1171,6 +1188,31 @@ def _method_record(
             row_key: test["per_row"][row_key]["test"] if "test" in test["per_row"][row_key] else test["per_row"][row_key]
             for row_key in row_keys
         },
+    }
+
+
+def _alignment_stage_runtime_breakdown(prefix: str, stage: dict[str, object]) -> dict[str, float]:
+    best_trial = stage.get("best_trial", {})
+    if not isinstance(best_trial, dict):
+        best_trial = {}
+    return {
+        f"{prefix}_runtime_seconds": float(stage.get("runtime_seconds", 0.0)),
+        f"{prefix}_wall_runtime_seconds": float(stage.get("wall_runtime_seconds", stage.get("runtime_seconds", 0.0))),
+        f"{prefix}_setup_runtime_seconds": float(stage.get("setup_runtime_seconds", 0.0)),
+        f"{prefix}_selected_trial_runtime_seconds": float(best_trial.get("trial_runtime_seconds", 0.0)),
+        f"{prefix}_selected_transport_solve_runtime_seconds": float(
+            best_trial.get("transport_solve_runtime_seconds", 0.0)
+        ),
+        f"{prefix}_selected_calibration_test_runtime_seconds": float(
+            best_trial.get("calibration_test_runtime_seconds", 0.0)
+        ),
+    }
+
+
+def _das_stage_runtime_breakdown(prefix: str, stage: dict[str, object]) -> dict[str, float]:
+    return {
+        f"{prefix}_runtime_seconds": float(stage.get("runtime_seconds", 0.0)),
+        f"{prefix}_wall_runtime_seconds": float(stage.get("wall_runtime_seconds", stage.get("runtime_seconds", 0.0))),
     }
 
 
@@ -1536,48 +1578,86 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         skip=bool(args.skip_das),
     )
 
+    stage_a_breakdown = _alignment_stage_runtime_breakdown("stage_a", stage_a)
+    stage_b_canonical_breakdown = _alignment_stage_runtime_breakdown("stage_b_canonical", stage_b_canonical)
+    stage_b_pca_breakdown = _alignment_stage_runtime_breakdown("stage_b_pca", stage_b_pca)
+    pca_fit_breakdown = {"pca_fit_runtime_seconds": float(pca_fit_seconds)}
+    stage_b_das_full_breakdown = _das_stage_runtime_breakdown("stage_b_das_full_timestep", stage_b_das_full)
+    stage_b_das_canonical_breakdown = _das_stage_runtime_breakdown(
+        "stage_b_das_canonical_support",
+        stage_b_das_canonical,
+    )
+    stage_b_das_pca_breakdown = _das_stage_runtime_breakdown("stage_b_das_pca_support", stage_b_das_pca)
+    full_das_breakdown = _das_stage_runtime_breakdown("full_das", full_das)
+
     methods = {
         f"stage_a_{alignment_suffix}": _method_record(
             name=f"PLOT Stage-A {alignment_label}",
             accuracy_source=stage_a["best_trial"],
             runtime_seconds=float(stage_a["runtime_seconds"]),
             row_keys=row_keys,
+            runtime_breakdown=stage_a_breakdown,
         ),
         "plot_in_timestep": _method_record(
             name=native_method_name,
             accuracy_source=stage_b_canonical["best_trial"],
             runtime_seconds=float(stage_a["runtime_seconds"]) + float(stage_b_canonical["runtime_seconds"]),
             row_keys=row_keys,
+            runtime_breakdown={
+                **stage_a_breakdown,
+                **stage_b_canonical_breakdown,
+            },
         ),
         "plot_pca_in_timestep": _method_record(
             name=pca_method_name,
             accuracy_source=stage_b_pca["best_trial"],
             runtime_seconds=float(stage_a["runtime_seconds"]) + float(pca_fit_seconds) + float(stage_b_pca["runtime_seconds"]),
             row_keys=row_keys,
+            runtime_breakdown={
+                **stage_a_breakdown,
+                **pca_fit_breakdown,
+                **stage_b_pca_breakdown,
+            },
         ),
         "plot_guided_das_full_timestep": _method_record(
             name="PLOT-guided DAS full timestep",
             accuracy_source=stage_b_das_full,
             runtime_seconds=float(stage_a["runtime_seconds"]) + float(stage_b_das_full["runtime_seconds"]),
             row_keys=row_keys,
+            runtime_breakdown={
+                **stage_a_breakdown,
+                **stage_b_das_full_breakdown,
+            },
         ),
         "plot_guided_das_canonical_support": _method_record(
             name="PLOT-guided DAS canonical support",
             accuracy_source=stage_b_das_canonical,
             runtime_seconds=float(stage_a["runtime_seconds"]) + float(stage_b_canonical["runtime_seconds"]) + float(stage_b_das_canonical["runtime_seconds"]),
             row_keys=row_keys,
+            runtime_breakdown={
+                **stage_a_breakdown,
+                **stage_b_canonical_breakdown,
+                **stage_b_das_canonical_breakdown,
+            },
         ),
         "plot_pca_guided_das": _method_record(
             name="PLOT-PCA-guided DAS",
             accuracy_source=stage_b_das_pca,
             runtime_seconds=float(stage_a["runtime_seconds"]) + float(pca_fit_seconds) + float(stage_b_pca["runtime_seconds"]) + float(stage_b_das_pca["runtime_seconds"]),
             row_keys=row_keys,
+            runtime_breakdown={
+                **stage_a_breakdown,
+                **pca_fit_breakdown,
+                **stage_b_pca_breakdown,
+                **stage_b_das_pca_breakdown,
+            },
         ),
         "full_das": _method_record(
             name="Full DAS",
             accuracy_source=full_das,
             runtime_seconds=float(full_das["runtime_seconds"]),
             row_keys=row_keys,
+            runtime_breakdown=full_das_breakdown,
         ),
     }
     if bool(args.skip_das):
@@ -1673,12 +1753,32 @@ def main() -> None:
         sens = [float(per_seed[str(seed)]["methods"][method_key]["mean_sensitivity"]) for seed in seeds]
         inv = [float(per_seed[str(seed)]["methods"][method_key]["mean_invariance"]) for seed in seeds]
         runtime = [float(per_seed[str(seed)]["methods"][method_key]["runtime_seconds"]) for seed in seeds]
+        breakdown_keys = sorted(
+            {
+                str(key)
+                for seed in seeds
+                for key in per_seed[str(seed)]["methods"][method_key].get("runtime_breakdown_seconds", {}).keys()
+            }
+        )
         aggregate_methods[method_key] = {
             "name": per_seed[str(seeds[0])]["methods"][method_key]["method"],
             "accuracy": _summary_stats(acc),
             "sensitivity": _summary_stats(sens),
             "invariance": _summary_stats(inv),
             "runtime_seconds": _summary_stats(runtime),
+            "runtime_breakdown_seconds": {
+                key: _summary_stats(
+                    [
+                        float(
+                            per_seed[str(seed)]["methods"][method_key]
+                            .get("runtime_breakdown_seconds", {})
+                            .get(key, 0.0)
+                        )
+                        for seed in seeds
+                    ]
+                )
+                for key in breakdown_keys
+            },
         }
 
     aggregate = {

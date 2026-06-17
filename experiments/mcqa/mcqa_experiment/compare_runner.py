@@ -89,6 +89,7 @@ def run_comparison(
         selected_token_position_ids=config.token_position_ids,
     )
     method_payloads: dict[str, list[dict[str, object]]] = {method: [] for method in config.methods}
+    method_runtime_breakdown_seconds: dict[str, list[dict[str, object]]] = {method: [] for method in config.methods}
     all_records: list[dict[str, object]] = []
     for method in config.methods:
         print(f"[method] start method={method} targets={list(target_vars)}")
@@ -221,6 +222,18 @@ def run_comparison(
             payload["signature_prepare_runtime_seconds"] = float(embedded_signature_prepare_runtime_seconds)
             payload["embedded_signature_prepare_runtime_seconds"] = float(embedded_signature_prepare_runtime_seconds)
             payload["recorded_signature_prepare_runtime_seconds"] = float(recorded_signature_prepare_runtime_seconds)
+            runtime_breakdown = {
+                "target_var": str(target_var),
+                "reported_runtime_seconds": float(payload["runtime_seconds"]),
+                "wall_runtime_seconds": float(payload["wall_runtime_seconds"]),
+                "signature_prepare_runtime_seconds": float(embedded_signature_prepare_runtime_seconds),
+                "recorded_signature_prepare_runtime_seconds": float(recorded_signature_prepare_runtime_seconds),
+            }
+            if isinstance(payload.get("timing_seconds"), dict):
+                for key, value in payload["timing_seconds"].items():
+                    runtime_breakdown[f"payload_{key}"] = float(value)
+            payload["runtime_breakdown_seconds"] = runtime_breakdown
+            method_runtime_breakdown_seconds[method].append(runtime_breakdown)
             method_payloads[method].append(payload)
             all_records.extend(payload["results"])
             print(
@@ -258,6 +271,7 @@ def run_comparison(
         "das_candidate_sites": [site.label for site in das_sites],
         "data": data_metadata,
         "method_payloads": method_payloads,
+        "method_runtime_breakdown_seconds": method_runtime_breakdown_seconds,
         "results": all_records,
         "method_summary": summary_records,
     }
