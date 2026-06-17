@@ -137,6 +137,8 @@ def _build_summary_lines(
         for method in config.methods
     }
     factual_metrics = dict(backbone_meta.get("factual_validation_metrics", {}))
+    methods_use_epsilon = any(str(method) in {"ot", "uot", "gw", "fgw"} for method in config.methods)
+    methods_use_uot_beta = any(str(method) == "uot" for method in config.methods)
     summary_lines = [
         "Hierarchical Equality Compare Summary",
         f"checkpoint: {config.checkpoint_path}",
@@ -173,10 +175,7 @@ def _build_summary_lines(
         f"batch_size: {config.batch_size}",
         f"resolution: {config.resolution}",
         f"fgw_alpha: {float(config.fgw_alpha):.4f}",
-        f"ot_epsilon: {float(config.ot_epsilon):.6f}",
         f"ot_tau: {float(config.ot_tau):.6f}",
-        f"uot_beta_abstract: {float(config.uot_beta_abstract):.6f}",
-        f"uot_beta_neural: {float(config.uot_beta_neural):.6f}",
         f"transport_solver_backend: {config.transport_solver_backend}",
         f"signature_mode: {config.signature_mode}",
         "ot_top_k_values: "
@@ -195,6 +194,12 @@ def _build_summary_lines(
         f"factual_validation_exact_acc: {float(factual_metrics.get('exact_acc', 0.0)):.4f}",
         "",
     ]
+    if methods_use_epsilon:
+        summary_lines.insert(12, f"ot_epsilon: {float(config.ot_epsilon):.6f}")
+    if methods_use_uot_beta:
+        insert_at = 14 if methods_use_epsilon else 13
+        summary_lines.insert(insert_at, f"uot_beta_abstract: {float(config.uot_beta_abstract):.6f}")
+        summary_lines.insert(insert_at + 1, f"uot_beta_neural: {float(config.uot_beta_neural):.6f}")
     _extend_bank_summary_lines(summary_lines, train_bank)
     _extend_bank_summary_lines(summary_lines, calibration_bank)
     _extend_bank_summary_lines(summary_lines, test_bank)
@@ -445,12 +450,12 @@ def run_comparison_with_banks(
         method_runtime_seconds=method_runtime_seconds,
         summary_records=summary_records,
     )
+    methods_use_epsilon = any(str(method) in {"ot", "uot", "gw", "fgw"} for method in config.methods)
     payload = {
         "seed": config.seed,
         "methods": list(config.methods),
         "checkpoint_path": str(config.checkpoint_path),
         "target_vars": list(config.target_vars),
-        "ot_epsilon": float(config.ot_epsilon),
         "ot_tau": float(config.ot_tau),
         "transport_solver_backend": str(config.transport_solver_backend),
         "uot_beta_abstract": float(config.uot_beta_abstract),
@@ -468,6 +473,8 @@ def run_comparison_with_banks(
         "method_payloads": method_payloads,
         "method_runtime_seconds": method_runtime_seconds,
     }
+    if methods_use_epsilon:
+        payload["ot_epsilon"] = float(config.ot_epsilon)
 
     if config.save_outputs and config.save_plots:
         plot_paths = save_comparison_plots(payload, config.output_path, method_payloads=method_payloads)

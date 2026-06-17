@@ -62,6 +62,7 @@ def run_comparison(
     prepared_ot_artifacts: dict[str, object] | None = None,
 ) -> dict[str, object]:
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in config.target_vars)
+    methods_use_epsilon = any(str(method).lower() in {"ot", "uot"} for method in config.methods)
     source_target_vars = tuple(
         canonicalize_target_var(target_var)
         for target_var in (
@@ -240,6 +241,8 @@ def run_comparison(
         "summary_path": str(config.summary_path),
         "target_vars": list(target_vars),
     }
+    if not methods_use_epsilon:
+        config_payload.pop("ot_epsilon", None)
     payload = {
         "config": config_payload,
         "model_name": config.model_name,
@@ -247,7 +250,6 @@ def run_comparison(
         "target_vars": list(target_vars),
         "ot_source_target_vars": list(source_target_vars),
         "signature_mode": config.signature_mode,
-        "ot_epsilon": float(config.ot_epsilon),
         "uot_beta_neural": float(config.uot_beta_neural),
         "resolution": None if config.resolution is None else int(config.resolution),
         "num_candidate_sites": len(ot_sites),
@@ -259,6 +261,8 @@ def run_comparison(
         "results": all_records,
         "method_summary": summary_records,
     }
+    if methods_use_epsilon:
+        payload["ot_epsilon"] = float(config.ot_epsilon)
     write_json(config.output_path, payload)
     write_text_report(config.summary_path, summary_text)
     print_results_table(all_records, "MCQA Counterfactual Test Results")

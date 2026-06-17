@@ -568,11 +568,12 @@ def _run_alignment_stage(
         }
         trial = {
             "alignment_method": alignment_method,
-            "epsilon": None if eps is None else float(eps),
             "coupling": coupling.tolist(),
             "calibration": calibration,
             "test": test,
         }
+        if eps is not None:
+            trial["epsilon"] = float(eps)
         if cosine_scores is not None:
             score_key = "bruteforce_scores" if alignment_method == "bruteforce" else "cosine_scores"
             trial[score_key] = cosine_scores.tolist()

@@ -164,6 +164,10 @@ def _format_beta_tag(beta: float) -> str:
     return f"{float(beta):.6f}".rstrip("0").rstrip(".")
 
 
+def _method_uses_epsilon(method: str) -> bool:
+    return str(method) in {"ot", "uot", "gw", "fgw"}
+
+
 def _pair_stats_from_bank(bank: PairBank) -> dict[str, object]:
     """Recompute pair stats for a concatenated bank."""
     per_variable = {}
@@ -502,9 +506,14 @@ def _build_best_method_exact_table(
         if str(source.get("source_type")) == "fixed":
             source_label = "fixed"
         elif "method" in source:
+            source_method = str(source.get("method"))
             source_label = (
-                f"sweep eps={float(source.get('ot_epsilon', 0.0)):.3g}, "
-                f"tau={float(source.get('ot_tau', 0.0)):.3g}"
+                (
+                    f"sweep eps={float(source.get('ot_epsilon', 0.0)):.3g}, "
+                    if _method_uses_epsilon(source_method)
+                    else "single alignment, "
+                )
+                + f"tau={float(source.get('ot_tau', 0.0)):.3g}"
             )
         else:
             source_label = "fixed"
@@ -537,9 +546,12 @@ def _build_transport_config_stem(
     uot_beta_neural: float,
 ) -> str:
     """Build a stable file stem for one transport sweep configuration."""
-    epsilon_tag = _format_epsilon_tag(ot_epsilon)
     tau_tag = _format_tau_tag(ot_tau)
-    stem = f"sig_{signature_mode}_epsilon_{epsilon_tag}_tau_{tau_tag}"
+    stem = f"sig_{signature_mode}"
+    if _method_uses_epsilon(method):
+        epsilon_tag = _format_epsilon_tag(ot_epsilon)
+        stem += f"_epsilon_{epsilon_tag}"
+    stem += f"_tau_{tau_tag}"
     if method == "uot":
         beta_abstract_tag = _format_beta_tag(uot_beta_abstract)
         beta_neural_tag = _format_beta_tag(uot_beta_neural)
@@ -595,10 +607,11 @@ def _build_transport_method_summary(method: str, sweep_records: list[dict[str, o
         [
             "Best Hyperparameters",
             f"signature_mode: {best.get('signature_mode')}",
-            f"ot_epsilon: {float(best.get('ot_epsilon', 0.0)):.6f}",
             f"ot_tau: {float(best.get('ot_tau', 0.0)):.6f}",
         ]
     )
+    if _method_uses_epsilon(method):
+        lines.insert(3, f"ot_epsilon: {float(best.get('ot_epsilon', 0.0)):.6f}")
     if method == "uot":
         lines.extend(
             [
@@ -650,9 +663,10 @@ def _build_transport_method_summary(method: str, sweep_records: list[dict[str, o
             f"avg={float(summary.get('exact_acc', 0.0)):.4f}",
             f"avg_inv={float(summary.get('invariant_exact_acc', 0.0)):.4f}",
             f"sig={record.get('signature_mode')}",
-            f"epsilon={float(record.get('ot_epsilon', 0.0)):.6f}",
             f"tau={float(record.get('ot_tau', 0.0)):.6f}",
         ]
+        if _method_uses_epsilon(method):
+            bits.insert(3, f"epsilon={float(record.get('ot_epsilon', 0.0)):.6f}")
         if method == "uot":
             bits.extend(
                 [
@@ -1458,10 +1472,16 @@ def _run_single_seed(seed: int) -> dict[str, object]:
                 f"[seed {seed}] [sweep {sweep_index}/{len(method_sweep_points)}] "
                 f"method={method} "
                 f"| signature_mode={signature_mode} "
-                f"| ot_epsilon={float(ot_epsilon):.6f} "
-                f"| ot_tau={float(ot_tau):.6f} "
-                f"| uot_beta_abstract={float(uot_beta_abstract):.6f} "
-                f"| uot_beta_neural={float(uot_beta_neural):.6f}"
+                + (
+                    f"| ot_epsilon={float(ot_epsilon):.6f} "
+                    if _method_uses_epsilon(method) else ""
+                )
+                + f"| ot_tau={float(ot_tau):.6f} "
+                + (
+                    f"| uot_beta_abstract={float(uot_beta_abstract):.6f} "
+                    f"| uot_beta_neural={float(uot_beta_neural):.6f}"
+                    if method == "uot" else ""
+                )
             )
             comparison = run_comparison_with_banks(
                 model=model,
@@ -1485,19 +1505,19 @@ def _run_single_seed(seed: int) -> dict[str, object]:
                 invariant_test_bank=invariant_test_bank,
                 transport_prepare_cache=transport_prepare_cache,
             )
-            epsilon_sweeps.append(
-                {
-                    "method": method,
-                    "ot_epsilon": float(ot_epsilon),
-                    "ot_tau": float(ot_tau),
-                    "uot_beta_abstract": float(uot_beta_abstract),
-                    "uot_beta_neural": float(uot_beta_neural),
-                    "signature_mode": signature_mode,
-                    "config_stem": config_stem,
-                    "methods": [method],
-                    "comparison": comparison,
-                }
-            )
+            sweep_record = {
+                "method": method,
+                "ot_tau": float(ot_tau),
+                "uot_beta_abstract": float(uot_beta_abstract),
+                "uot_beta_neural": float(uot_beta_neural),
+                "signature_mode": signature_mode,
+                "config_stem": config_stem,
+                "methods": [method],
+                "comparison": comparison,
+            }
+            if _method_uses_epsilon(method):
+                sweep_record["ot_epsilon"] = float(ot_epsilon)
+            epsilon_sweeps.append(sweep_record)
 
     best_method_runs = {}
     for record in static_runs:
@@ -1554,8 +1574,7 @@ def _run_single_seed(seed: int) -> dict[str, object]:
         write_text_report(method_summary_path, _build_transport_method_summary(method, method_records))
         best_method_runs[method] = {
             "method": method,
-            "source_type": "sweep",
-            "ot_epsilon": float(best_record.get("ot_epsilon", 0.0)),
+            "source_type": "sweep" if _method_uses_epsilon(method) else "single_alignment",
             "ot_tau": float(best_record.get("ot_tau", 0.0)),
             "uot_beta_abstract": float(best_record.get("uot_beta_abstract", 0.0)),
             "uot_beta_neural": float(best_record.get("uot_beta_neural", 0.0)),
@@ -1564,6 +1583,8 @@ def _run_single_seed(seed: int) -> dict[str, object]:
             "summary_path": str(method_summary_path),
             "comparison": comparison,
         }
+        if _method_uses_epsilon(method):
+            best_method_runs[method]["ot_epsilon"] = float(best_record.get("ot_epsilon", 0.0))
     payload["best_method_runs"] = best_method_runs
     best_method_table_records, best_method_table_text = _build_best_method_exact_table(
         list(best_method_runs.values()),
@@ -1597,6 +1618,13 @@ def _run_single_seed(seed: int) -> dict[str, object]:
                         f"uot_beta_neural: {float(record.get('uot_beta_neural', 0.0)):.6f}",
                     ]
                 )
+        elif str(record.get("source_type")) == "single_alignment":
+            section_lines.extend(
+                [
+                    f"signature_mode: {record.get('signature_mode')}",
+                    f"ot_tau: {float(record.get('ot_tau', 0.0)):.6f}",
+                ]
+            )
         section_lines.extend(["", format_method_selection_summary(method_selection)])
         best_method_sections.append("\n".join(section_lines))
 

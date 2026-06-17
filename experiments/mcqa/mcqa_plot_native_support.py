@@ -211,6 +211,23 @@ def _canonical_alignment_method(method: str) -> str:
     return "bruteforce-coupling" if method == "bruteforce" else method
 
 
+def _method_uses_epsilon(method: str) -> bool:
+    return _canonical_alignment_method(method) in {"ot", "uot"}
+
+
+def _effective_epsilons(method: str, ot_epsilons: tuple[float, ...]) -> tuple[float, ...]:
+    if _method_uses_epsilon(method):
+        return tuple(float(epsilon) for epsilon in ot_epsilons)
+    return (float(ot_epsilons[0]),)
+
+
+def _alignment_artifact_suffix(method: str, epsilon: float) -> str:
+    method = _canonical_alignment_method(method)
+    if _method_uses_epsilon(method):
+        return f"eps-{float(epsilon):g}_{method}"
+    return method
+
+
 def _best_alignment_method_payloads(
     ot_compare_payloads: list[dict[str, object]],
     *,
@@ -228,10 +245,11 @@ def _best_alignment_method_payloads(
                 "exact_acc": float(result.get("exact_acc", 0.0)),
                 "selection_score": float(result.get("selection_score", 0.0)),
                 "site_label": str(result.get("site_label", "")),
-                "epsilon": float(epsilon),
                 "method": method,
                 "selected_hyperparameters": dict(payload.get("selected_hyperparameters", {})),
             }
+            if _method_uses_epsilon(method):
+                candidate["epsilon"] = float(epsilon)
             previous = best_records_by_var.get(target_var)
             if previous is None or (
                 float(candidate["selection_score"]),
@@ -266,13 +284,18 @@ def _format_summary(
     for target_var in target_vars:
         best = best_ot_by_var.get(str(target_var), {})
         lines.append(f"[{target_var}]")
-        lines.append(
-            f"best_ot exact={float(best.get('exact_acc', 0.0)):.4f} "
-            f"cal={float(best.get('selection_score', 0.0)):.4f} "
+        eps_fragment = (
             f"eps={float(best.get('epsilon', 0.0)):g} "
+            if _method_uses_epsilon(str(best.get("method", "ot")))
+            else ""
+        )
+        lines.append(
+            f"best_{str(best.get('method', 'alignment'))} exact={float(best.get('exact_acc', 0.0)):.4f} "
+            f"cal={float(best.get('selection_score', 0.0)):.4f} "
+            f"{eps_fragment}"
             f"site={best.get('site_label')}"
         )
-        lines.append("support_source=selected_best_ot_row_only")
+        lines.append(f"support_source=selected_best_{str(best.get('method', 'alignment'))}_row_only")
         support_summary = support_by_var.get(str(target_var), {})
         if support_summary:
             lines.append(f"support masks={[candidate.get('name') for candidate in support_summary.get('mask_candidates', [])]}")
@@ -313,6 +336,7 @@ def main() -> None:
     ot_top_k_values = tuple(_parse_csv_ints(args.ot_top_k_values) or list(DEFAULT_OT_TOP_K_VALUES))
     ot_lambdas = tuple(_parse_csv_floats(args.ot_lambdas) or list(DEFAULT_OT_LAMBDAS))
     alignment_method = _canonical_alignment_method(str(args.alignment_method))
+    effective_ot_epsilons = _effective_epsilons(alignment_method, ot_epsilons)
     calibration_family_weights = tuple(
         _parse_csv_floats(args.calibration_family_weights) or list(DEFAULT_CALIBRATION_FAMILY_WEIGHTS)
     )
@@ -381,7 +405,12 @@ def main() -> None:
                 print(
                     f"[stageB native] signature cache miss layer={int(layer)} width={int(native_resolution)} "
                     f"sites={len(sites)}; building one shared neural-site signature pass "
-                    f"for transport_target_vars={list(transport_target_vars)} and reusing it across epsilons={list(float(e) for e in ot_epsilons)}"
+                    f"for transport_target_vars={list(transport_target_vars)}"
+                    + (
+                        f" and reusing it across epsilons={list(float(e) for e in effective_ot_epsilons)}"
+                        if _method_uses_epsilon(alignment_method)
+                        else ""
+                    )
                 )
                 artifact_prepare_start = perf_counter()
                 prepared_artifacts = prepare_alignment_artifacts(
@@ -422,7 +451,12 @@ def main() -> None:
                 )
                 print(
                     f"[stageB native] reuse one shared neural-site signature family "
-                    f"across transport_target_vars={list(transport_target_vars)} and epsilons={list(float(e) for e in ot_epsilons)}"
+                    f"across transport_target_vars={list(transport_target_vars)}"
+                    + (
+                        f" and epsilons={list(float(e) for e in effective_ot_epsilons)}"
+                        if _method_uses_epsilon(alignment_method)
+                        else ""
+                    )
                 )
             _synchronize_if_cuda(device)
             artifact_prepare_recorded_seconds = resolve_recorded_artifact_prepare_seconds(
@@ -457,14 +491,20 @@ def main() -> None:
                     f"calibrating target_var={target_var} from shared transport rows={list(transport_target_vars)}"
                 )
                 print(
-                    f"[stageB native] sweeping OT over layer={int(layer)} width={int(native_resolution)} "
-                    f"target_var={target_var} epsilons={list(float(e) for e in ot_epsilons)}"
+                    f"[stageB native] calibrating {alignment_method.upper()} over layer={int(layer)} "
+                    f"width={int(native_resolution)} target_var={target_var}"
+                    + (
+                        f" epsilons={list(float(e) for e in effective_ot_epsilons)}"
+                        if _method_uses_epsilon(alignment_method)
+                        else ""
+                    )
                 )
-                for epsilon in ot_epsilons:
+                for epsilon in effective_ot_epsilons:
+                    artifact_suffix = _alignment_artifact_suffix(alignment_method, float(epsilon))
                     output_stem = (
                         f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
                         f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}"
-                        f"{target_suffix}_eps-{float(epsilon):g}_{alignment_method}"
+                        f"{target_suffix}_{artifact_suffix}"
                     )
                     output_path = layer_dir / f"{output_stem}.json"
                     summary_path = layer_dir / f"{output_stem}.txt"
@@ -510,7 +550,8 @@ def main() -> None:
                     else:
                         print(
                             f"[stageB native] reusing compare payload layer={int(layer)} width={int(native_resolution)} "
-                            f"target_var={target_var} epsilon={float(epsilon):g}"
+                            f"target_var={target_var}"
+                            + (f" epsilon={float(epsilon):g}" if _method_uses_epsilon(alignment_method) else "")
                         )
                     ot_compare_payloads.append(compare_payload)
                 _synchronize_if_cuda(device)
@@ -578,7 +619,10 @@ def main() -> None:
                     "target_vars": [target_var],
                     "transport_target_vars": [str(source_var) for source_var in transport_target_vars],
                     "native_resolutions": [int(resolution) for resolution in native_resolutions],
-                    "ot_epsilons": [float(epsilon) for epsilon in ot_epsilons],
+                    "ot_epsilons": [float(epsilon) for epsilon in effective_ot_epsilons]
+                    if _method_uses_epsilon(alignment_method)
+                    else [],
+                    "alignment_method": str(alignment_method),
                     "ot_top_k_values": [int(value) for value in ot_top_k_values],
                     "ot_lambdas": [float(value) for value in ot_lambdas],
                     "calibration_family_weights": [float(weight) for weight in calibration_family_weights],
@@ -589,7 +633,11 @@ def main() -> None:
                     "support_source_by_var": {
                         target_var: {
                             "mode": f"selected_best_{alignment_method}_row_only",
-                            "epsilon": float(best_ot_by_var.get(target_var, {}).get("epsilon", 0.0)),
+                            **(
+                                {"epsilon": float(best_ot_by_var.get(target_var, {}).get("epsilon", 0.0))}
+                                if _method_uses_epsilon(alignment_method)
+                                else {}
+                            ),
                         }
                     }
                     if target_var in best_ot_by_var
@@ -601,10 +649,10 @@ def main() -> None:
                             / (
                                 f"mcqa_plot_native_support_layer-{int(layer)}_pos-{DEFAULT_TOKEN_POSITION_ID}"
                                 f"_atomic-{int(native_resolution)}_sig-{str(args.signature_mode)}"
-                                f"{target_suffix}_eps-{float(epsilon):g}_{alignment_method}.json"
+                                f"{target_suffix}_{_alignment_artifact_suffix(alignment_method, float(epsilon))}.json"
                             )
                         )
-                        for epsilon in ot_epsilons
+                        for epsilon in effective_ot_epsilons
                     ],
                     "summary_path": str(summary_path),
                     "context_timing_seconds": context_timing_seconds,
