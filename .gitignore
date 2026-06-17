@@ -6,9 +6,14 @@ tests/__pycache__/
 models/
 paper/
 results/
+signatures/
 synthetic_datasets/
 .DS_Store
 MIB/
+.venv/
+.cache/
+hf-cache/
+mcqa_plot_*_mcqa_*/
 
 # LaTeX build artifacts
 paper/*.aux

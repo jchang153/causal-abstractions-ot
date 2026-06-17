@@ -14,7 +14,6 @@ from .metrics import (
     _gather_label_logits,
     build_family_label_signature,
     build_family_signature,
-    gather_variable_logits,
     structured_output_features,
 )
 from .pca import LayerPCABasis
@@ -38,10 +37,10 @@ def signature_from_logits(
     """Convert factual/counterfactual logits into one site-effect signature."""
     if signature_mode == "whole_vocab_kl_t1":
         return _per_example_kl(counterfactual_logits, base_logits).reshape(-1)
-    if signature_mode == "answer_logit_delta":
-        counterfactual_target_logits = gather_variable_logits(counterfactual_logits, bank)
-        base_target_logits = gather_variable_logits(base_logits, bank)
-        return (counterfactual_target_logits - base_target_logits).reshape(-1)
+    if signature_mode == "label_logit_delta":
+        counterfactual_label_logits = _gather_label_logits(counterfactual_logits, bank)
+        base_label_logits = _gather_label_logits(base_logits, bank)
+        return (counterfactual_label_logits - base_label_logits).reshape(-1)
     if signature_mode in {"family_slot_label_delta", "family_slot_label_delta_norm"}:
         counterfactual_features = structured_output_features(counterfactual_logits, bank)
         base_features = structured_output_features(base_logits, bank)

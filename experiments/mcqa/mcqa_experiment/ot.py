@@ -34,6 +34,7 @@ def _synchronize_if_cuda(device: torch.device | str) -> None:
 def _shared_site_signature_mode(signature_mode: str) -> bool:
     return signature_mode in {
         "whole_vocab_kl_t1",
+        "label_logit_delta",
         "family_slot_label_delta",
         "family_slot_label_delta_norm",
         "family_label_delta",

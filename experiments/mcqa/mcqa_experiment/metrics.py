@@ -307,23 +307,34 @@ def build_variable_signature(bank: MCQAPairBank, signature_mode: str) -> torch.T
     canonical_target_var = canonicalize_target_var(bank.target_var)
     if signature_mode == "whole_vocab_kl_t1":
         return bank.changed_mask.to(torch.float32)
-    if signature_mode == "answer_logit_delta":
+    if signature_mode == "label_logit_delta":
+        base_answer_indices = torch.tensor(
+            [ALPHABET_LABELS.index(str(output["answer"]).strip()) for output in bank.base_outputs],
+            dtype=torch.long,
+        )
         if canonical_target_var == "answer_pointer":
-            source_onehot = F.one_hot(bank.labels.to(torch.long), num_classes=4).to(torch.float32)
-            base_pointer_indices = torch.tensor(
-                [int(output["answer_pointer"]) for output in bank.base_outputs],
+            source_pointer_indices = torch.tensor(
+                [int(output["answer_pointer"]) for output in bank.source_outputs],
                 dtype=torch.long,
             )
-            base_onehot = F.one_hot(base_pointer_indices, num_classes=4).to(torch.float32)
-            return (source_onehot - base_onehot).reshape(-1)
-        if canonical_target_var == "answer_token":
-            source_onehot = F.one_hot(bank.labels.to(torch.long), num_classes=26).to(torch.float32)
-            base_answer_indices = torch.tensor(
-                [ALPHABET_LABELS.index(str(output["answer"]).strip()) for output in bank.base_outputs],
+            target_label_indices = torch.tensor(
+                [
+                    ALPHABET_LABELS.index(str(bank.base_inputs[index][f"symbol{int(source_pointer)}"]).strip())
+                    for index, source_pointer in enumerate(source_pointer_indices.tolist())
+                ],
                 dtype=torch.long,
             )
-            base_onehot = F.one_hot(base_answer_indices, num_classes=26).to(torch.float32)
-            return (source_onehot - base_onehot).reshape(-1)
+        elif canonical_target_var == "answer_token":
+            target_label_indices = torch.tensor(
+                [ALPHABET_LABELS.index(str(output["answer"]).strip()) for output in bank.source_outputs],
+                dtype=torch.long,
+            )
+        else:
+            raise ValueError(f"Unsupported MCQA target variable {bank.target_var}")
+        return (
+            F.one_hot(target_label_indices, num_classes=STRUCTURED_LABEL_DIM).to(torch.float32)
+            - F.one_hot(base_answer_indices, num_classes=STRUCTURED_LABEL_DIM).to(torch.float32)
+        ).reshape(-1)
     if signature_mode in {"family_slot_label_delta", "family_slot_label_delta_norm"}:
         batch_size = bank.size
         slot_delta = torch.zeros((batch_size, STRUCTURED_SLOT_DIM), dtype=torch.float32)
