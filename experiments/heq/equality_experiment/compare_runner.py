@@ -329,7 +329,8 @@ def run_comparison_with_banks(
             )
             prepared = None
             prepare_runtime_seconds = 0.0
-            if transport_prepare_cache is not None:
+            uses_signature_prepare = method not in {"bruteforce", "brute-force"}
+            if uses_signature_prepare and transport_prepare_cache is not None:
                 cache_key = (
                     int(config.resolution),
                     str(getattr(config, "signature_mode", "prob_delta")),

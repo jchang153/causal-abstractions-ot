@@ -13,8 +13,6 @@ from .intervention import forward_factual_logits, run_soft_site_intervention
 from .metrics import (
     _gather_label_logits,
     build_family_label_signature,
-    build_family_signature,
-    structured_output_features,
 )
 from .pca import LayerPCABasis
 from .sites import SiteLike
@@ -27,6 +25,16 @@ def _per_example_kl(counterfactual_logits: torch.Tensor, base_logits: torch.Tens
     return torch.sum(counterfactual_probs * (counterfactual_log_probs - base_log_probs), dim=-1)
 
 
+def _per_example_tv(counterfactual_logits: torch.Tensor, base_logits: torch.Tensor) -> torch.Tensor:
+    base_probs = torch.softmax(base_logits, dim=-1)
+    counterfactual_probs = torch.softmax(counterfactual_logits, dim=-1)
+    return 0.5 * torch.sum(torch.abs(counterfactual_probs - base_probs), dim=-1)
+
+
+def _bounded_kl_transform(values: torch.Tensor) -> torch.Tensor:
+    return 1.0 - torch.exp(-values.to(torch.float32))
+
+
 def signature_from_logits(
     *,
     counterfactual_logits: torch.Tensor,
@@ -36,26 +44,20 @@ def signature_from_logits(
 ) -> torch.Tensor:
     """Convert factual/counterfactual logits into one site-effect signature."""
     if signature_mode == "whole_vocab_kl_t1":
-        return _per_example_kl(counterfactual_logits, base_logits).reshape(-1)
+        return _bounded_kl_transform(_per_example_kl(counterfactual_logits, base_logits)).reshape(-1)
+    if signature_mode == "whole_vocab_tv_t1":
+        return _per_example_tv(counterfactual_logits, base_logits).reshape(-1)
     if signature_mode == "label_logit_delta":
         counterfactual_label_logits = _gather_label_logits(counterfactual_logits, bank)
         base_label_logits = _gather_label_logits(base_logits, bank)
         return (counterfactual_label_logits - base_label_logits).reshape(-1)
-    if signature_mode in {"family_slot_label_delta", "family_slot_label_delta_norm"}:
-        counterfactual_features = structured_output_features(counterfactual_logits, bank)
-        base_features = structured_output_features(base_logits, bank)
-        return build_family_signature(
-            counterfactual_features - base_features,
-            bank,
-            normalize_blocks=(signature_mode == "family_slot_label_delta_norm"),
-        )
-    if signature_mode in {"family_label_delta", "family_label_delta_norm", "family_label_logit_delta", "family_label_logit_delta_norm"}:
+    if signature_mode == "family_label_delta_norm":
         counterfactual_features = _gather_label_logits(counterfactual_logits, bank)
         base_features = _gather_label_logits(base_logits, bank)
         return build_family_label_signature(
             counterfactual_features - base_features,
             bank,
-            normalize_blocks=signature_mode in {"family_label_delta_norm", "family_label_logit_delta_norm"},
+            normalize_blocks=True,
         )
     raise ValueError(f"Unsupported signature_mode={signature_mode}")
 

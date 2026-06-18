@@ -212,6 +212,17 @@ def _float_matches(lhs: object, rhs: object, *, tol: float = 1e-9) -> bool:
     return abs(_as_float(lhs) - _as_float(rhs)) <= float(tol)
 
 
+def _iter_method_payloads(method_payloads: object) -> Iterable[dict[str, object]]:
+    if not isinstance(method_payloads, dict):
+        return
+    for payload_list in method_payloads.values():
+        if not isinstance(payload_list, list):
+            continue
+        for method_payload in payload_list:
+            if isinstance(method_payload, dict):
+                yield method_payload
+
+
 def _native_selected_width_epsilon_runtime(
     *,
     rankings: dict[str, object],
@@ -290,12 +301,7 @@ def _native_selected_width_epsilon_runtime(
             if not isinstance(compare_payload, dict):
                 continue
             epsilon = _as_float(compare_payload.get("ot_epsilon"))
-            method_payloads = compare_payload.get("method_payloads", {})
-            if not isinstance(method_payloads, dict):
-                continue
-            for method_payload in method_payloads.get("ot", []):
-                if not isinstance(method_payload, dict):
-                    continue
+            for method_payload in _iter_method_payloads(compare_payload.get("method_payloads", {})):
                 target_var = str(method_payload.get("target_var"))
                 if target_var not in TARGET_VARS:
                     continue
@@ -411,12 +417,7 @@ def _pca_selected_config_epsilon_runtime(
             if not isinstance(compare_payload, dict):
                 continue
             epsilon = _as_float(compare_payload.get("ot_epsilon"))
-            method_payloads = compare_payload.get("method_payloads", {})
-            if not isinstance(method_payloads, dict):
-                continue
-            for method_payload in method_payloads.get("ot", []):
-                if not isinstance(method_payload, dict):
-                    continue
+            for method_payload in _iter_method_payloads(compare_payload.get("method_payloads", {})):
                 target_var = str(method_payload.get("target_var"))
                 if target_var not in TARGET_VARS:
                     continue
@@ -434,6 +435,18 @@ def _pca_selected_config_epsilon_runtime(
             full_config_runtime_grid[(target_var, layer, basis_source_mode, site_menu, num_bands)] = float(
                 config_setup_seconds + core_runtime_seconds
             )
+
+        if not payload.get("ot_output_paths"):
+            for target_var, method_record in (payload.get("method_by_var", {}) or {}).items():
+                if target_var not in TARGET_VARS or not isinstance(method_record, dict):
+                    continue
+                runtime_seconds = _as_float(payload.get("runtime_seconds", payload.get("wall_runtime_seconds")))
+                full_config_runtime_grid[(str(target_var), layer, basis_source_mode, site_menu, num_bands)] = float(
+                    runtime_seconds
+                )
+                runtime_grid[(str(target_var), layer, basis_source_mode, site_menu, num_bands, _as_float(method_record.get("epsilon"), -1.0))] = float(
+                    runtime_seconds
+                )
 
     if not bool(restrict_to_selected_config) or not bool(restrict_to_selected_epsilon):
         downstream_by_var: dict[str, float] = {}
@@ -518,12 +531,18 @@ def _stage_a_selected_plan_runtime(
 
     selected_joint_config = stage_a_payload.get("selected_joint_config")
     if isinstance(selected_joint_config, dict):
+        selected_method = str(selected_joint_config.get("method", "")).lower()
         shared_runtime_seconds = _as_float(
             selected_joint_config.get(
                 "runtime_with_signatures_seconds",
                 selected_joint_config.get("runtime_seconds"),
             )
         )
+        if "bruteforce" in selected_method or "brute-force" in selected_method:
+            shared_runtime_seconds = max(
+                0.0,
+                shared_runtime_seconds - _as_float(selected_joint_config.get("signature_prepare_runtime_seconds")),
+            )
         if shared_runtime_seconds > 0.0:
             downstream_by_var = {
                 str(target_var): (shared_runtime_seconds if entries_by_var.get(str(target_var)) else 0.0)
@@ -532,7 +551,7 @@ def _stage_a_selected_plan_runtime(
             selected_records = {
                 str(target_var): {
                     "target_var": str(target_var),
-                    "method": "uot",
+                    "method": str(selected_joint_config.get("method", "transport")),
                     "epsilon": _as_float(selected_joint_config.get("epsilon")),
                     "uot_beta_neural": (
                         None
@@ -734,8 +753,8 @@ def build_paper_runtime_summary(
     native_downstream, native_parallel_by_var, native_runtime_by_layer_by_var = _native_selected_width_epsilon_runtime(
         rankings=native_rankings,
         entries_by_var=native_entries,
-        restrict_to_selected_width=False,
-        restrict_to_selected_epsilon=False,
+        restrict_to_selected_width=True,
+        restrict_to_selected_epsilon=True,
     )
     native_shared_by_layer = {
         layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in native_runtime_by_layer_by_var.values())
@@ -752,7 +771,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=native_serial,
             parallel_downstream_seconds=native_parallel,
             shared_runtime_seconds_by_layer=native_shared_by_layer,
-            notes="Stage A plus the full native-support localization sweep over all executed widths and epsilons for the Stage B-selected layers.",
+            notes="Stage A plus selected native-support localization runtime. For OT/PLOT, this restricts to the selected width and selected epsilon; runtimes are summed over abstract variables.",
         )
     )
 
@@ -760,8 +779,8 @@ def build_paper_runtime_summary(
     pca_downstream, pca_parallel_by_var, pca_runtime_by_layer_by_var = _pca_selected_config_epsilon_runtime(
         rankings=pca_rankings,
         entries_by_var=pca_entries,
-        restrict_to_selected_config=False,
-        restrict_to_selected_epsilon=False,
+        restrict_to_selected_config=True,
+        restrict_to_selected_epsilon=True,
     )
     pca_shared_by_layer = {
         layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in pca_runtime_by_layer_by_var.values())
@@ -778,7 +797,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=pca_serial,
             parallel_downstream_seconds=pca_parallel,
             shared_runtime_seconds_by_layer=pca_shared_by_layer,
-            notes="Stage A plus the full PCA-support localization sweep over all executed PCA configs and epsilons for the Stage B-selected layers.",
+            notes="Stage A plus selected PCA-support localization runtime, summed over abstract variables. When per-epsilon child payloads are present this restricts to the selected epsilon; otherwise it uses the selected config's recorded runtime.",
         )
     )
 

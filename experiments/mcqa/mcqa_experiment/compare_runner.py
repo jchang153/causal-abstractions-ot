@@ -28,7 +28,7 @@ class CompareExperimentConfig:
     batch_size: int = 16
     ot_epsilon: float = 1.0
     uot_beta_neural: float = 1.0
-    signature_mode: str = "family_slot_label_delta"
+    signature_mode: str = "family_label_delta_norm"
     ot_top_k_values: tuple[int, ...] | None = None
     ot_lambdas: tuple[float, ...] = (1.0,)
     calibration_metric: str = "exact_acc"

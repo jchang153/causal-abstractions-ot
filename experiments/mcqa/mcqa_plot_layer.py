@@ -743,11 +743,16 @@ def _select_joint_layer_config(
             row_top_k=row_top_k,
         )
         shortlist_runtime_seconds = float(candidate_config.get("calibration_sweep_runtime_seconds", 0.0))
-        candidate_config["signature_prepare_runtime_seconds"] = float(signature_prepare_runtime_seconds)
+        candidate_method = str(candidate_config.get("method", "transport")).lower()
+        effective_signature_prepare_seconds = (
+            0.0 if "bruteforce" in candidate_method or "brute-force" in candidate_method
+            else float(signature_prepare_runtime_seconds)
+        )
+        candidate_config["signature_prepare_runtime_seconds"] = float(effective_signature_prepare_seconds)
         candidate_config["transport_solve_runtime_seconds"] = float(compare_payload.get("runtime_seconds", 0.0))
         candidate_config["direct_eval_runtime_seconds"] = float(shortlist_runtime_seconds)
         candidate_config["runtime_with_signatures_seconds"] = float(
-            signature_prepare_runtime_seconds
+            effective_signature_prepare_seconds
             + float(compare_payload.get("runtime_seconds", 0.0))
             + shortlist_runtime_seconds
         )

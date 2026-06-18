@@ -463,6 +463,8 @@ def main() -> None:
                 prepared_artifacts,
                 artifact_prepare_create_seconds=artifact_prepare_create_seconds,
             ) if signature_based_method else 0.0
+            if alignment_method in {"bruteforce-coupling", "bruteforce", "brute-force-coupling"}:
+                artifact_prepare_recorded_seconds = 0.0
 
             selected_target_vars = layer_target_vars.get(int(layer), transport_target_vars)
             unknown_target_vars = tuple(

@@ -48,7 +48,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.token_position_ids is None:
             args.token_position_ids = "correct_symbol,correct_symbol_period,last_token"
         if args.signature_modes is None:
-            args.signature_modes = "family_slot_label_delta"
+            args.signature_modes = "family_label_delta_norm"
         if args.resolutions is None:
             args.resolutions = "full"
         if args.ot_epsilons is None:
@@ -73,7 +73,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.token_position_ids is None:
             args.token_position_ids = "correct_symbol,correct_symbol_period,last_token"
         if args.signature_modes is None:
-            args.signature_modes = "family_slot_label_delta"
+            args.signature_modes = "family_label_delta_norm"
         if args.resolutions is None:
             args.resolutions = "full"
         if args.ot_epsilons is None:
@@ -98,7 +98,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.token_position_ids is None:
             args.token_position_ids = "correct_symbol,correct_symbol_period,last_token"
         if args.signature_modes is None:
-            args.signature_modes = "family_slot_label_delta_norm"
+            args.signature_modes = "family_label_delta_norm"
         if args.resolutions is None:
             args.resolutions = "full"
         if args.ot_epsilons is None:
@@ -127,7 +127,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.token_position_ids is None:
             args.token_position_ids = "correct_symbol,correct_symbol_period,last_token"
         if args.signature_modes is None:
-            args.signature_modes = "family_slot_label_delta_norm"
+            args.signature_modes = "family_label_delta_norm"
         if args.resolutions is None:
             args.resolutions = "full"
         if args.ot_epsilons is None:

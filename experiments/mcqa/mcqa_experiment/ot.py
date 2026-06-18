@@ -34,13 +34,9 @@ def _synchronize_if_cuda(device: torch.device | str) -> None:
 def _shared_site_signature_mode(signature_mode: str) -> bool:
     return signature_mode in {
         "whole_vocab_kl_t1",
+        "whole_vocab_tv_t1",
         "label_logit_delta",
-        "family_slot_label_delta",
-        "family_slot_label_delta_norm",
-        "family_label_delta",
         "family_label_delta_norm",
-        "family_label_logit_delta",
-        "family_label_logit_delta_norm",
     }
 
 
@@ -217,7 +213,7 @@ class OTConfig:
     uot_beta_neural: float = 1.0
     max_iter: int = 500
     tol: float = 1e-9
-    signature_mode: str = "family_slot_label_delta"
+    signature_mode: str = "family_label_delta_norm"
     top_k_values: tuple[int, ...] | None = None
     lambda_values: tuple[float, ...] = (1.0,)
     selection_verbose: bool = True

@@ -1216,7 +1216,12 @@ def run_alignment_pipeline(
 ) -> dict[str, object]:
     """Run OT, GW, or FGW end to end on shared pair-bank splits."""
     device = torch.device(device)
-    if prepared is None:
+    method_key = str(config.method).lower()
+    if prepared is None and method_key in {"bruteforce", "brute-force"}:
+        prepared = {
+            "sites": enumerate_canonical_sites(model, resolution=config.resolution),
+        }
+    elif prepared is None:
         sites = enumerate_canonical_sites(model, resolution=config.resolution)
         base_logits = collect_base_logits(model, fit_bank.base_inputs, config.batch_size, device)
         site_signatures = collect_site_signatures(
@@ -1267,34 +1272,35 @@ def run_alignment_pipeline(
             f"| holdout_examples={_resolve_bank_for_variable(holdout_bank, config.target_vars[0]).size} "
             f"| sites={len(sites)}"
         )
-    site_signatures = prepared["site_signatures"]
-    variable_signatures = prepared["variable_signatures"]
-    cost_var = prepared["cost_var"]
-    cost_site = prepared["cost_site"]
-    p = np.ones(variable_signatures.shape[0], dtype=np.float64) / float(variable_signatures.shape[0])
-    q = np.ones(site_signatures.shape[0], dtype=np.float64) / float(site_signatures.shape[0])
-
-    if config.method == "gw":
-        transport, transport_meta = solve_gw_transport(cost_var, cost_site, p, q, config)
+    if method_key in {"bruteforce", "brute-force"}:
+        transport, transport_meta = solve_bruteforce_alignment(
+            model=model,
+            fit_bank=fit_bank,
+            sites=sites,
+            target_vars=tuple(config.target_vars),
+            config=config,
+            device=device,
+        )
     else:
+        site_signatures = prepared["site_signatures"]
+        variable_signatures = prepared["variable_signatures"]
+        cost_var = prepared["cost_var"]
+        cost_site = prepared["cost_site"]
+        p = np.ones(variable_signatures.shape[0], dtype=np.float64) / float(variable_signatures.shape[0])
+        q = np.ones(site_signatures.shape[0], dtype=np.float64) / float(site_signatures.shape[0])
+
+    if method_key == "gw":
+        transport, transport_meta = solve_gw_transport(cost_var, cost_site, p, q, config)
+    elif method_key not in {"bruteforce", "brute-force"}:
         cost_cross = prepared["cost_cross"]
-        if config.method == "ot":
+        if method_key == "ot":
             transport, transport_meta = solve_ot_transport(variable_signatures, site_signatures, config)
-        elif config.method == "uot":
+        elif method_key == "uot":
             transport, transport_meta = solve_uot_transport(variable_signatures, site_signatures, config)
-        elif config.method == "fgw":
+        elif method_key == "fgw":
             transport, transport_meta = solve_fgw_transport(cost_cross, cost_var, cost_site, p, q, config)
-        elif config.method == "cosine":
+        elif method_key == "cosine":
             transport, transport_meta = solve_cosine_alignment(variable_signatures, site_signatures, config)
-        elif config.method in {"bruteforce", "brute-force"}:
-            transport, transport_meta = solve_bruteforce_alignment(
-                model=model,
-                fit_bank=fit_bank,
-                sites=sites,
-                target_vars=tuple(config.target_vars),
-                config=config,
-                device=device,
-            )
         else:
             raise ValueError(f"Unsupported alignment method {config.method}")
 

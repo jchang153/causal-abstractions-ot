@@ -1268,8 +1268,8 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
 
     transport_stage_a = _make_transport_config(
         epsilons=_parse_floats(args.stage_a_epsilons),
-        top_k_grid=_parse_ints(args.stage_a_top_k_grid),
-        lambda_grid=_parse_floats(args.ot_lambda_grid),
+        top_k_grid=(1,),
+        lambda_grid=(1.0,),
         sinkhorn_iters=int(args.sinkhorn_iters),
     )
     transport_stage_b = _make_transport_config(

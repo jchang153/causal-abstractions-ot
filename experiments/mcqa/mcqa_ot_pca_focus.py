@@ -1136,7 +1136,9 @@ def _run_pca_band(
         prepared_artifacts,
         artifact_prepare_create_seconds=artifact_prepare_create_seconds,
     )
-    if artifact_prepare_recorded_seconds <= 0.0:
+    if alignment_method in {"bruteforce-coupling", "bruteforce", "brute-force-coupling"}:
+        artifact_prepare_recorded_seconds = 0.0
+    elif artifact_prepare_recorded_seconds <= 0.0:
         for compare_payload in ot_compare_payloads:
             if not isinstance(compare_payload, dict):
                 continue
