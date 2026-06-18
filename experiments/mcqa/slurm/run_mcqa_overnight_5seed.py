@@ -92,7 +92,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-b-top-layers-per-var", type=int, default=3)
     parser.add_argument("--stage-b-neighbor-radius", type=int, default=0)
     parser.add_argument("--stage-b-max-layers-per-var", type=int, default=3)
-    parser.add_argument("--native-resolutions", default="32,64,128,256")
+    parser.add_argument("--native-resolutions", default="128,144,192,256,288,384,576,768")
     parser.add_argument("--pca-site-menus", default="partition")
     parser.add_argument("--pca-basis-source-modes", default="all_variants")
     parser.add_argument("--pca-num-bands-values", default="8,16")

@@ -57,7 +57,7 @@ TOKEN_POSITION_IDS = ["correct_symbol", "correct_symbol_period", "last_token"]
 
 BATCH_SIZE = 64 
 
-RESOLUTIONS = [None]
+RESOLUTIONS = [128, 144, 192, 256, 288, 384, 576, 768]
 OT_EPSILONS = [0.5, 1.0, 2.0]
 UOT_BETA_NEURALS = [0.1, 0.3, 1.0, 3.0]
 SIGNATURE_MODES = ["family_label_delta_norm"]

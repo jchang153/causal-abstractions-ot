@@ -8,6 +8,9 @@ from pathlib import Path
 import mcqa_run as base_run
 
 
+DEFAULT_RESOLUTION_SWEEP = "128,144,192,256,288,384,576,768"
+
+
 def _parse_csv_strings(value: str | None) -> list[str] | None:
     if value is None:
         return None
@@ -50,7 +53,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.signature_modes is None:
             args.signature_modes = "family_label_delta_norm"
         if args.resolutions is None:
-            args.resolutions = "full"
+            args.resolutions = DEFAULT_RESOLUTION_SWEEP
         if args.ot_epsilons is None:
             args.ot_epsilons = "0.5,1,2"
         if args.ot_top_k_values is None:
@@ -75,7 +78,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.signature_modes is None:
             args.signature_modes = "family_label_delta_norm"
         if args.resolutions is None:
-            args.resolutions = "full"
+            args.resolutions = DEFAULT_RESOLUTION_SWEEP
         if args.ot_epsilons is None:
             args.ot_epsilons = "0.5,1,2"
         if args.ot_top_k_values is None:
@@ -100,7 +103,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.signature_modes is None:
             args.signature_modes = "family_label_delta_norm"
         if args.resolutions is None:
-            args.resolutions = "full"
+            args.resolutions = DEFAULT_RESOLUTION_SWEEP
         if args.ot_epsilons is None:
             args.ot_epsilons = "0.25,0.5,1,2,4"
         if args.ot_top_k_values is None:
@@ -129,7 +132,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.signature_modes is None:
             args.signature_modes = "family_label_delta_norm"
         if args.resolutions is None:
-            args.resolutions = "full"
+            args.resolutions = DEFAULT_RESOLUTION_SWEEP
         if args.ot_epsilons is None:
             args.ot_epsilons = "0.25,0.5,1,2,4"
         if args.ot_top_k_values is None:

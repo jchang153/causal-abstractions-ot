@@ -27,7 +27,7 @@ from mcqa_experiment.support import extract_ordered_site_support
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
 DEFAULT_TOKEN_POSITION_ID = "last_token"
-DEFAULT_NATIVE_RESOLUTIONS = [16, 32, 128, 256]
+DEFAULT_NATIVE_RESOLUTIONS = [128, 144, 192, 256, 288, 384, 576, 768]
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
