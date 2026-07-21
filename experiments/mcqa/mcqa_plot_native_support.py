@@ -577,7 +577,16 @@ def main() -> None:
                 if isinstance(support_summary, dict):
                     support_by_var[target_var] = support_summary
                 support_extract_seconds = float(perf_counter() - support_start)
-                target_wall_seconds = float(shared_width_seconds + ot_localization_seconds + support_extract_seconds)
+                best_method_wall_seconds = float(
+                    best_method_payload.get(
+                        "wall_runtime_seconds",
+                        best_method_payload.get("runtime_seconds", ot_localization_seconds),
+                    )
+                    or 0.0
+                )
+                if best_method_wall_seconds <= 0.0:
+                    best_method_wall_seconds = float(ot_localization_seconds)
+                target_wall_seconds = float(shared_width_seconds + best_method_wall_seconds + support_extract_seconds)
                 effective_width_total_seconds = adjust_runtime_for_cached_signatures(
                     wall_runtime_seconds=target_wall_seconds,
                     artifact_prepare_load_seconds=artifact_prepare_load_seconds,
@@ -671,12 +680,20 @@ def main() -> None:
                         "t_artifact_prepare_create": float(artifact_prepare_create_seconds),
                         "t_artifact_prepare_recorded": float(artifact_prepare_recorded_seconds),
                         "t_signature_prepare": float(artifact_prepare_recorded_seconds),
-                        "t_stageB_native_ot_localization": float(ot_localization_seconds),
+                        "t_stageB_native_selected_method_wall": float(best_method_wall_seconds),
+                        "t_stageB_native_all_epsilon_sweep_wall": float(ot_localization_seconds),
+                        "t_stageB_native_ot_localization": float(best_method_wall_seconds),
                         "t_support_extract": float(support_extract_seconds),
                         "t_native_width_total_wall": float(target_wall_seconds),
                         "t_native_width_total_effective": float(effective_width_total_seconds),
                     },
                     "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)) if prepared_artifacts else False,
+                    "runtime_accounting": (
+                        "shared_width_setup_plus_selected_method_payload_wall_plus_support_extract; "
+                        "signature cache load/create wall is replaced with recorded signature construction time"
+                    ),
+                    "all_epsilon_sweep_wall_seconds": float(ot_localization_seconds),
+                    "selected_method_wall_runtime_seconds": float(best_method_wall_seconds),
                     "wall_runtime_seconds": float(target_wall_seconds),
                     "localization_runtime_seconds": float(effective_width_total_seconds),
                     "runtime_seconds": float(effective_width_total_seconds),

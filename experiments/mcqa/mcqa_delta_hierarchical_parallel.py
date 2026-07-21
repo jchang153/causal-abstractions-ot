@@ -27,6 +27,7 @@ from mcqa_delta_hierarchical_sweep import (
     _extract_stage_a_rankings,
     _extract_stage_b_best_configs,
     _extract_stage_c_rankings,
+    _fixed_stage_a_rankings,
     _format_native_summary,
     _format_stage_a_summary,
     _format_stage_b_summary,
@@ -350,8 +351,25 @@ def _load_stage_a_rankings_by_token(
     sweep_root: Path,
 ) -> dict[str, dict[str, list[dict[str, object]]]]:
     rankings_by_token: dict[str, dict[str, list[dict[str, object]]]] = {}
+    fixed_stage_a_layers = normalized.get("stage_a_fixed_layers", {})
     for token_position_id in normalized["stage_a_token_position_ids"]:
         ranking_json_path, _ = _stage_a_rankings_paths(sweep_root=sweep_root, token_position_id=str(token_position_id))
+        if fixed_stage_a_layers:
+            rankings = _fixed_stage_a_rankings(
+                token_position_id=str(token_position_id),
+                fixed_layers_by_var={
+                    str(target_var): tuple(int(layer) for layer in layers)
+                    for target_var, layers in dict(fixed_stage_a_layers).items()
+                },
+            )
+            ranking_txt_path = ranking_json_path.with_suffix(".txt")
+            _write_json(ranking_json_path, rankings)
+            _write_text(
+                ranking_txt_path,
+                _format_stage_a_summary(token_position_id=str(token_position_id), rankings=rankings),
+            )
+            rankings_by_token[str(token_position_id)] = rankings
+            continue
         rankings_by_token[str(token_position_id)] = _read_rankings(ranking_json_path)
     return rankings_by_token
 
@@ -400,6 +418,7 @@ def plan_stage_b_tasks(args: argparse.Namespace) -> None:
                         "category": "stage_b_native_support",
                         "token_position_id": str(token_position_id),
                         "layer": int(layer),
+                        "target_vars": [str(target_var) for target_var in target_vars],
                         "stage_timestamp": stage_timestamp,
                         "command": list(
                             _build_native_block_command(

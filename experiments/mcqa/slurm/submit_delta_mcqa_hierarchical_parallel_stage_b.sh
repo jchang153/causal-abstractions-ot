@@ -26,6 +26,7 @@ echo "[submit-delta-hpar-b] delta_account=${DELTA_ACCOUNT}"
 echo "[submit-delta-hpar-b] delta_partition=${DELTA_PARTITION}"
 echo "[submit-delta-hpar-b] array_throttle=${ARRAY_THROTTLE}"
 echo "[submit-delta-hpar-b] native_resolutions=${NATIVE_RESOLUTIONS:-}"
+echo "[submit-delta-hpar-b] plot_alignment_method=${PLOT_ALIGNMENT_METHOD:-ot}"
 echo "[submit-delta-hpar-b] pca_site_menus=${PCA_SITE_MENUS:-partition}"
 echo "[submit-delta-hpar-b] pca_basis_source_modes=${PCA_BASIS_SOURCE_MODES:-all_variants}"
 echo "[submit-delta-hpar-b] pca_num_bands_values=${PCA_NUM_BANDS_VALUES:-8,16}"
@@ -42,6 +43,7 @@ COMMON_ARGS=(
   --stage-a-token-position-ids "${STAGE_A_TOKEN_POSITION_IDS:-last_token}"
   --target-vars "${TARGET_VARS:-answer_pointer,answer_token}"
   --signature-mode "${SIGNATURE_MODE:-family_label_delta_norm}"
+  --plot-alignment-method "${PLOT_ALIGNMENT_METHOD:-ot}"
   --ot-epsilons "${OT_EPSILONS:-0.5,1,2,4}"
   --ot-top-k-values "${OT_TOP_K_VALUES:-1,2,4}"
   --ot-lambdas "${OT_LAMBDAS:-0.5,1,2,4}"
@@ -66,6 +68,9 @@ COMMON_ARGS=(
 
 if [[ -n "${STAGE_A_LAYER_INDICES:-}" ]]; then
   COMMON_ARGS+=(--stage-a-layer-indices "${STAGE_A_LAYER_INDICES}")
+fi
+if [[ -n "${STAGE_A_FIXED_LAYERS:-}" ]]; then
+  COMMON_ARGS+=(--stage-a-fixed-layers "${STAGE_A_FIXED_LAYERS}")
 fi
 if [[ -n "${NATIVE_RESOLUTIONS:-}" ]]; then
   COMMON_ARGS+=(--native-resolutions "${NATIVE_RESOLUTIONS}")
