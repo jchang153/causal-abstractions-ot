@@ -54,7 +54,7 @@ TASK_MANIFEST_VERSION = 1
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parent
+    return Path(__file__).resolve().parents[2]
 
 
 def _sweep_root(args: argparse.Namespace, normalized: dict[str, object]) -> Path:
