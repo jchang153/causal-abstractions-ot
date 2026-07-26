@@ -29,6 +29,8 @@ For the Delta A40 allocation used by the MCQA reruns, launch the complete baseli
 `bash experiments/mcqa/slurm/run_delta_mcqa_mib_baselines.sh`. The launcher creates exactly one
 `srun` for the complete sweep, uses `/work/nvme/bgvo/$USER/hf_cache`, and resumes existing JSON
 outputs within the chosen `RUN_NAME` folder.
+Set `VENV_PATH` when using a virtual environment other than `/u/$USER/.venv`; the launcher
+checks that its interpreter is Python 3.10 or newer before starting the Slurm step.
 
 Related MCQA experiment folders outside the main-paper path:
 

@@ -8,6 +8,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
 fi
 
 REPO_ROOT="${REPO_ROOT:-/u/${USER}/causal-abstractions-ot}"
+VENV_PATH="${VENV_PATH:-/u/${USER}/.venv}"
 RUN_NAME="${RUN_NAME:-mcqa_mib_baselines_$(date +%Y%m%d_%H%M%S)}"
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/delta}"
 CACHE_ROOT="${CACHE_ROOT:-/work/nvme/bgvo/${USER}/hf_cache}"
@@ -23,9 +24,14 @@ export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 cd "${REPO_ROOT}"
-source /u/${USER}/.venv/bin/activate
+if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
+  echo "Virtual environment not found at ${VENV_PATH}" >&2
+  exit 2
+fi
+source "${VENV_PATH}/bin/activate"
 
-echo "job=${SLURM_JOB_ID} run=${RUN_NAME} cache=${CACHE_ROOT} results=${RESULTS_ROOT}/${RUN_NAME}"
+echo "job=${SLURM_JOB_ID} run=${RUN_NAME} venv=${VENV_PATH} cache=${CACHE_ROOT} results=${RESULTS_ROOT}/${RUN_NAME}"
+python -c 'import sys; assert sys.version_info >= (3, 10), f"Python 3.10+ required, got {sys.version}"'
 
 run_baseline_shard() {
   python experiments/mcqa/mcqa_dbm_baselines.py \
@@ -66,6 +72,6 @@ CPUS_PER_WORKER="${CPUS_PER_WORKER:-$(( ${SLURM_CPUS_ON_NODE:-8} / BASELINE_WORK
 srun --ntasks="${BASELINE_WORKERS}" --gpus-per-task=1 --gpu-bind=single:1 \
   --cpus-per-task="${CPUS_PER_WORKER}" \
   env MCQA_MIB_INSIDE_SRUN=1 REPO_ROOT="${REPO_ROOT}" RUN_NAME="${RUN_NAME}" \
-    RESULTS_ROOT="${RESULTS_ROOT}" CACHE_ROOT="${CACHE_ROOT}" bash "$0"
+    RESULTS_ROOT="${RESULTS_ROOT}" CACHE_ROOT="${CACHE_ROOT}" VENV_PATH="${VENV_PATH}" bash "$0"
 
 echo "All outputs: ${RESULTS_ROOT}/${RUN_NAME}"
