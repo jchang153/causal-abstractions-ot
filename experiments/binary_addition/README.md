@@ -8,6 +8,11 @@ Entry points:
 - `run_progressive_plot.py`: full progressive PLOT pipeline, including Stage A timestep localization, native/PCA Stage B handles, PLOT-guided DAS, PLOT-PCA-guided DAS, and full DAS.
 - `run_progressive_plot_stage_b_resolution_sweep.py`: rerun native Stage B from a cached Stage A result.
 - `plot_progressive_heatmaps.py`: render paper heatmaps for PLOT, PLOT-native, PLOT-PCA, PLOT-DAS, and full DAS handles.
+- `run_mib_baselines.py`: run Full State, canonical DBM, and DBM+PCA over all recurrent timesteps, selecting timesteps on calibration data before test reporting.
+
+The Delta launcher `slurm/run_delta_binary_addition_mib_baselines.sh` runs the three MIB-style
+baselines for seeds 0--2 and carries `C1`--`C3` in one resume-safe `srun`. It uses the main-paper
+128/64/64 base split and the structured source policy used by the progressive PLOT experiment.
 
 Example Stage B rerun:
 
