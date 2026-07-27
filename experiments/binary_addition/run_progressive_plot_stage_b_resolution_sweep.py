@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -28,6 +29,7 @@ from experiments.binary_addition.run_progressive_plot import (
     _summary_stats,
 )
 from experiments.binary_addition.sites import enumerate_group_sites_for_timesteps
+from experiments.binary_addition.transport import evaluate_single_calibrated_transport
 
 
 ROW_KEYS_DEFAULT = "C1,C2,C3"
@@ -231,6 +233,7 @@ def _run_seed(
     family_order = _family_order(int(args.width), str(args.source_policy))
 
     resolution_results = {}
+    resolution_sites = {}
     for resolution in resolutions:
         transport_cfg = _make_transport_config(
             epsilons=_parse_floats(str(args.stage_b_epsilons)),
@@ -245,6 +248,7 @@ def _run_seed(
                 resolution=int(resolution),
             )
         )
+        resolution_sites[str(resolution)] = sites
         resolution_results[str(resolution)] = _run_ot_stage(
             stage_name=f"stage_b_canonical_r{resolution}_topk_ot_inside_cached_stage_a_timesteps",
             model=model,
@@ -266,6 +270,7 @@ def _run_seed(
             cost_metric=str(args.cost_metric),
             rotation_map=None,
             row_allowed_timesteps=row_allowed_timesteps,
+            evaluate_test=False,
         )
 
     sens_rows = []
@@ -274,6 +279,7 @@ def _run_seed(
     selected_top_k_counts: dict[str, int] = {}
     selected_epsilon_counts: dict[str, int] = {}
     per_row = {}
+    selected_test_start = time.perf_counter()
     for row_key in row_keys:
         resolution, trial, row = _select_row_from_resolution_trials(
             resolution_results,
@@ -283,24 +289,50 @@ def _run_seed(
         selected_resolution_counts[resolution] = selected_resolution_counts.get(resolution, 0) + 1
         selected_top_k_counts[str(row["top_k"])] = selected_top_k_counts.get(str(row["top_k"]), 0) + 1
         selected_epsilon_counts[str(trial["epsilon"])] = selected_epsilon_counts.get(str(trial["epsilon"]), 0) + 1
-        sens_rows.append(float(row["test"]["sensitivity"]))
-        inv_rows.append(float(row["test"]["invariance"]))
+        calibrated = {
+            "top_k": int(row["top_k"]),
+            "lambda": float(row["lambda"]),
+            "selected_sites": list(row["selected_sites"]),
+            "calibration": dict(row["calibration"]),
+        }
+        tested = evaluate_single_calibrated_transport(
+            model,
+            calibrated,
+            resolution_sites[resolution],
+            banks["test_positive_by_row"][row_key],
+            banks["test_invariant_by_row"][row_key],
+            device=device,
+            run_cache=run_cache,
+            rotation_map=None,
+        )
+        sens_rows.append(float(tested["sensitivity"]))
+        inv_rows.append(float(tested["invariance"]))
         per_row[row_key] = {
             "stage_a_timestep": int(stage_a_timesteps[row_key]),
             "resolution": int(resolution),
             "epsilon": float(trial["epsilon"]),
             "top_k": int(row["top_k"]),
             "lambda": float(row["lambda"]),
-            "combined": float(row["test"]["combined"]),
-            "sensitivity": float(row["test"]["sensitivity"]),
-            "invariance": float(row["test"]["invariance"]),
+            "combined": float(tested["combined"]),
+            "sensitivity": float(tested["sensitivity"]),
+            "invariance": float(tested["invariance"]),
             "selected_sites": [str(site["site_key"]) for site in row.get("selected_sites", [])],
         }
+
+    selected_test_runtime = time.perf_counter() - selected_test_start
 
     mean_sensitivity = sum(sens_rows) / len(sens_rows)
     mean_invariance = sum(inv_rows) / len(inv_rows)
     mean_combined = 0.5 * (mean_sensitivity + mean_invariance)
-    stage_b_sweep_runtime = sum(float(stage["runtime_seconds"]) for stage in resolution_results.values())
+    # Charge the method for every evaluated resolution and every epsilon trial,
+    # not only for the trial ultimately selected by calibration.
+    stage_b_selected_trial_accounting_runtime = sum(
+        float(stage["runtime_seconds"]) for stage in resolution_results.values()
+    )
+    stage_b_sweep_runtime = sum(
+        float(stage.get("wall_runtime_seconds", stage["runtime_seconds"]))
+        for stage in resolution_results.values()
+    ) + float(selected_test_runtime)
     total_runtime = stage_a_runtime + stage_b_sweep_runtime
 
     result = {
@@ -322,6 +354,14 @@ def _run_seed(
         },
         "stage_a_runtime_seconds_cached": float(stage_a_runtime),
         "stage_b_sweep_runtime_seconds": float(stage_b_sweep_runtime),
+        "stage_b_selected_trial_accounting_runtime_seconds": float(
+            stage_b_selected_trial_accounting_runtime
+        ),
+        "stage_b_selected_test_runtime_seconds": float(selected_test_runtime),
+        "runtime_definition": (
+            "sum of calibration wall runtime across all independent resolution sweeps "
+            "plus test runtime for calibration-selected rows"
+        ),
         "total_runtime_seconds_with_cached_stage_a": float(total_runtime),
         "mean_combined": float(mean_combined),
         "mean_sensitivity": float(mean_sensitivity),

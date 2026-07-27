@@ -439,6 +439,7 @@ def _run_alignment_stage(
     bruteforce_temperature: float,
     rotation_map: dict[int, RotatedBasis] | None,
     row_allowed_timesteps: dict[str, set[int]] | None = None,
+    evaluate_test: bool = True,
 ) -> dict[str, object]:
     start_time = time.perf_counter()
     alignment_method = str(alignment_method).replace("-", "")
@@ -528,20 +529,22 @@ def _run_alignment_stage(
                 selection_rule=str(selection_rule),
                 invariance_floor=float(invariance_floor),
             )
-            tested = evaluate_single_calibrated_transport(
-                model,
-                calibrated,
-                sites,
-                banks["test_positive_by_row"][row_key],
-                banks["test_invariant_by_row"][row_key],
-                device=device,
-                run_cache=run_cache,
-                rotation_map=rotation_map,
-            )
             calibrated = dict(calibrated)
             calibrated["selected_sites"] = _selected_site_dicts(calibrated, sites)
-            tested = dict(tested)
-            tested["selected_sites"] = _selected_site_dicts(calibrated, sites)
+            tested = None
+            if bool(evaluate_test):
+                tested = evaluate_single_calibrated_transport(
+                    model,
+                    calibrated,
+                    sites,
+                    banks["test_positive_by_row"][row_key],
+                    banks["test_invariant_by_row"][row_key],
+                    device=device,
+                    run_cache=run_cache,
+                    rotation_map=rotation_map,
+                )
+                tested = dict(tested)
+                tested["selected_sites"] = list(calibrated["selected_sites"])
             per_row[row_key] = {
                 "calibration": calibrated["calibration"],
                 "test": tested,
@@ -553,8 +556,9 @@ def _run_alignment_stage(
             }
             calib_sens.append(float(calibrated["calibration"]["sensitivity"]))
             calib_inv.append(float(calibrated["calibration"]["invariance"]))
-            test_sens.append(float(tested["sensitivity"]))
-            test_inv.append(float(tested["invariance"]))
+            if tested is not None:
+                test_sens.append(float(tested["sensitivity"]))
+                test_inv.append(float(tested["invariance"]))
         calibration = {
             "mean_sensitivity": _mean(calib_sens),
             "mean_invariance": _mean(calib_inv),
@@ -562,11 +566,17 @@ def _run_alignment_stage(
         }
         test = {
             "per_row": per_row,
-            "mean_sensitivity": _mean(test_sens),
-            "mean_invariance": _mean(test_inv),
-            "mean_combined": 0.5 * (_mean(test_sens) + _mean(test_inv)),
-            "subset": _subset_summary({k: v["test"] for k, v in per_row.items()}, row_keys),
+            "evaluated": bool(evaluate_test),
         }
+        if bool(evaluate_test):
+            test.update(
+                {
+                    "mean_sensitivity": _mean(test_sens),
+                    "mean_invariance": _mean(test_inv),
+                    "mean_combined": 0.5 * (_mean(test_sens) + _mean(test_inv)),
+                    "subset": _subset_summary({k: v["test"] for k, v in per_row.items()}, row_keys),
+                }
+            )
         trial = {
             "alignment_method": alignment_method,
             "coupling": coupling.tolist(),
@@ -609,6 +619,171 @@ def _run_alignment_stage(
     }
 
 
+def _run_alignment_resolution_sweep(
+    *,
+    stage_name: str,
+    alignment_method: str,
+    model: GRUAdder,
+    specs: Sequence[EndogenousRowSpec],
+    row_keys: Sequence[str],
+    banks: dict[str, object],
+    sites_by_resolution: dict[int, Sequence[Site]],
+    family_order: Sequence[str],
+    transport_cfg: TransportConfig,
+    selection_rule: str,
+    invariance_floor: float,
+    device: torch.device,
+    run_cache: RunCache,
+    batch_size: int,
+    normalize_signatures: bool,
+    fit_signature_mode: str,
+    fit_stratify_mode: str,
+    fit_family_profile: str,
+    cost_metric: str,
+    cosine_temperature: float,
+    bruteforce_temperature: float,
+    rotation_map: dict[int, RotatedBasis] | None,
+    row_allowed_timesteps: dict[str, set[int]] | None = None,
+) -> dict[str, object]:
+    """Run one independent coupling per resolution and select rows by calibration.
+
+    The returned ``best_trial`` is a compatibility view assembled from the
+    independently selected resolution/trial for each abstract row.  Complete
+    per-resolution stages remain available under ``resolution_results``.
+    Reported runtime is the calibration wall time summed across *all*
+    resolutions (and all epsilon trials within each resolution), plus the test
+    evaluation of the calibration-selected row from each coupling.
+    """
+    resolution_results: dict[str, dict[str, object]] = {}
+    for resolution, resolution_sites in sites_by_resolution.items():
+        resolution_results[str(int(resolution))] = _run_alignment_stage(
+            stage_name=f"{stage_name}_r{int(resolution)}",
+            alignment_method=alignment_method,
+            model=model,
+            specs=specs,
+            row_keys=row_keys,
+            banks=banks,
+            sites=_dedupe_sites(tuple(resolution_sites)),
+            family_order=family_order,
+            transport_cfg=transport_cfg,
+            selection_rule=selection_rule,
+            invariance_floor=invariance_floor,
+            device=device,
+            run_cache=run_cache,
+            batch_size=batch_size,
+            normalize_signatures=normalize_signatures,
+            fit_signature_mode=fit_signature_mode,
+            fit_stratify_mode=fit_stratify_mode,
+            fit_family_profile=fit_family_profile,
+            cost_metric=cost_metric,
+            cosine_temperature=cosine_temperature,
+            bruteforce_temperature=bruteforce_temperature,
+            rotation_map=rotation_map,
+            row_allowed_timesteps=row_allowed_timesteps,
+            evaluate_test=False,
+        )
+
+    selected_per_row: dict[str, dict[str, object]] = {}
+    calibration_sensitivity: list[float] = []
+    calibration_invariance: list[float] = []
+    test_sensitivity: list[float] = []
+    test_invariance: list[float] = []
+    selected_test_start = time.perf_counter()
+    for row_key in row_keys:
+        selected: tuple[str, dict[str, object], dict[str, object], dict[str, object]] | None = None
+        selected_key: tuple[float, float, float] | None = None
+        for resolution, resolution_stage in resolution_results.items():
+            for trial in resolution_stage["trials"]:
+                row = trial["test"]["per_row"][row_key]
+                calibration = row["calibration"]
+                key = (
+                    float(calibration["combined"]),
+                    float(calibration["sensitivity"]),
+                    float(calibration["invariance"]),
+                )
+                if selected_key is None or key > selected_key:
+                    selected_key = key
+                    selected = (resolution, resolution_stage, trial, row)
+        if selected is None:
+            raise RuntimeError(f"no resolution/trial candidate generated for {row_key}")
+        resolution, resolution_stage, trial, row = selected
+        selected_row = dict(row)
+        resolution_sites = _dedupe_sites(tuple(sites_by_resolution[int(resolution)]))
+        calibrated = {
+            "top_k": int(row["top_k"]),
+            "lambda": float(row["lambda"]),
+            "selected_sites": list(row["selected_sites"]),
+            "calibration": dict(row["calibration"]),
+        }
+        tested = evaluate_single_calibrated_transport(
+            model,
+            calibrated,
+            resolution_sites,
+            banks["test_positive_by_row"][row_key],
+            banks["test_invariant_by_row"][row_key],
+            device=device,
+            run_cache=run_cache,
+            rotation_map=rotation_map,
+        )
+        selected_row["test"] = dict(tested)
+        selected_row["test"]["selected_sites"] = list(row["selected_sites"])
+        selected_row["resolution"] = int(resolution)
+        selected_row["resolution_sites"] = list(resolution_stage["sites"])
+        selected_row["alignment_method"] = str(trial["alignment_method"])
+        if "epsilon" in trial:
+            selected_row["epsilon"] = float(trial["epsilon"])
+        selected_per_row[row_key] = selected_row
+        calibration_sensitivity.append(float(row["calibration"]["sensitivity"]))
+        calibration_invariance.append(float(row["calibration"]["invariance"]))
+        test_sensitivity.append(float(tested["sensitivity"]))
+        test_invariance.append(float(tested["invariance"]))
+
+    selected_test_seconds = time.perf_counter() - selected_test_start
+
+    calibration = {
+        "mean_sensitivity": _mean(calibration_sensitivity),
+        "mean_invariance": _mean(calibration_invariance),
+        "mean_combined": 0.5 * (_mean(calibration_sensitivity) + _mean(calibration_invariance)),
+    }
+    test = {
+        "per_row": selected_per_row,
+        "mean_sensitivity": _mean(test_sensitivity),
+        "mean_invariance": _mean(test_invariance),
+        "mean_combined": 0.5 * (_mean(test_sensitivity) + _mean(test_invariance)),
+        "subset": _subset_summary({key: value["test"] for key, value in selected_per_row.items()}, row_keys),
+    }
+    calibration_sweep_wall_seconds = sum(
+        float(stage["wall_runtime_seconds"]) for stage in resolution_results.values()
+    )
+    sweep_wall_seconds = float(calibration_sweep_wall_seconds + selected_test_seconds)
+    sweep_setup_seconds = sum(float(stage["setup_runtime_seconds"]) for stage in resolution_results.values())
+    selected_view = {
+        "alignment_method": str(alignment_method).replace("-", ""),
+        "calibration": calibration,
+        "test": test,
+        "selected_resolution_by_row": {
+            row_key: int(selected_per_row[row_key]["resolution"]) for row_key in row_keys
+        },
+    }
+    return {
+        "stage": str(stage_name),
+        "alignment_method": str(alignment_method).replace("-", ""),
+        "runtime_seconds": float(sweep_wall_seconds),
+        "wall_runtime_seconds": float(sweep_wall_seconds),
+        "setup_runtime_seconds": float(sweep_setup_seconds),
+        "runtime_definition": (
+            "sum of calibration wall runtime across all independent resolution sweeps "
+            "plus test runtime for calibration-selected rows"
+        ),
+        "calibration_sweep_runtime_seconds": float(calibration_sweep_wall_seconds),
+        "selected_test_runtime_seconds": float(selected_test_seconds),
+        "resolutions": [int(value) for value in sites_by_resolution],
+        "resolution_results": resolution_results,
+        "selected_resolution_by_row": selected_view["selected_resolution_by_row"],
+        "best_trial": selected_view,
+    }
+
+
 def _run_ot_stage(
     *,
     stage_name: str,
@@ -631,6 +806,7 @@ def _run_ot_stage(
     cost_metric: str,
     rotation_map: dict[int, RotatedBasis] | None,
     row_allowed_timesteps: dict[str, set[int]] | None = None,
+    evaluate_test: bool = True,
 ) -> dict[str, object]:
     return _run_alignment_stage(
         stage_name=stage_name,
@@ -656,6 +832,7 @@ def _run_ot_stage(
         bruteforce_temperature=1.0,
         rotation_map=rotation_map,
         row_allowed_timesteps=row_allowed_timesteps,
+        evaluate_test=bool(evaluate_test),
     )
 
 
@@ -1192,6 +1369,27 @@ def _method_record(
 
 
 def _alignment_stage_runtime_breakdown(prefix: str, stage: dict[str, object]) -> dict[str, float]:
+    resolution_results = stage.get("resolution_results", {})
+    if isinstance(resolution_results, dict) and resolution_results:
+        breakdown = {
+            f"{prefix}_runtime_seconds": float(stage.get("runtime_seconds", 0.0)),
+            f"{prefix}_wall_runtime_seconds": float(
+                stage.get("wall_runtime_seconds", stage.get("runtime_seconds", 0.0))
+            ),
+            f"{prefix}_setup_runtime_seconds": float(stage.get("setup_runtime_seconds", 0.0)),
+            f"{prefix}_calibration_sweep_runtime_seconds": float(
+                stage.get("calibration_sweep_runtime_seconds", 0.0)
+            ),
+            f"{prefix}_selected_test_runtime_seconds": float(stage.get("selected_test_runtime_seconds", 0.0)),
+        }
+        for resolution, resolution_stage in resolution_results.items():
+            breakdown[f"{prefix}_r{resolution}_wall_runtime_seconds"] = float(
+                resolution_stage.get("wall_runtime_seconds", resolution_stage.get("runtime_seconds", 0.0))
+            )
+            breakdown[f"{prefix}_r{resolution}_setup_runtime_seconds"] = float(
+                resolution_stage.get("setup_runtime_seconds", 0.0)
+            )
+        return breakdown
     best_trial = stage.get("best_trial", {})
     if not isinstance(best_trial, dict):
         best_trial = {}
@@ -1309,23 +1507,22 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     selected_timesteps = tuple(sorted(set(stage_a_timesteps.values())))
 
     canonical_resolutions = _parse_ints(args.canonical_resolutions) if str(args.canonical_resolutions).strip() else _default_resolutions(int(args.hidden_size))
-    canonical_sites: list[Site] = []
-    for resolution in canonical_resolutions:
-        canonical_sites.extend(
-            enumerate_group_sites_for_timesteps(
+    canonical_sites_by_resolution = {
+        int(resolution): enumerate_group_sites_for_timesteps(
                 timesteps=selected_timesteps,
                 hidden_size=int(args.hidden_size),
                 resolution=int(resolution),
             )
-        )
-    stage_b_canonical = _run_alignment_stage(
+        for resolution in canonical_resolutions
+    }
+    stage_b_canonical = _run_alignment_resolution_sweep(
         stage_name=f"stage_b_canonical_{alignment_suffix}_inside_stage_a_timesteps",
         alignment_method=alignment_method,
         model=model,
         specs=specs,
         row_keys=row_keys,
         banks=banks,
-        sites=_dedupe_sites(tuple(canonical_sites)),
+        sites_by_resolution=canonical_sites_by_resolution,
         family_order=family_order,
         transport_cfg=transport_stage_b,
         selection_rule=str(args.selection_rule),
@@ -1355,20 +1552,23 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     pca_fit_seconds = time.perf_counter() - pca_start
 
     pca_resolutions = _parse_ints(args.pca_resolutions) if str(args.pca_resolutions).strip() else _default_resolutions(int(args.hidden_size))
-    pca_sites = _build_rotated_sites(
-        timesteps=selected_timesteps,
-        hidden_size=int(args.hidden_size),
-        resolutions=pca_resolutions,
-        site_menu=str(args.pca_site_menu),
-    )
-    stage_b_pca = _run_alignment_stage(
+    pca_sites_by_resolution = {
+        int(resolution): _build_rotated_sites(
+            timesteps=selected_timesteps,
+            hidden_size=int(args.hidden_size),
+            resolutions=(int(resolution),),
+            site_menu=str(args.pca_site_menu),
+        )
+        for resolution in pca_resolutions
+    }
+    stage_b_pca = _run_alignment_resolution_sweep(
         stage_name=f"stage_b_pca_{alignment_suffix}_inside_stage_a_timesteps",
         alignment_method=alignment_method,
         model=model,
         specs=specs,
         row_keys=row_keys,
         banks=banks,
-        sites=pca_sites,
+        sites_by_resolution=pca_sites_by_resolution,
         family_order=family_order,
         transport_cfg=transport_stage_b,
         selection_rule=str(args.selection_rule),
@@ -1453,7 +1653,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         ]
         canonical_evidence = _coordinate_evidence_from_row_mass(
             stage_b_canonical["best_trial"]["test"]["per_row"][row_key],
-            stage_b_canonical["sites"],
+            stage_b_canonical["best_trial"]["test"]["per_row"][row_key].get("resolution_sites", ()),
             hidden_size=int(args.hidden_size),
             timestep=timestep,
             basis="canonical",
