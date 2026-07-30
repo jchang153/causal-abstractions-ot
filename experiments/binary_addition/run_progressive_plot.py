@@ -110,9 +110,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no-full-support-fallback", action="store_true")
     ap.add_argument("--das-fit-bank-mode", type=str, default="anchored_prefix", choices=["shared", "anchored_prefix"])
     ap.add_argument("--das-subspace-dims", type=str, default="")
-    ap.add_argument("--das-lrs", type=str, default="0.01,0.003")
-    ap.add_argument("--das-epochs", type=int, default=12)
-    ap.add_argument("--das-train-records-per-epoch", type=int, default=256)
+    ap.add_argument("--das-learning-rate", type=float, default=0.01)
+    ap.add_argument("--das-max-epochs", type=int, default=100)
+    ap.add_argument("--das-min-epochs", type=int, default=5)
+    ap.add_argument("--das-plateau-patience", type=int, default=1)
+    ap.add_argument("--das-plateau-rel-delta", type=float, default=1e-3)
+    ap.add_argument("--das-restarts", type=int, default=2)
+    ap.add_argument(
+        "--das-train-records-per-epoch",
+        type=int,
+        default=0,
+        help="Maximum fit records per epoch; 0 uses the complete anchored fit bank.",
+    )
     ap.add_argument("--das-batch-size", type=int, default=64)
     ap.add_argument("--skip-das", action="store_true")
     ap.add_argument("--skip-existing", action="store_true")
@@ -1028,21 +1037,48 @@ def _train_das_rotator(
     *,
     subspace_dim: int,
     lr: float,
-    epochs: int,
+    max_epochs: int,
+    min_epochs: int,
+    plateau_patience: int,
+    plateau_rel_delta: float,
+    restart_index: int,
     train_records_per_epoch: int,
     batch_size: int,
     seed: int,
     device: torch.device,
     run_cache: RunCache,
     rotation_map: dict[int, RotatedBasis] | None,
-) -> RotatedSubspace:
+) -> tuple[RotatedSubspace, dict[str, object]]:
+    if max_epochs <= 0 or min_epochs <= 0 or min_epochs > max_epochs:
+        raise ValueError("DAS epochs must satisfy 0 < min_epochs <= max_epochs")
+    if plateau_patience <= 0 or plateau_rel_delta < 0:
+        raise ValueError("DAS plateau patience must be positive and relative delta nonnegative")
+    candidate_seed = (
+        int(seed)
+        + int(subspace_dim) * 1009
+        + int(round(float(lr) * 1e6))
+        + int(restart_index) * 9176
+        + int(support.timestep) * 104729
+    )
+    torch.manual_seed(candidate_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(candidate_seed)
     rotator = RotatedSubspace(support.dim(model.hidden_size), subspace_dim=int(subspace_dim)).to(device)
     optimizer = torch.optim.Adam(rotator.parameters(), lr=float(lr))
     criterion = nn.BCEWithLogitsLoss()
-    rng = random.Random(int(seed) + int(subspace_dim) * 1009 + int(round(float(lr) * 1e6)))
+    rng = random.Random(candidate_seed)
     records = list(records)
-    for _ in range(int(epochs)):
-        sampled = records if len(records) <= int(train_records_per_epoch) else rng.sample(records, int(train_records_per_epoch))
+    loss_history: list[float] = []
+    previous_loss: float | None = None
+    plateau_steps = 0
+    for _ in range(int(max_epochs)):
+        if int(train_records_per_epoch) <= 0 or len(records) <= int(train_records_per_epoch):
+            sampled = list(records)
+            rng.shuffle(sampled)
+        else:
+            sampled = rng.sample(records, int(train_records_per_epoch))
+        epoch_loss_sum = 0.0
+        epoch_example_count = 0
         for start in range(0, len(sampled), int(batch_size)):
             batch = sampled[start : start + int(batch_size)]
             optimizer.zero_grad(set_to_none=True)
@@ -1060,7 +1096,24 @@ def _train_das_rotator(
             loss = criterion(logits, target)
             loss.backward()
             optimizer.step()
-    return rotator.cpu()
+            epoch_loss_sum += float(loss.detach().cpu().item()) * len(batch)
+            epoch_example_count += len(batch)
+        epoch_loss = float(epoch_loss_sum / max(1, epoch_example_count))
+        loss_history.append(epoch_loss)
+        if previous_loss is None or epoch_loss < previous_loss * (1.0 - float(plateau_rel_delta)):
+            plateau_steps = 0
+        else:
+            plateau_steps += 1
+        previous_loss = epoch_loss
+        if len(loss_history) >= int(min_epochs) and plateau_steps >= int(plateau_patience):
+            break
+    return rotator.cpu(), {
+        "candidate_seed": int(candidate_seed),
+        "restart_index": int(restart_index),
+        "epochs_ran": int(len(loss_history)),
+        "loss_history": loss_history,
+        "stopped_early": bool(len(loss_history) < int(max_epochs)),
+    }
 
 
 def _das_exact_match_rate(
@@ -1117,9 +1170,13 @@ def _run_das_stage(
     support_menu: dict[str, Sequence[DASSupport]],
     fit_bank_mode: str,
     subspace_dims: tuple[int, ...],
-    learning_rates: tuple[float, ...],
+    learning_rate: float,
     lambda_grid: tuple[float, ...],
-    epochs: int,
+    max_epochs: int,
+    min_epochs: int,
+    plateau_patience: int,
+    plateau_rel_delta: float,
+    restarts: int,
     train_records_per_epoch: int,
     batch_size: int,
     selection_rule: str,
@@ -1179,14 +1236,18 @@ def _run_das_stage(
         for support in support_menu[row_key]:
             valid_dims = tuple(dim for dim in subspace_dims if 1 <= int(dim) <= int(support.dim(model.hidden_size)))
             for subspace_dim in valid_dims:
-                for lr in learning_rates:
-                    rotator = _train_das_rotator(
+                for restart_index in range(max(1, int(restarts))):
+                    rotator, training = _train_das_rotator(
                         model,
                         fit_records,
                         support,
                         subspace_dim=int(subspace_dim),
-                        lr=float(lr),
-                        epochs=int(epochs),
+                        lr=float(learning_rate),
+                        max_epochs=int(max_epochs),
+                        min_epochs=int(min_epochs),
+                        plateau_patience=int(plateau_patience),
+                        plateau_rel_delta=float(plateau_rel_delta),
+                        restart_index=int(restart_index),
                         train_records_per_epoch=int(train_records_per_epoch),
                         batch_size=int(batch_size),
                         seed=int(seed),
@@ -1229,7 +1290,10 @@ def _run_das_stage(
                             "row_key": row_key,
                             "support": support.as_dict(),
                             "subspace_dim": int(subspace_dim),
-                            "lr": float(lr),
+                            "lr": float(learning_rate),
+                            "restart_index": int(restart_index),
+                            "restart_count": int(max(1, restarts)),
+                            "training": training,
                             "lambda": float(lambda_scale),
                             "calibration": {
                                 "sensitivity": float(sens),
@@ -1679,8 +1743,10 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         canonical_ot_supports[row_key] = _unique_supports(tuple(canonical_menu))
 
     das_dims = _parse_ints(args.das_subspace_dims) if str(args.das_subspace_dims).strip() else _default_das_dims(int(args.hidden_size))
-    das_lrs = _parse_floats(args.das_lrs)
-    das_lambda_grid = _parse_floats(args.ot_lambda_grid)
+    das_learning_rate = float(args.das_learning_rate)
+    # DAS is always a full-strength interchange intervention. Lambda belongs
+    # to the transport methods and is not a DAS calibration hyperparameter.
+    das_lambda_grid = (1.0,)
     stage_b_das_full = _run_das_stage(
         stage_name="stage_b_das_full_stage_a_timestep",
         model=model,
@@ -1689,9 +1755,13 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         support_menu=full_timestep_supports,
         fit_bank_mode=str(args.das_fit_bank_mode),
         subspace_dims=das_dims,
-        learning_rates=das_lrs,
+        learning_rate=das_learning_rate,
         lambda_grid=das_lambda_grid,
-        epochs=int(args.das_epochs),
+        max_epochs=int(args.das_max_epochs),
+        min_epochs=int(args.das_min_epochs),
+        plateau_patience=int(args.das_plateau_patience),
+        plateau_rel_delta=float(args.das_plateau_rel_delta),
+        restarts=int(args.das_restarts),
         train_records_per_epoch=int(args.das_train_records_per_epoch),
         batch_size=int(args.das_batch_size),
         selection_rule=str(args.selection_rule),
@@ -1710,9 +1780,13 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         support_menu=canonical_ot_supports,
         fit_bank_mode=str(args.das_fit_bank_mode),
         subspace_dims=das_dims,
-        learning_rates=das_lrs,
+        learning_rate=das_learning_rate,
         lambda_grid=das_lambda_grid,
-        epochs=int(args.das_epochs),
+        max_epochs=int(args.das_max_epochs),
+        min_epochs=int(args.das_min_epochs),
+        plateau_patience=int(args.das_plateau_patience),
+        plateau_rel_delta=float(args.das_plateau_rel_delta),
+        restarts=int(args.das_restarts),
         train_records_per_epoch=int(args.das_train_records_per_epoch),
         batch_size=int(args.das_batch_size),
         selection_rule=str(args.selection_rule),
@@ -1731,9 +1805,13 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         support_menu=pca_supports,
         fit_bank_mode=str(args.das_fit_bank_mode),
         subspace_dims=das_dims,
-        learning_rates=das_lrs,
+        learning_rate=das_learning_rate,
         lambda_grid=das_lambda_grid,
-        epochs=int(args.das_epochs),
+        max_epochs=int(args.das_max_epochs),
+        min_epochs=int(args.das_min_epochs),
+        plateau_patience=int(args.das_plateau_patience),
+        plateau_rel_delta=float(args.das_plateau_rel_delta),
+        restarts=int(args.das_restarts),
         train_records_per_epoch=int(args.das_train_records_per_epoch),
         batch_size=int(args.das_batch_size),
         selection_rule=str(args.selection_rule),
@@ -1764,9 +1842,13 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         support_menu=full_das_supports,
         fit_bank_mode=str(args.das_fit_bank_mode),
         subspace_dims=das_dims,
-        learning_rates=das_lrs,
+        learning_rate=das_learning_rate,
         lambda_grid=das_lambda_grid,
-        epochs=int(args.das_epochs),
+        max_epochs=int(args.das_max_epochs),
+        min_epochs=int(args.das_min_epochs),
+        plateau_patience=int(args.das_plateau_patience),
+        plateau_rel_delta=float(args.das_plateau_rel_delta),
+        restarts=int(args.das_restarts),
         train_records_per_epoch=int(args.das_train_records_per_epoch),
         batch_size=int(args.das_batch_size),
         selection_rule=str(args.selection_rule),

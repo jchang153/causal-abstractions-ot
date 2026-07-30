@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -13,6 +14,7 @@ sys.path.append(str(ROOT))
 from experiments.binary_addition.data import enumerate_all_examples, stratified_base_split
 from experiments.binary_addition.interventions import build_run_cache
 from experiments.binary_addition.model import exact_accuracy
+from experiments.binary_addition.pca_basis import fit_pca_rotations
 from experiments.binary_addition.run_progressive_plot import (
     _build_banks,
     _checkpoint_map,
@@ -26,15 +28,18 @@ from experiments.binary_addition.run_progressive_plot import (
     _run_alignment_resolution_sweep,
     _summary_stats,
 )
-from experiments.binary_addition.sites import enumerate_group_sites_for_timesteps
+from experiments.binary_addition.sites import (
+    enumerate_group_sites_for_timesteps,
+    enumerate_rotated_prefix_sites_for_timesteps,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Single-stage binary-addition PLOT: independently partition every hidden timestep "
-            "at each resolution, form a separate coupling, select by calibration, and test only "
-            "the selected handle."
+            "Single-stage binary-addition PLOT: independently construct canonical partitions or "
+            "PCA-prefix sites at every hidden timestep for each resolution, form a separate "
+            "coupling, select by calibration, and test only the selected handle."
         )
     )
     parser.add_argument("--out-dir", required=True)
@@ -51,6 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-batch-size", type=int, default=64)
     parser.add_argument("--train-lr", type=float, default=0.02)
     parser.add_argument("--source-policy", default="structured_26_top3carry_c2x5_c3x7_no_random")
+    parser.add_argument("--basis", choices=["canonical", "pca"], default="canonical")
+    parser.add_argument("--pca-variant", choices=["uncentered", "centered", "whitened"], default="centered")
     parser.add_argument("--resolutions", default="1,2,4,8,16")
     parser.add_argument("--epsilons", default="0.003,0.01,0.03,0.1")
     parser.add_argument("--top-k-grid", default="1,2,4")
@@ -77,7 +84,8 @@ def _device(name: str) -> torch.device:
 
 def _run_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_dir: Path) -> dict[str, object]:
     seed_dir = out_dir / f"h{args.hidden_size}" / f"seed_{seed}"
-    summary_path = seed_dir / "single_stage_plot_seed_summary.json"
+    summary_name = "single_stage_plot_pca_seed_summary.json" if args.basis == "pca" else "single_stage_plot_seed_summary.json"
+    summary_path = seed_dir / summary_name
     if args.skip_existing and summary_path.exists():
         return json.loads(summary_path.read_text())
     seed_dir.mkdir(parents=True, exist_ok=True)
@@ -112,14 +120,39 @@ def _run_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_dir: 
     )
     family_order = _family_order(int(args.width), str(args.source_policy))
     resolutions = _parse_ints(str(args.resolutions))
-    sites_by_resolution = {
-        int(resolution): enumerate_group_sites_for_timesteps(
-            timesteps=tuple(range(int(args.width))),
+    rotation_map = None
+    pca_diagnostics = None
+    pca_fit_seconds = 0.0
+    if str(args.basis) == "pca":
+        pca_start = time.perf_counter()
+        rotation_map, pca_diagnostics = fit_pca_rotations(
+            fit_examples=split.fit,
+            run_cache=run_cache,
+            width=int(args.width),
             hidden_size=int(args.hidden_size),
-            resolution=int(resolution),
+            variant=str(args.pca_variant),
         )
-        for resolution in resolutions
-    }
+        pca_fit_seconds = time.perf_counter() - pca_start
+        # Match the existing two-stage PLOT-PCA baseline: resolution r means
+        # the leading r principal components, with one prefix site per timestep.
+        sites_by_resolution = {
+            int(resolution): enumerate_rotated_prefix_sites_for_timesteps(
+                timesteps=tuple(range(int(args.width))),
+                hidden_size=int(args.hidden_size),
+                resolution=int(resolution),
+                basis_name="pca",
+            )
+            for resolution in resolutions
+        }
+    else:
+        sites_by_resolution = {
+            int(resolution): enumerate_group_sites_for_timesteps(
+                timesteps=tuple(range(int(args.width))),
+                hidden_size=int(args.hidden_size),
+                resolution=int(resolution),
+            )
+            for resolution in resolutions
+        }
     transport = _make_transport_config(
         epsilons=_parse_floats(str(args.epsilons)),
         top_k_grid=_parse_ints(str(args.top_k_grid)),
@@ -127,7 +160,7 @@ def _run_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_dir: 
         sinkhorn_iters=int(args.sinkhorn_iters),
     )
     stage = _run_alignment_resolution_sweep(
-        stage_name="single_stage_plot_all_timesteps",
+        stage_name=f"single_stage_plot_{args.basis}_all_timesteps",
         alignment_method="ot",
         model=model,
         specs=specs,
@@ -148,7 +181,7 @@ def _run_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_dir: 
         cost_metric=str(args.cost_metric),
         cosine_temperature=1.0,
         bruteforce_temperature=1.0,
-        rotation_map=None,
+        rotation_map=rotation_map,
     )
     test = stage["best_trial"]["test"]["subset"]
     result = {
@@ -160,13 +193,16 @@ def _run_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_dir: 
             "test": exact_accuracy(model, split.test, device=device),
         },
         "training": training,
+        "pca_fit_seconds": float(pca_fit_seconds),
+        "pca_diagnostics": pca_diagnostics,
         "stage": stage,
         "method": {
-            "name": "PLOT (single-stage)",
+            "name": "PLOT-PCA (single-stage)" if args.basis == "pca" else "PLOT (single-stage)",
             "mean_combined": float(test["mean_combined"]),
             "mean_sensitivity": float(test["mean_sensitivity"]),
             "mean_invariance": float(test["mean_invariance"]),
-            "runtime_seconds": float(stage["runtime_seconds"]),
+            "runtime_seconds": float(pca_fit_seconds + stage["runtime_seconds"]),
+            "pca_fit_seconds": float(pca_fit_seconds),
             "selected_resolution_by_row": stage["selected_resolution_by_row"],
         },
     }
@@ -196,7 +232,8 @@ def main() -> None:
         "invariance": _summary_stats([float(result["method"]["mean_invariance"]) for result in results]),
         "runtime_seconds": _summary_stats([float(result["method"]["runtime_seconds"]) for result in results]),
     }
-    aggregate_path = out_dir / f"h{args.hidden_size}" / "single_stage_plot_summary.json"
+    aggregate_name = "single_stage_plot_pca_summary.json" if args.basis == "pca" else "single_stage_plot_summary.json"
+    aggregate_path = out_dir / f"h{args.hidden_size}" / aggregate_name
     aggregate_path.write_text(json.dumps(aggregate, indent=2))
     print(json.dumps({"summary": str(aggregate_path), **aggregate}, indent=2))
 

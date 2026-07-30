@@ -9,6 +9,7 @@ from .data import (
     enumerate_all_examples,
     stratified_base_split,
 )
+from .bdas import BDASConfig, BoundlessRotatedSubspace, run_bdas_rows, run_bdas_sweep
 from .das import DASConfig, run_das_sweep
 from .model import GRUAdder, TrainConfig, exact_accuracy, train_backbone
 from .scm import BinaryAdditionExample, compute_example, intervene_carries
@@ -20,6 +21,8 @@ __all__ = [
     "BaseSplit",
     "BinaryAdditionExample",
     "CarryPairRecord",
+    "BDASConfig",
+    "BoundlessRotatedSubspace",
     "DASConfig",
     "ExhaustiveBanks",
     "FullStateSite",
@@ -33,6 +36,8 @@ __all__ = [
     "exact_accuracy",
     "intervene_carries",
     "run_das_sweep",
+    "run_bdas_sweep",
+    "run_bdas_rows",
     "run_transport_sweep",
     "stratified_base_split",
     "train_backbone",
