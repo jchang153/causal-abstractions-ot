@@ -9,6 +9,13 @@ Entry points:
 - `run_progressive_plot_stage_b_resolution_sweep.py`: rerun native Stage B from a cached Stage A result.
 - `plot_progressive_heatmaps.py`: render paper heatmaps for PLOT, PLOT-native, PLOT-PCA, PLOT-DAS, and full DAS handles.
 - `run_mib_baselines.py`: run Full State, canonical DBM, and DBM+PCA over all recurrent timesteps, selecting timesteps on calibration data before test reporting.
+
+Transport sweeps use one shared epsilon across abstract variables.  For each
+epsilon, every variable selects its best resolution on calibration data; the
+epsilon score is the equal-weight average of those variable-level best scores.
+Only the winning shared epsilon and frozen per-variable resolutions are tested.
+Reported runtime includes coupling and calibration at every resolution for the
+selected epsilon, plus the final selected test evaluations.
 - `run_boundless_das.py`: resume-safe Boundless DAS sweep over structured C1--C3 banks, recurrent timesteps, and model/data seeds, with aggregate table output.
 - `run_boundless_das_diagnostics.py`: resume-safe one-seed sweep over BDAS boundary, temperature, optimizer, loss, selection, and fit-bank variants, with a ranked Markdown summary.
 

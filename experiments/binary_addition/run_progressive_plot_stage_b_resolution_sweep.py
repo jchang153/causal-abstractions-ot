@@ -146,6 +146,7 @@ def _select_row_from_resolution_trials(
     row_key: str,
     *,
     select_resolutions: set[str],
+    epsilon: float,
 ) -> tuple[str, dict[str, object], dict[str, object]]:
     best = None
     best_key = None
@@ -153,6 +154,8 @@ def _select_row_from_resolution_trials(
         if str(resolution) not in select_resolutions:
             continue
         for trial in stage["trials"]:
+            if float(trial["epsilon"]) != float(epsilon):
+                continue
             row = trial["test"]["per_row"][row_key]
             calibration = row["calibration"]
             key = (
@@ -164,7 +167,7 @@ def _select_row_from_resolution_trials(
                 best_key = key
                 best = (str(resolution), trial, row)
     if best is None:
-        raise RuntimeError(f"no candidate found for row {row_key}")
+        raise RuntimeError(f"no candidate found for row {row_key} at epsilon={epsilon}")
     return best
 
 
@@ -273,6 +276,40 @@ def _run_seed(
             evaluate_test=False,
         )
 
+    epsilon_plans: list[dict[str, object]] = []
+    for epsilon in _parse_floats(str(args.stage_b_epsilons)):
+        selected_by_row = {
+            row_key: _select_row_from_resolution_trials(
+                resolution_results,
+                row_key,
+                select_resolutions=select_resolutions,
+                epsilon=float(epsilon),
+            )
+            for row_key in row_keys
+        }
+        row_scores = {
+            row_key: float(selected_by_row[row_key][2]["calibration"]["combined"])
+            for row_key in row_keys
+        }
+        epsilon_plans.append(
+            {
+                "epsilon": float(epsilon),
+                "mean_best_row_calibration_score": sum(row_scores.values()) / len(row_scores),
+                "best_row_calibration_scores": row_scores,
+                "selected_by_row": selected_by_row,
+            }
+        )
+    if not epsilon_plans:
+        raise RuntimeError("no epsilon candidates configured")
+    selected_plan = epsilon_plans[0]
+    for candidate_plan in epsilon_plans[1:]:
+        if float(candidate_plan["mean_best_row_calibration_score"]) > float(
+            selected_plan["mean_best_row_calibration_score"]
+        ):
+            selected_plan = candidate_plan
+    selected_epsilon = float(selected_plan["epsilon"])
+    selected_by_row = selected_plan["selected_by_row"]
+
     sens_rows = []
     inv_rows = []
     selected_resolution_counts: dict[str, int] = {}
@@ -281,11 +318,7 @@ def _run_seed(
     per_row = {}
     selected_test_start = time.perf_counter()
     for row_key in row_keys:
-        resolution, trial, row = _select_row_from_resolution_trials(
-            resolution_results,
-            row_key,
-            select_resolutions=select_resolutions,
-        )
+        resolution, trial, row = selected_by_row[row_key]
         selected_resolution_counts[resolution] = selected_resolution_counts.get(resolution, 0) + 1
         selected_top_k_counts[str(row["top_k"])] = selected_top_k_counts.get(str(row["top_k"]), 0) + 1
         selected_epsilon_counts[str(trial["epsilon"])] = selected_epsilon_counts.get(str(trial["epsilon"]), 0) + 1
@@ -324,15 +357,24 @@ def _run_seed(
     mean_sensitivity = sum(sens_rows) / len(sens_rows)
     mean_invariance = sum(inv_rows) / len(inv_rows)
     mean_combined = 0.5 * (mean_sensitivity + mean_invariance)
-    # Charge the method for every evaluated resolution and every epsilon trial,
-    # not only for the trial ultimately selected by calibration.
-    stage_b_selected_trial_accounting_runtime = sum(
-        float(stage["runtime_seconds"]) for stage in resolution_results.values()
-    )
-    stage_b_sweep_runtime = sum(
+    stage_b_selected_epsilon_resolution_sweep_runtime = 0.0
+    for resolution, stage in resolution_results.items():
+        if str(resolution) not in select_resolutions:
+            continue
+        trial = next(
+            trial for trial in stage["trials"] if float(trial["epsilon"]) == selected_epsilon
+        )
+        stage_b_selected_epsilon_resolution_sweep_runtime += float(
+            trial.get("runtime_seconds", stage.get("runtime_seconds", 0.0))
+        )
+    full_hyperparameter_sweep_wall_runtime = sum(
         float(stage.get("wall_runtime_seconds", stage["runtime_seconds"]))
-        for stage in resolution_results.values()
-    ) + float(selected_test_runtime)
+        for resolution, stage in resolution_results.items()
+        if str(resolution) in select_resolutions
+    )
+    stage_b_sweep_runtime = float(
+        stage_b_selected_epsilon_resolution_sweep_runtime + selected_test_runtime
+    )
     total_runtime = stage_a_runtime + stage_b_sweep_runtime
 
     result = {
@@ -350,17 +392,26 @@ def _run_seed(
             "sinkhorn_iters": int(args.sinkhorn_iters),
             "selection_rule": str(args.selection_rule),
             "cost_metric": str(args.cost_metric),
-            "selection": "per carry across selected separate-resolution trials by calibration combined/sensitivity/invariance",
+            "selection": (
+                "one shared epsilon by macro-average of each carry's best-resolution calibration combined; "
+                "then one resolution per carry at that epsilon"
+            ),
         },
         "stage_a_runtime_seconds_cached": float(stage_a_runtime),
         "stage_b_sweep_runtime_seconds": float(stage_b_sweep_runtime),
         "stage_b_selected_trial_accounting_runtime_seconds": float(
-            stage_b_selected_trial_accounting_runtime
+            stage_b_selected_epsilon_resolution_sweep_runtime
+        ),
+        "stage_b_selected_epsilon_resolution_sweep_runtime_seconds": float(
+            stage_b_selected_epsilon_resolution_sweep_runtime
+        ),
+        "stage_b_full_hyperparameter_sweep_wall_runtime_seconds": float(
+            full_hyperparameter_sweep_wall_runtime
         ),
         "stage_b_selected_test_runtime_seconds": float(selected_test_runtime),
         "runtime_definition": (
-            "sum of calibration wall runtime across all independent resolution sweeps "
-            "plus test runtime for calibration-selected rows"
+            "sum of coupling+calibration runtime across all selected resolutions at the globally "
+            "selected epsilon plus test runtime for frozen calibration-selected rows"
         ),
         "total_runtime_seconds_with_cached_stage_a": float(total_runtime),
         "mean_combined": float(mean_combined),
@@ -370,6 +421,19 @@ def _run_seed(
         "selected_resolution_counts": selected_resolution_counts,
         "selected_top_k_counts": selected_top_k_counts,
         "selected_epsilon_counts": selected_epsilon_counts,
+        "selected_epsilon": float(selected_epsilon),
+        "epsilon_selection_rule": "macro_average_of_each_row_best_resolution_calibration_combined",
+        "epsilon_calibration_plans": [
+            {
+                "epsilon": float(plan["epsilon"]),
+                "mean_best_row_calibration_score": float(plan["mean_best_row_calibration_score"]),
+                "best_row_calibration_scores": plan["best_row_calibration_scores"],
+                "selected_resolution_by_row": {
+                    row_key: int(plan["selected_by_row"][row_key][0]) for row_key in row_keys
+                },
+            }
+            for plan in epsilon_plans
+        ],
         "resolution_results": resolution_results,
     }
     out_seed_dir.mkdir(parents=True, exist_ok=True)

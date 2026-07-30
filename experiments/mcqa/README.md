@@ -11,6 +11,7 @@ Method families:
 - `PLOT-native-DAS`: DAS guided by the native Stage B support.
 - `PLOT-PCA-DAS`: DAS guided by the PCA Stage B support.
 - `Full DAS`: DAS over all layers and the full subspace grid.
+- `bDAS`: Boundless DAS over all layers with a learned rotated-prefix boundary.
 - `DBM`: MIB-style desiderata-based masking in the canonical, PCA, or Gemma Scope SAE basis.
 - `Full layer`: the pre-DAS control that swaps the entire last-token residual vector at one layer.
 
@@ -20,8 +21,28 @@ Main entry points:
 - `mcqa_delta_hierarchical_parallel.py`: staged task planner/aggregator for cluster runs.
 - `mcqa_run_cloud.py`: configurable single-run launcher, including full DAS.
 - `mcqa_paper_runtime.py`: paper-runtime summarizer.
+- `mcqa_boundless_das.py`: selected-only-test Full Boundless DAS runner.
+
+PLOT sweeps select one epsilon globally across abstract variables.  Within each
+epsilon, each variable selects its best native resolution or PCA support config
+using calibration data, and the epsilon score is the equal-weight average of
+those best variable scores.  Only the frozen winning configurations are tested.
+Paper runtime charges every resolution/config evaluated at the selected epsilon
+plus the final selected test evaluations; it does not charge only the
+retrospective winning resolution, nor the sweep over unselected epsilons.
 - `mcqa_plot_layer.py`, `mcqa_plot_native_support.py`, `mcqa_ot_pca_focus.py`, `mcqa_plot_das_layer.py`, `mcqa_plot_das_native_support.py`: individual stage runners.
-- `mcqa_dbm_baselines.py`: resumable DBM/full-layer sweep. It selects layers using calibration accuracy and preserves all per-layer test results.
+- `mcqa_dbm_baselines.py`: resumable DBM/full-layer sweep. It selects layers using calibration accuracy and evaluates only the frozen selected layer on test.
+- `slurm/submit_delta_mcqa_boundless_das.sh`: submit the three-seed bDAS array on Delta.
+- `slurm/submit_delta_mcqa_corrected_reruns.sh`: submit the three-seed corrected PLOT,
+  PLOT-guided DAS, MIB, and bDAS rerun set.
+
+MCQA bDAS uses the recommended binary-addition settings: batch size 64,
+no gradient accumulation, 12 epochs, one restart, rotation learning rate
+`1e-2`, boundary learning rate `1e-4`, boundary penalty `1.0`, and temperature
+annealing from `1.0` to `0.1`.  It calibrates every last-token layer, selects
+one layer independently for each abstract variable, and evaluates only those
+frozen layer/boundary candidates on test.  Its reported runtime includes the
+complete layer training/calibration sweep plus selected test evaluation.
 
 Cluster launchers are in `slurm/`.
 

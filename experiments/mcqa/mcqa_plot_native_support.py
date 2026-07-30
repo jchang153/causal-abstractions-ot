@@ -20,6 +20,7 @@ from mcqa_experiment.ot import (
 )
 from mcqa_experiment.reporting import write_text_report
 from mcqa_experiment.runtime import write_json
+from mcqa_experiment.selection import select_shared_epsilon
 from mcqa_experiment.sites import enumerate_residual_sites
 from mcqa_experiment.support import extract_ordered_site_support
 
@@ -517,6 +518,10 @@ def main() -> None:
                         expected_transport_target_vars=transport_target_vars,
                     ):
                         compare_payload = None
+                    if isinstance(compare_payload, dict) and bool(compare_payload.get("test_evaluated", True)):
+                        # Old artifacts contain holdout results for every epsilon;
+                        # rebuild them as calibration-only sweep records.
+                        compare_payload = None
                     if compare_payload is None:
                         compare_payload = run_comparison(
                             model=model,
@@ -546,6 +551,7 @@ def main() -> None:
                                 resolution=int(native_resolution),
                                 layers=(int(layer),),
                                 token_position_ids=(DEFAULT_TOKEN_POSITION_ID,),
+                                evaluate_test=False,
                             ),
                             prepared_ot_artifacts=prepared_artifacts,
                         )
@@ -666,6 +672,7 @@ def main() -> None:
                         for epsilon in effective_ot_epsilons
                     ],
                     "summary_path": str(summary_path),
+                    "payload_path": str(payload_path),
                     "context_timing_seconds": context_timing_seconds,
                     "artifact_prepare_recorded_seconds": float(artifact_prepare_recorded_seconds),
                     "signature_prepare_runtime_seconds": float(artifact_prepare_recorded_seconds),
@@ -710,6 +717,162 @@ def main() -> None:
                     }
                 )
 
+    calibration_candidates: list[dict[str, object]] = []
+    for payload in all_payloads:
+        target_var = str(payload["target_vars"][0])
+        for ot_path_str in payload.get("ot_output_paths", []):
+            compare_payload = _load_existing_payload(Path(str(ot_path_str)))
+            if not isinstance(compare_payload, dict):
+                continue
+            epsilon = (
+                float(compare_payload.get("ot_epsilon", effective_ot_epsilons[0]))
+                if _method_uses_epsilon(alignment_method)
+                else 0.0
+            )
+            for method_payload in compare_payload.get("method_payloads", {}).get(alignment_method, []):
+                if not isinstance(method_payload, dict):
+                    continue
+                results = method_payload.get("results", [])
+                if not results or not isinstance(results[0], dict):
+                    continue
+                result = results[0]
+                calibration_candidates.append(
+                    {
+                        "variable": target_var,
+                        "epsilon": float(epsilon),
+                        "calibration_score": float(
+                            result.get("selection_score", result.get("calibration_exact_acc", 0.0))
+                        ),
+                        "calibration_exact_acc": float(result.get("calibration_exact_acc", result.get("exact_acc", 0.0))),
+                        "layer": int(payload["layer"]),
+                        "native_resolution": int(payload["native_resolution"]),
+                        "payload": payload,
+                        "compare_payload_path": str(ot_path_str),
+                    }
+                )
+    global_selection = select_shared_epsilon(
+        calibration_candidates,
+        variables=tuple(
+            target_var for target_var in transport_target_vars
+            if any(str(candidate["variable"]) == str(target_var) for candidate in calibration_candidates)
+        ),
+        epsilon_order=effective_ot_epsilons if _method_uses_epsilon(alignment_method) else (0.0,),
+    )
+    selected_epsilon = float(global_selection["selected_epsilon"])
+    for payload in all_payloads:
+        payload["selected_global_epsilon"] = selected_epsilon
+        payload["epsilon_selection_rule"] = global_selection["selection_rule"]
+        payload["test_evaluated"] = False
+
+    # Re-run only the frozen per-variable best resolution at the shared epsilon
+    # against the test split.  Calibration-only artifacts for every other
+    # resolution/epsilon remain untouched.
+    for target_var, selected_candidate in global_selection["selected_by_variable"].items():
+        payload = selected_candidate["payload"]
+        layer = int(selected_candidate["layer"])
+        native_resolution = int(selected_candidate["native_resolution"])
+        sites = enumerate_residual_sites(
+            num_layers=int(model.config.num_hidden_layers),
+            hidden_size=hidden_size,
+            token_position_ids=token_position_ids,
+            resolution=native_resolution,
+            layers=(layer,),
+            selected_token_position_ids=(DEFAULT_TOKEN_POSITION_ID,),
+        )
+        cache_spec = base_run._signature_cache_spec(
+            train_bank=train_banks[transport_target_vars[0]],
+            resolution=native_resolution,
+            resolved_resolution=native_resolution,
+            signature_mode=str(args.signature_mode),
+            selected_layers=[layer],
+            token_position_ids=token_position_ids,
+        )
+        cache_path = base_run._signature_cache_path(
+            resolution=native_resolution,
+            signature_mode=str(args.signature_mode),
+            cache_spec=cache_spec,
+        )
+        prepared_artifacts = (
+            load_prepared_alignment_artifacts(cache_path, expected_spec=cache_spec)
+            if alignment_method in {"ot", "cosine", "uot"}
+            else None
+        )
+        output_path = Path(str(selected_candidate["compare_payload_path"]))
+        selected_compare = run_comparison(
+            model=model,
+            tokenizer=tokenizer,
+            token_positions=token_positions,
+            banks_by_split=banks_by_split,
+            data_metadata=data_metadata,
+            device=device,
+            config=CompareExperimentConfig(
+                model_name=base_run.MODEL_NAME,
+                output_path=output_path,
+                summary_path=output_path.with_suffix(".txt"),
+                methods=(alignment_method,),
+                target_vars=(str(target_var),),
+                ot_source_target_vars=transport_target_vars,
+                batch_size=int(args.batch_size),
+                ot_epsilon=selected_epsilon,
+                signature_mode=str(args.signature_mode),
+                ot_top_k_values=ot_top_k_values,
+                ot_lambdas=ot_lambdas,
+                calibration_metric=DEFAULT_CALIBRATION_METRIC,
+                calibration_family_weights=calibration_family_weights,
+                ot_top_k_values_by_var={str(target_var): ot_top_k_values},
+                ot_lambdas_by_var={str(target_var): ot_lambdas},
+                cosine_temperature=float(args.cosine_temperature),
+                bruteforce_temperature=float(args.bruteforce_temperature),
+                resolution=native_resolution,
+                layers=(layer,),
+                token_position_ids=(DEFAULT_TOKEN_POSITION_ID,),
+                evaluate_test=True,
+            ),
+            prepared_ot_artifacts=prepared_artifacts,
+        )
+        method_payload = selected_compare["method_payloads"][alignment_method][0]
+        result = method_payload["results"][0]
+        selected_hyperparameters = dict(method_payload.get("selected_hyperparameters", {}))
+        method_summary = {
+            "method": alignment_method,
+            "epsilon": selected_epsilon,
+            "exact_acc": float(result.get("exact_acc", 0.0)),
+            "selection_score": float(result.get("selection_score", 0.0)),
+            "site_label": result.get("site_label"),
+            "selected_hyperparameters": selected_hyperparameters,
+        }
+        support_by_var = extract_ordered_site_support(
+            ot_run_payloads=[{"method_payloads": {alignment_method: [method_payload]}}],
+            sites=sites,
+            score_slack=0.0,
+        )
+        payload["method_by_var"] = {str(target_var): method_summary}
+        payload["support_by_var"] = support_by_var
+        payload["support_source_by_var"] = {
+            str(target_var): {"mode": f"selected_best_{alignment_method}_row_only", "epsilon": selected_epsilon}
+        }
+        payload["test_evaluated"] = True
+        payload["selected_for_test"] = True
+        payload["selected_test_runtime_seconds"] = float(
+            method_payload.get("timing_seconds", {}).get("t_final_holdout_eval", 0.0)
+        )
+
+    serializable_plans = [
+        {
+            "epsilon": float(plan["epsilon"]),
+            "mean_best_variable_calibration_score": float(plan["mean_best_variable_calibration_score"]),
+            "best_variable_calibration_scores": plan["best_variable_calibration_scores"],
+            "selected_resolution_by_variable": {
+                variable: int(plan["selected_by_variable"][variable]["native_resolution"])
+                for variable in plan["selected_by_variable"]
+            },
+        }
+        for plan in global_selection["epsilon_plans"]
+    ]
+    for payload in all_payloads:
+        payload["epsilon_calibration_plans"] = serializable_plans
+        write_json(Path(str(payload["payload_path"])), payload)
+
     manifest_path = sweep_root / "layer_sweep_manifest.json"
     write_json(
         manifest_path,
@@ -717,6 +880,9 @@ def main() -> None:
             "kind": "mcqa_plot_native_support",
             "layers": [int(layer) for layer in layers],
             "native_resolutions": [int(width) for width in native_resolutions],
+            "selected_global_epsilon": selected_epsilon,
+            "epsilon_selection_rule": global_selection["selection_rule"],
+            "epsilon_calibration_plans": serializable_plans,
             "runtime_seconds": float(perf_counter() - stage_start),
             "runs": manifest_runs,
         },

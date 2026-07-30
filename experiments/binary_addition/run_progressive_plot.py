@@ -516,8 +516,6 @@ def _run_alignment_stage(
         per_row = {}
         calib_sens = []
         calib_inv = []
-        test_sens = []
-        test_inv = []
         for row_idx, row_key in enumerate(row_keys):
             row = coupling[row_idx]
             allowed = None if row_allowed_timesteps is None else row_allowed_timesteps.get(row_key)
@@ -541,19 +539,6 @@ def _run_alignment_stage(
             calibrated = dict(calibrated)
             calibrated["selected_sites"] = _selected_site_dicts(calibrated, sites)
             tested = None
-            if bool(evaluate_test):
-                tested = evaluate_single_calibrated_transport(
-                    model,
-                    calibrated,
-                    sites,
-                    banks["test_positive_by_row"][row_key],
-                    banks["test_invariant_by_row"][row_key],
-                    device=device,
-                    run_cache=run_cache,
-                    rotation_map=rotation_map,
-                )
-                tested = dict(tested)
-                tested["selected_sites"] = list(calibrated["selected_sites"])
             per_row[row_key] = {
                 "calibration": calibrated["calibration"],
                 "test": tested,
@@ -565,9 +550,6 @@ def _run_alignment_stage(
             }
             calib_sens.append(float(calibrated["calibration"]["sensitivity"]))
             calib_inv.append(float(calibrated["calibration"]["invariance"]))
-            if tested is not None:
-                test_sens.append(float(tested["sensitivity"]))
-                test_inv.append(float(tested["invariance"]))
         calibration = {
             "mean_sensitivity": _mean(calib_sens),
             "mean_invariance": _mean(calib_inv),
@@ -575,17 +557,8 @@ def _run_alignment_stage(
         }
         test = {
             "per_row": per_row,
-            "evaluated": bool(evaluate_test),
+            "evaluated": False,
         }
-        if bool(evaluate_test):
-            test.update(
-                {
-                    "mean_sensitivity": _mean(test_sens),
-                    "mean_invariance": _mean(test_inv),
-                    "mean_combined": 0.5 * (_mean(test_sens) + _mean(test_inv)),
-                    "subset": _subset_summary({k: v["test"] for k, v in per_row.items()}, row_keys),
-                }
-            )
         trial = {
             "alignment_method": alignment_method,
             "coupling": coupling.tolist(),
@@ -603,6 +576,7 @@ def _run_alignment_stage(
                 trial["cosine_temperature"] = float(cosine_temperature)
         trial["transport_solve_runtime_seconds"] = float(transport_solve_seconds or 0.0)
         trial["calibration_test_runtime_seconds"] = float(time.perf_counter() - trial_start_time)
+        trial["calibration_runtime_seconds"] = float(trial["calibration_test_runtime_seconds"])
         trial["trial_runtime_seconds"] = float(
             float(trial["transport_solve_runtime_seconds"]) + float(trial["calibration_test_runtime_seconds"])
         )
@@ -613,14 +587,57 @@ def _run_alignment_stage(
             best_key = key
             best_trial = trial
 
+    selected_test_seconds = 0.0
+    if bool(evaluate_test) and isinstance(best_trial, dict):
+        selected_test_start = time.perf_counter()
+        selected_test_sens: list[float] = []
+        selected_test_inv: list[float] = []
+        selected_rows = best_trial["test"]["per_row"]
+        for row_key, row in selected_rows.items():
+            calibrated = {
+                "top_k": int(row["top_k"]),
+                "lambda": float(row["lambda"]),
+                "selected_sites": list(row["selected_sites"]),
+                "calibration": dict(row["calibration"]),
+            }
+            tested = evaluate_single_calibrated_transport(
+                model,
+                calibrated,
+                sites,
+                banks["test_positive_by_row"][row_key],
+                banks["test_invariant_by_row"][row_key],
+                device=device,
+                run_cache=run_cache,
+                rotation_map=rotation_map,
+            )
+            row["test"] = dict(tested)
+            row["test"]["selected_sites"] = list(row["selected_sites"])
+            selected_test_sens.append(float(tested["sensitivity"]))
+            selected_test_inv.append(float(tested["invariance"]))
+        best_trial["test"].update(
+            {
+                "evaluated": True,
+                "mean_sensitivity": _mean(selected_test_sens),
+                "mean_invariance": _mean(selected_test_inv),
+                "mean_combined": 0.5 * (_mean(selected_test_sens) + _mean(selected_test_inv)),
+                "subset": _subset_summary({k: v["test"] for k, v in selected_rows.items()}, row_keys),
+            }
+        )
+        selected_test_seconds = float(time.perf_counter() - selected_test_start)
     wall_elapsed = time.perf_counter() - start_time
-    selected_runtime = float(best_trial.get("runtime_seconds", wall_elapsed)) if isinstance(best_trial, dict) else float(wall_elapsed)
+    selected_runtime = (
+        float(best_trial.get("runtime_seconds", wall_elapsed)) + float(selected_test_seconds)
+        if isinstance(best_trial, dict)
+        else float(wall_elapsed)
+    )
     return {
         "stage": str(stage_name),
         "alignment_method": alignment_method,
         "runtime_seconds": float(selected_runtime),
         "wall_runtime_seconds": float(wall_elapsed),
         "setup_runtime_seconds": float(setup_seconds),
+        "selected_test_runtime_seconds": float(selected_test_seconds),
+        "test_evaluation_policy": "selected_global_alignment_trial_only" if bool(evaluate_test) else "deferred",
         "sites": [site.key() for site in sites],
         "fit_diagnostics": diagnostics,
         "trials": trials,
@@ -656,12 +673,13 @@ def _run_alignment_resolution_sweep(
 ) -> dict[str, object]:
     """Run one independent coupling per resolution and select rows by calibration.
 
-    The returned ``best_trial`` is a compatibility view assembled from the
-    independently selected resolution/trial for each abstract row.  Complete
-    per-resolution stages remain available under ``resolution_results``.
-    Reported runtime is the calibration wall time summed across *all*
-    resolutions (and all epsilon trials within each resolution), plus the test
-    evaluation of the calibration-selected row from each coupling.
+    The returned ``best_trial`` is a compatibility view assembled by first
+    selecting each abstract row's best resolution within each epsilon, then
+    selecting one shared epsilon by the macro-average of those row-level
+    calibration scores.  Complete per-resolution stages remain available under
+    ``resolution_results``.  Reported runtime is the coupling+calibration time
+    for every resolution at the selected shared epsilon, plus test evaluation
+    of the frozen calibration-selected row from each coupling.
     """
     resolution_results: dict[str, dict[str, object]] = {}
     for resolution, resolution_sites in sites_by_resolution.items():
@@ -692,6 +710,67 @@ def _run_alignment_resolution_sweep(
             evaluate_test=False,
         )
 
+    epsilon_order: list[float | None] = []
+    for resolution_stage in resolution_results.values():
+        for trial in resolution_stage["trials"]:
+            epsilon = float(trial["epsilon"]) if "epsilon" in trial else None
+            if epsilon not in epsilon_order:
+                epsilon_order.append(epsilon)
+    if not epsilon_order:
+        raise RuntimeError("resolution sweep generated no alignment trials")
+
+    plans_by_epsilon: list[dict[str, object]] = []
+    for epsilon in epsilon_order:
+        selected_by_row: dict[
+            str,
+            tuple[str, dict[str, object], dict[str, object], dict[str, object]],
+        ] = {}
+        row_scores: list[float] = []
+        for row_key in row_keys:
+            selected: tuple[str, dict[str, object], dict[str, object], dict[str, object]] | None = None
+            selected_key: tuple[float, float, float] | None = None
+            for resolution, resolution_stage in resolution_results.items():
+                for trial in resolution_stage["trials"]:
+                    trial_epsilon = float(trial["epsilon"]) if "epsilon" in trial else None
+                    if trial_epsilon != epsilon:
+                        continue
+                    row = trial["test"]["per_row"][row_key]
+                    calibration = row["calibration"]
+                    key = (
+                        float(calibration["combined"]),
+                        float(calibration["sensitivity"]),
+                        float(calibration["invariance"]),
+                    )
+                    if selected_key is None or key > selected_key:
+                        selected_key = key
+                        selected = (resolution, resolution_stage, trial, row)
+            if selected is None or selected_key is None:
+                raise RuntimeError(f"no resolution candidate generated for {row_key} at epsilon={epsilon}")
+            selected_by_row[row_key] = selected
+            row_scores.append(float(selected_key[0]))
+        plans_by_epsilon.append(
+            {
+                "epsilon": epsilon,
+                "mean_best_row_calibration_score": _mean(row_scores),
+                "best_row_calibration_scores": {
+                    row_key: float(selected_by_row[row_key][3]["calibration"]["combined"])
+                    for row_key in row_keys
+                },
+                "selected_by_row": selected_by_row,
+            }
+        )
+
+    # Strict '>' preserves the declared epsilon-grid order as the deterministic
+    # tie-break, rather than adding another data-dependent selection rule.
+    selected_plan = plans_by_epsilon[0]
+    for candidate_plan in plans_by_epsilon[1:]:
+        if float(candidate_plan["mean_best_row_calibration_score"]) > float(
+            selected_plan["mean_best_row_calibration_score"]
+        ):
+            selected_plan = candidate_plan
+    selected_epsilon = selected_plan["epsilon"]
+    selected_by_row = selected_plan["selected_by_row"]
+
     selected_per_row: dict[str, dict[str, object]] = {}
     calibration_sensitivity: list[float] = []
     calibration_invariance: list[float] = []
@@ -699,23 +778,7 @@ def _run_alignment_resolution_sweep(
     test_invariance: list[float] = []
     selected_test_start = time.perf_counter()
     for row_key in row_keys:
-        selected: tuple[str, dict[str, object], dict[str, object], dict[str, object]] | None = None
-        selected_key: tuple[float, float, float] | None = None
-        for resolution, resolution_stage in resolution_results.items():
-            for trial in resolution_stage["trials"]:
-                row = trial["test"]["per_row"][row_key]
-                calibration = row["calibration"]
-                key = (
-                    float(calibration["combined"]),
-                    float(calibration["sensitivity"]),
-                    float(calibration["invariance"]),
-                )
-                if selected_key is None or key > selected_key:
-                    selected_key = key
-                    selected = (resolution, resolution_stage, trial, row)
-        if selected is None:
-            raise RuntimeError(f"no resolution/trial candidate generated for {row_key}")
-        resolution, resolution_stage, trial, row = selected
+        resolution, resolution_stage, trial, row = selected_by_row[row_key]
         selected_row = dict(row)
         resolution_sites = _dedupe_sites(tuple(sites_by_resolution[int(resolution)]))
         calibrated = {
@@ -761,9 +824,25 @@ def _run_alignment_resolution_sweep(
         "mean_combined": 0.5 * (_mean(test_sensitivity) + _mean(test_invariance)),
         "subset": _subset_summary({key: value["test"] for key, value in selected_per_row.items()}, row_keys),
     }
-    calibration_sweep_wall_seconds = sum(
+    selected_epsilon_resolution_runtime_seconds = 0.0
+    for resolution_stage in resolution_results.values():
+        matching_trial = next(
+            (
+                trial
+                for trial in resolution_stage["trials"]
+                if (float(trial["epsilon"]) if "epsilon" in trial else None) == selected_epsilon
+            ),
+            None,
+        )
+        if matching_trial is None:
+            raise RuntimeError(f"missing selected epsilon={selected_epsilon} in a resolution stage")
+        selected_epsilon_resolution_runtime_seconds += float(
+            matching_trial.get("runtime_seconds", resolution_stage.get("runtime_seconds", 0.0))
+        )
+    full_hyperparameter_sweep_wall_seconds = sum(
         float(stage["wall_runtime_seconds"]) for stage in resolution_results.values()
     )
+    calibration_sweep_wall_seconds = float(selected_epsilon_resolution_runtime_seconds)
     sweep_wall_seconds = float(calibration_sweep_wall_seconds + selected_test_seconds)
     sweep_setup_seconds = sum(float(stage["setup_runtime_seconds"]) for stage in resolution_results.values())
     selected_view = {
@@ -774,6 +853,8 @@ def _run_alignment_resolution_sweep(
             row_key: int(selected_per_row[row_key]["resolution"]) for row_key in row_keys
         },
     }
+    if selected_epsilon is not None:
+        selected_view["epsilon"] = float(selected_epsilon)
     return {
         "stage": str(stage_name),
         "alignment_method": str(alignment_method).replace("-", ""),
@@ -781,11 +862,29 @@ def _run_alignment_resolution_sweep(
         "wall_runtime_seconds": float(sweep_wall_seconds),
         "setup_runtime_seconds": float(sweep_setup_seconds),
         "runtime_definition": (
-            "sum of calibration wall runtime across all independent resolution sweeps "
-            "plus test runtime for calibration-selected rows"
+            "sum of coupling+calibration runtime across all independent resolutions at the "
+            "globally selected epsilon plus test runtime for frozen calibration-selected rows"
+            if selected_epsilon is not None
+            else "sum of coupling+calibration runtime across all independent resolutions plus "
+            "test runtime for frozen calibration-selected rows"
         ),
         "calibration_sweep_runtime_seconds": float(calibration_sweep_wall_seconds),
+        "selected_epsilon_resolution_sweep_runtime_seconds": float(calibration_sweep_wall_seconds),
+        "full_hyperparameter_sweep_wall_runtime_seconds": float(full_hyperparameter_sweep_wall_seconds),
         "selected_test_runtime_seconds": float(selected_test_seconds),
+        "epsilon_selection_rule": "macro_average_of_each_row_best_resolution_calibration_combined",
+        "selected_epsilon": selected_epsilon,
+        "epsilon_calibration_plans": [
+            {
+                "epsilon": plan["epsilon"],
+                "mean_best_row_calibration_score": plan["mean_best_row_calibration_score"],
+                "best_row_calibration_scores": plan["best_row_calibration_scores"],
+                "selected_resolution_by_row": {
+                    row_key: int(plan["selected_by_row"][row_key][0]) for row_key in row_keys
+                },
+            }
+            for plan in plans_by_epsilon
+        ],
         "resolutions": [int(value) for value in sites_by_resolution],
         "resolution_results": resolution_results,
         "selected_resolution_by_row": selected_view["selected_resolution_by_row"],
@@ -1444,8 +1543,15 @@ def _alignment_stage_runtime_breakdown(prefix: str, stage: dict[str, object]) ->
             f"{prefix}_calibration_sweep_runtime_seconds": float(
                 stage.get("calibration_sweep_runtime_seconds", 0.0)
             ),
+            f"{prefix}_selected_epsilon_resolution_sweep_runtime_seconds": float(
+                stage.get("selected_epsilon_resolution_sweep_runtime_seconds", 0.0)
+            ),
+            f"{prefix}_full_hyperparameter_sweep_wall_runtime_seconds": float(
+                stage.get("full_hyperparameter_sweep_wall_runtime_seconds", 0.0)
+            ),
             f"{prefix}_selected_test_runtime_seconds": float(stage.get("selected_test_runtime_seconds", 0.0)),
         }
+        selected_epsilon = stage.get("selected_epsilon")
         for resolution, resolution_stage in resolution_results.items():
             breakdown[f"{prefix}_r{resolution}_wall_runtime_seconds"] = float(
                 resolution_stage.get("wall_runtime_seconds", resolution_stage.get("runtime_seconds", 0.0))
@@ -1453,6 +1559,18 @@ def _alignment_stage_runtime_breakdown(prefix: str, stage: dict[str, object]) ->
             breakdown[f"{prefix}_r{resolution}_setup_runtime_seconds"] = float(
                 resolution_stage.get("setup_runtime_seconds", 0.0)
             )
+            selected_trial = next(
+                (
+                    trial
+                    for trial in resolution_stage.get("trials", [])
+                    if (float(trial["epsilon"]) if "epsilon" in trial else None) == selected_epsilon
+                ),
+                None,
+            )
+            if isinstance(selected_trial, dict):
+                breakdown[f"{prefix}_r{resolution}_selected_epsilon_runtime_seconds"] = float(
+                    selected_trial.get("runtime_seconds", 0.0)
+                )
         return breakdown
     best_trial = stage.get("best_trial", {})
     if not isinstance(best_trial, dict):

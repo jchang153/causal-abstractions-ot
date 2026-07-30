@@ -1501,8 +1501,11 @@ def _run_single_seed(seed: int) -> dict[str, object]:
                 ),
                 train_bank=train_bank,
                 calibration_bank=calibration_bank,
-                test_bank=test_bank,
-                invariant_test_bank=invariant_test_bank,
+                # Hyperparameter sweeps are calibration-only. Supplying the
+                # calibration bank as the temporary evaluation bank preserves
+                # the existing payload schema without touching the test split.
+                test_bank=calibration_bank,
+                invariant_test_bank=None,
                 transport_prepare_cache=transport_prepare_cache,
             )
             sweep_record = {
@@ -1513,6 +1516,7 @@ def _run_single_seed(seed: int) -> dict[str, object]:
                 "signature_mode": signature_mode,
                 "config_stem": config_stem,
                 "methods": [method],
+                "selection_split": "calibration",
                 "comparison": comparison,
             }
             if _method_uses_epsilon(method):
@@ -1568,13 +1572,58 @@ def _run_single_seed(seed: int) -> dict[str, object]:
         method_dir = seed_run_dir / method
         result_path = method_dir / f"{method}_results.json"
         method_summary_path = method_dir / f"{method}_summary.txt"
-        comparison = dict(best_record.get("comparison", {}))
+        # Evaluate the real test banks exactly once, after the shared method
+        # configuration has been selected by macro calibration accuracy.
+        comparison = run_comparison_with_banks(
+            model=model,
+            backbone_meta=backbone_meta,
+            device=device,
+            config=build_compare_config(
+                int(seed),
+                checkpoint_path,
+                (method,),
+                float(best_record.get("ot_epsilon", OT_EPSILONS[0])),
+                float(best_record.get("ot_tau", OT_TAUS[0])),
+                float(best_record.get("uot_beta_abstract", UOT_BETA_ABSTRACTS[0])),
+                float(best_record.get("uot_beta_neural", UOT_BETA_NEURALS[0])),
+                str(best_record.get("signature_mode", SIGNATURE_MODES[0])),
+                result_path,
+                method_summary_path,
+            ),
+            train_bank=train_bank,
+            calibration_bank=calibration_bank,
+            test_bank=test_bank,
+            invariant_test_bank=invariant_test_bank,
+            transport_prepare_cache=transport_prepare_cache,
+        )
         comparison["summary_path"] = str(method_summary_path)
         write_json(result_path, comparison)
         write_text_report(method_summary_path, _build_transport_method_summary(method, method_records))
         best_method_runs[method] = {
             "method": method,
             "source_type": "sweep" if _method_uses_epsilon(method) else "single_alignment",
+            "epsilon_selection_rule": "macro_average_calibration_exact_across_variables",
+            "test_evaluation_policy": "selected_global_configuration_only",
+            "calibration_configuration_scores": [
+                {
+                    "ot_epsilon": (
+                        float(record.get("ot_epsilon", 0.0))
+                        if _method_uses_epsilon(method)
+                        else None
+                    ),
+                    "macro_variable_calibration_exact": float(
+                        next(
+                            (
+                                summary.get("exact_acc", 0.0)
+                                for summary in dict(record.get("comparison", {})).get("method_summary", [])
+                                if str(summary.get("method")) == method
+                            ),
+                            0.0,
+                        )
+                    ),
+                }
+                for record in method_records
+            ],
             "ot_tau": float(best_record.get("ot_tau", 0.0)),
             "uot_beta_abstract": float(best_record.get("uot_beta_abstract", 0.0)),
             "uot_beta_neural": float(best_record.get("uot_beta_neural", 0.0)),

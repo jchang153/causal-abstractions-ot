@@ -12,6 +12,7 @@ from time import perf_counter
 from typing import Iterable
 
 from mcqa_paper_runtime import write_paper_runtime_summary
+from mcqa_experiment.selection import select_shared_epsilon
 
 
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
@@ -179,6 +180,7 @@ def _sort_best_first(entries: Iterable[dict[str, object]]) -> list[dict[str, obj
     return sorted(
         entries,
         key=lambda entry: (
+            bool(entry.get("selected_for_global_plan", False)),
             float(entry.get("selection_score", entry.get("cal", -1.0))),
             float(entry.get("exact_acc", -1.0)),
             -int(entry.get("layer", 10**9)),
@@ -943,7 +945,7 @@ def _stage_a_rankings_from_layer_sweep(*, manifest_path: Path, manifest_payload:
     if not isinstance(manifest_runs, list):
         raise ValueError(f"Malformed Stage A layer-sweep manifest at {manifest_path}")
 
-    rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+    candidates: list[dict[str, object]] = []
     for manifest_record in manifest_runs:
         if not isinstance(manifest_record, dict):
             continue
@@ -966,19 +968,17 @@ def _stage_a_rankings_from_layer_sweep(*, manifest_path: Path, manifest_payload:
         run_payload = _load_json(run_path)
         if not isinstance(run_payload, dict):
             continue
-        grouped_payloads: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
         for payload in _iter_ot_payloads_from_run_payload(run_payload):
             target_var = str(payload.get("target_var"))
-            grouped_payloads.setdefault(target_var, []).append(payload)
-        for target_var, payloads in grouped_payloads.items():
-            best = _best_result_record(payloads)
+            best = _best_result_record([payload])
             if best is None:
                 continue
-            rankings.setdefault(str(target_var), []).append(
+            candidates.append(
                 {
                     "variable": str(target_var),
                     "layer": int(layer),
                     "selection_score": float(best["selection_score"]),
+                    "calibration_score": float(best["selection_score"]),
                     "exact_acc": float(best["exact_acc"]),
                     "epsilon": float(best["epsilon"]),
                     "site_label": best.get("site_label"),
@@ -989,6 +989,18 @@ def _stage_a_rankings_from_layer_sweep(*, manifest_path: Path, manifest_payload:
                     "source_path": str(run_path),
                 }
             )
+    selection = select_shared_epsilon(candidates, variables=DEFAULT_TARGET_VARS)
+    selected_epsilon = float(selection["selected_epsilon"])
+    rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+    for entry in candidates:
+        if float(entry["epsilon"]) != selected_epsilon:
+            continue
+        entry["selected_global_epsilon"] = selected_epsilon
+        entry["epsilon_selection_rule"] = selection["selection_rule"]
+        entry["selected_for_global_plan"] = bool(
+            selection["selected_by_variable"].get(str(entry["variable"])) is entry
+        )
+        rankings.setdefault(str(entry["variable"]), []).append(entry)
     for target_var in list(rankings):
         rankings[target_var] = _sort_best_first(rankings[target_var])
     return rankings
@@ -1002,8 +1014,30 @@ def _stage_a_rankings_from_joint_run(*, aggregate_path: Path, aggregate_payload:
         target_var = str(payload.get("target_var"))
         grouped_payloads.setdefault(target_var, []).append(payload)
 
+    epsilon_candidates: list[dict[str, object]] = []
+    for target_var, payloads in grouped_payloads.items():
+        for payload in payloads:
+            record = _best_result_record([payload])
+            if record is None:
+                continue
+            epsilon_candidates.append(
+                {
+                    "variable": str(target_var),
+                    "epsilon": float(record["epsilon"]),
+                    "calibration_score": float(record["selection_score"]),
+                    "payload": payload,
+                }
+            )
+    epsilon_selection = select_shared_epsilon(epsilon_candidates, variables=DEFAULT_TARGET_VARS)
+    selected_epsilon = float(epsilon_selection["selected_epsilon"])
+
     rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     for target_var, payloads in grouped_payloads.items():
+        payloads = [
+            payload
+            for payload in payloads
+            if float(payload.get("_ot_epsilon", payload.get("ot_epsilon", -1.0))) == selected_epsilon
+        ]
         if not payloads:
             continue
         best = _best_result_record(payloads)
@@ -1054,6 +1088,8 @@ def _stage_a_rankings_from_joint_run(*, aggregate_path: Path, aggregate_payload:
                     "selection_score": float(best["selection_score"]),
                     "exact_acc": float(best["exact_acc"]),
                     "epsilon": float(best["epsilon"]),
+                    "selected_global_epsilon": selected_epsilon,
+                    "epsilon_selection_rule": epsilon_selection["selection_rule"],
                     "site_label": best.get("site_label"),
                     "runtime_seconds": best.get("runtime_seconds"),
                     "wall_runtime_seconds": best.get("wall_runtime_seconds"),
@@ -1437,7 +1473,7 @@ def _expected_stage_b_native_payload_paths(
 
 
 def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
-    grouped: dict[tuple[str, str, int, str, str, int], dict[str, object]] = {}
+    grouped: dict[tuple[str, str, int, str, str, int, float], dict[str, object]] = {}
     def _stage_b_config_score(entry: dict[str, object]) -> tuple[float, float]:
         return (
             float(entry.get("selection_score", entry.get("cal", -1.0))),
@@ -1465,7 +1501,8 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
                 if not isinstance(selected_hyperparameters, dict):
                     selected_hyperparameters = {}
                 target_var = str(target_var)
-                key = (target_var, token_position_id, layer, basis_source_mode, site_menu, num_bands)
+                epsilon = float(method_summary.get("epsilon", -1.0))
+                key = (target_var, token_position_id, layer, basis_source_mode, site_menu, num_bands, epsilon)
                 entry = {
                     "variable": target_var,
                     "token_position_id": token_position_id,
@@ -1475,7 +1512,8 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
                     "num_bands": num_bands,
                     "exact_acc": float(method_summary.get("exact_acc", -1.0)),
                     "selection_score": float(method_summary.get("selection_score", -1.0)),
-                    "epsilon": float(method_summary.get("epsilon", -1.0)),
+                    "calibration_score": float(method_summary.get("selection_score", -1.0)),
+                    "epsilon": epsilon,
                     "site_label": method_summary.get("site_label"),
                     "selected_top_k": selected_hyperparameters.get("top_k"),
                     "selected_lambda": selected_hyperparameters.get("lambda"),
@@ -1506,7 +1544,8 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
                 selected_hyperparameters = method_payload.get("selected_hyperparameters", {})
                 if not isinstance(selected_hyperparameters, dict):
                     selected_hyperparameters = {}
-                key = (target_var, token_position_id, layer, basis_source_mode, site_menu, num_bands)
+                key = (target_var, token_position_id, layer, basis_source_mode, site_menu, num_bands, epsilon)
+                selection_score = _selection_score(result)
                 entry = {
                     "variable": target_var,
                     "token_position_id": token_position_id,
@@ -1515,7 +1554,8 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
                     "site_menu": site_menu,
                     "num_bands": num_bands,
                     "exact_acc": float(result.get("exact_acc", -1.0)),
-                    "selection_score": _selection_score(result),
+                    "selection_score": selection_score,
+                    "calibration_score": selection_score,
                     "epsilon": epsilon,
                     "site_label": result.get("site_label"),
                     "selected_top_k": selected_hyperparameters.get("top_k"),
@@ -1528,8 +1568,19 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
                 current = grouped.get(key)
                 if current is None or _stage_b_config_score(entry) > _stage_b_config_score(current):
                     grouped[key] = entry
+    selection = select_shared_epsilon(
+        grouped.values(),
+        variables=DEFAULT_TARGET_VARS,
+    )
+    selected_epsilon = float(selection["selected_epsilon"])
     rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
     for entry in grouped.values():
+        if float(entry["epsilon"]) != selected_epsilon:
+            continue
+        entry["selected_global_epsilon"] = selected_epsilon
+        entry["epsilon_selection_rule"] = selection["selection_rule"]
+        selected_entry = selection["selected_by_variable"].get(str(entry["variable"]))
+        entry["selected_for_global_plan"] = bool(selected_entry is entry)
         rankings.setdefault(str(entry["variable"]), []).append(entry)
     for target_var in list(rankings):
         rankings[target_var] = _sort_best_first(rankings[target_var])
@@ -1564,7 +1615,7 @@ def _format_stage_b_summary(*, rankings: dict[str, list[dict[str, object]]]) -> 
 
 
 def _extract_native_support_rankings(*, payload_paths: Iterable[Path]) -> dict[str, list[dict[str, object]]]:
-    rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+    candidates: list[dict[str, object]] = []
     for payload_path in payload_paths:
         payload = _load_json(payload_path)
         if not isinstance(payload, dict) or str(payload.get("kind")) != "mcqa_plot_native_support_layer":
@@ -1572,65 +1623,64 @@ def _extract_native_support_rankings(*, payload_paths: Iterable[Path]) -> dict[s
         layer = int(payload.get("layer"))
         native_resolution = int(payload.get("native_resolution", payload.get("atomic_width")))
         runtime_seconds = float(payload.get("localization_runtime_seconds", payload.get("runtime_seconds", 0.0)))
-        method_by_var = payload.get("method_by_var", {})
-        support_by_var = payload.get("support_by_var", {})
-        for target_var, method_summary in method_by_var.items():
-            if not isinstance(method_summary, dict):
+        alignment_method = str(payload.get("alignment_method", "ot"))
+        for ot_path_str in payload.get("ot_output_paths", []):
+            compare_payload = _load_json(Path(str(ot_path_str)))
+            if not isinstance(compare_payload, dict):
                 continue
-            support_summary = support_by_var.get(str(target_var), {}) if isinstance(support_by_var, dict) else {}
-            top_site_label = None
-            selected_site_total_dim = None
-            selected_site_labels = None
-            selected_top_k = None
-            selected_lambda = None
-            if isinstance(support_summary, dict):
-                ranked_site_labels = support_summary.get("ranked_site_labels", [])
-                if isinstance(ranked_site_labels, list) and ranked_site_labels:
-                    top_site_label = ranked_site_labels[0]
-                mask_candidates = support_summary.get("mask_candidates", [])
-                if isinstance(mask_candidates, list):
-                    selected_mask = next(
-                        (
-                            candidate
-                            for candidate in mask_candidates
-                            if isinstance(candidate, dict) and str(candidate.get("name")) == "Selected"
-                        ),
-                        None,
-                    )
-                    if isinstance(selected_mask, dict):
-                        if selected_mask.get("site_total_dim") is not None:
-                            selected_site_total_dim = int(selected_mask.get("site_total_dim", 0))
-                        if isinstance(selected_mask.get("site_labels"), list):
-                            selected_site_labels = [str(label) for label in selected_mask.get("site_labels", [])]
-                selected_trial = support_summary.get("selected_trial", {})
-                if isinstance(selected_trial, dict):
-                    if selected_trial.get("top_k") is not None:
-                        selected_top_k = int(selected_trial.get("top_k"))
-                    if selected_trial.get("lambda") is not None:
-                        selected_lambda = float(selected_trial.get("lambda"))
-            selected_hyperparameters = method_summary.get("selected_hyperparameters", {})
-            if isinstance(selected_hyperparameters, dict):
-                if selected_top_k is None and selected_hyperparameters.get("top_k") is not None:
-                    selected_top_k = int(selected_hyperparameters.get("top_k"))
-                if selected_lambda is None and selected_hyperparameters.get("lambda") is not None:
-                    selected_lambda = float(selected_hyperparameters.get("lambda"))
-            rankings.setdefault(str(target_var), []).append(
-                {
-                    "variable": str(target_var),
-                    "layer": int(layer),
-                    "native_resolution": int(native_resolution),
-                    "exact_acc": float(method_summary.get("exact_acc", 0.0)),
-                    "selection_score": float(method_summary.get("selection_score", 0.0)),
-                    "epsilon": float(method_summary.get("epsilon", 0.0)),
-                    "site_label": top_site_label or method_summary.get("site_label"),
-                    "selected_top_k": selected_top_k,
-                    "selected_lambda": selected_lambda,
-                    "selected_site_total_dim": selected_site_total_dim,
-                    "selected_site_labels": selected_site_labels,
-                    "runtime_seconds": float(runtime_seconds),
-                    "payload_path": str(payload_path),
-                }
-            )
+            epsilon = float(compare_payload.get("ot_epsilon", 0.0))
+            for method_payload in compare_payload.get("method_payloads", {}).get(alignment_method, []):
+                if not isinstance(method_payload, dict):
+                    continue
+                results = method_payload.get("results", [])
+                if not results or not isinstance(results[0], dict):
+                    continue
+                result = results[0]
+                target_var = str(method_payload.get("target_var") or result.get("variable"))
+                selected_hyperparameters = method_payload.get("selected_hyperparameters", {})
+                if not isinstance(selected_hyperparameters, dict):
+                    selected_hyperparameters = {}
+                selected_transport = method_payload.get("selected_transport", [])
+                selected_site_labels = None
+                if isinstance(selected_transport, list) and selected_transport:
+                    row = selected_transport[0] if isinstance(selected_transport[0], list) else selected_transport
+                    site_labels = payload.get("site_labels", [])
+                    selected_site_labels = [
+                        str(site_labels[index])
+                        for index, weight in enumerate(row)
+                        if index < len(site_labels) and float(weight) > 0.0
+                    ]
+                candidates.append(
+                    {
+                        "variable": target_var,
+                        "layer": int(layer),
+                        "native_resolution": int(native_resolution),
+                        "exact_acc": float(result.get("exact_acc", 0.0)),
+                        "selection_score": float(result.get("selection_score", result.get("calibration_exact_acc", 0.0))),
+                        "calibration_score": float(result.get("selection_score", result.get("calibration_exact_acc", 0.0))),
+                        "epsilon": float(epsilon),
+                        "site_label": result.get("site_label"),
+                        "selected_top_k": selected_hyperparameters.get("top_k"),
+                        "selected_lambda": selected_hyperparameters.get("lambda"),
+                        "selected_site_total_dim": None,
+                        "selected_site_labels": selected_site_labels,
+                        "runtime_seconds": float(runtime_seconds),
+                        "payload_path": str(payload_path),
+                        "compare_payload_path": str(ot_path_str),
+                        "test_evaluated": bool(method_payload.get("test_evaluated", False)),
+                    }
+                )
+    selection = select_shared_epsilon(candidates, variables=DEFAULT_TARGET_VARS)
+    selected_epsilon = float(selection["selected_epsilon"])
+    rankings: dict[str, list[dict[str, object]]] = {target_var: [] for target_var in DEFAULT_TARGET_VARS}
+    for entry in candidates:
+        if float(entry["epsilon"]) != selected_epsilon:
+            continue
+        entry["selected_global_epsilon"] = selected_epsilon
+        entry["epsilon_selection_rule"] = selection["selection_rule"]
+        selected_entry = selection["selected_by_variable"].get(str(entry["variable"]))
+        entry["selected_for_global_plan"] = bool(selected_entry is entry)
+        rankings.setdefault(str(entry["variable"]), []).append(entry)
     for target_var in list(rankings):
         rankings[target_var] = _sort_best_first(rankings[target_var])
     return rankings

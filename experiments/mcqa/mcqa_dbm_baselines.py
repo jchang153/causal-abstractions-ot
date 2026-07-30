@@ -16,6 +16,7 @@ import torch
 
 from mcqa_experiment.data import build_pair_banks, load_filtered_mcqa_pipeline
 from mcqa_experiment.dbm import (
+    DBMMask,
     IdentityBasis,
     PCABasis,
     SAEBasis,
@@ -181,8 +182,14 @@ def main() -> None:
         stem = f"{method}_seed{seed}_{target}_layer{layer}"
         output_path = run_dir / method / f"{stem}.json"
         if output_path.exists() and not args.no_resume:
-            print(f"[resume] {output_path}")
-            continue
+            try:
+                existing_payload = json.loads(output_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                existing_payload = None
+            if isinstance(existing_payload, dict) and "calibration_candidate_seconds" in existing_payload:
+                print(f"[resume] {output_path}")
+                continue
+            print(f"[rebuild] {output_path} uses the legacy every-layer test protocol")
         if seed not in banks_by_seed:
             banks, metadata = build_pair_banks(
                 tokenizer=tokenizer,
@@ -207,10 +214,6 @@ def main() -> None:
         if method == "full-layer":
             payload["calibration"] = evaluate_full_layer(
                 model=model, bank=banks["calibration"][target], layer=layer, device=device,
-                batch_size=args.eval_batch_size, tokenizer=tokenizer,
-            )
-            payload["test"] = evaluate_full_layer(
-                model=model, bank=banks["test"][target], layer=layer, device=device,
                 batch_size=args.eval_batch_size, tokenizer=tokenizer,
             )
         else:
@@ -243,10 +246,6 @@ def main() -> None:
                 model=model, bank=banks["calibration"][target], layer=layer, basis=basis, mask=mask,
                 device=device, batch_size=args.eval_batch_size, tokenizer=tokenizer,
             )
-            payload["test"] = evaluate_dbm(
-                model=model, bank=banks["test"][target], layer=layer, basis=basis, mask=mask,
-                device=device, batch_size=args.eval_batch_size, tokenizer=tokenizer,
-            )
             checkpoint = run_dir / method / f"{stem}.pt"
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
             checkpoint_payload = {"mask_logits": mask.logits.detach().cpu(), "basis": basis_metadata}
@@ -258,11 +257,14 @@ def main() -> None:
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-        payload["total_seconds"] = float(perf_counter() - started)
+        payload["test_evaluated"] = False
+        payload["result_split"] = "calibration"
+        payload["calibration_candidate_seconds"] = float(perf_counter() - started)
+        payload["total_seconds"] = float(payload["calibration_candidate_seconds"])
         atomic_json(output_path, payload)
         print(
             f"[done] {stem} cal={payload['calibration']['exact_acc']:.4f} "
-            f"test={payload['test']['exact_acc']:.4f} seconds={payload['total_seconds']:.1f}"
+            f"seconds={payload['total_seconds']:.1f}"
         )
 
     records = []
@@ -271,6 +273,79 @@ def main() -> None:
             records.append(json.loads(path.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError):
             pass
+    def banks_for_seed(seed: int) -> dict[str, dict[str, object]]:
+        if seed not in banks_by_seed:
+            banks, metadata = build_pair_banks(
+                tokenizer=tokenizer,
+                causal_model=causal_model,
+                token_positions=token_positions,
+                datasets_by_name=filtered,
+                counterfactual_names=("answerPosition", "randomLetter", "answerPosition_randomLetter"),
+                target_vars=targets,
+                split_seed=int(seed),
+                train_pool_size=args.train_size,
+                calibration_pool_size=args.calibration_size,
+                test_pool_size=args.test_size,
+            )
+            banks_by_seed[seed] = banks
+            atomic_json(run_dir / f"data_seed{seed}_shard{args.shard_index}.json", metadata)
+        return banks_by_seed[seed]
+
+    def evaluate_selected(record: dict[str, object]) -> dict[str, object]:
+        selected = dict(record)
+        if selected.get("test_evaluated") is True:
+            return selected
+        method = str(selected["method"])
+        seed = int(selected["seed"])
+        target = str(selected["target_var"])
+        layer = int(selected["layer"])
+        test_started = perf_counter()
+        if method == "full-layer":
+            test_metrics = evaluate_full_layer(
+                model=model,
+                bank=banks_for_seed(seed)["test"][target],
+                layer=layer,
+                device=device,
+                batch_size=args.eval_batch_size,
+                tokenizer=tokenizer,
+            )
+        else:
+            checkpoint = torch.load(run_dir / str(selected["checkpoint"]), map_location="cpu", weights_only=True)
+            if method == "dbm-canonical":
+                basis = IdentityBasis(int(model.config.hidden_size))
+                sae = None
+            elif method == "dbm-pca":
+                basis = PCABasis(components=checkpoint["pca_components"])
+                sae = None
+            else:
+                sae, _ = load_sae(
+                    layer=layer,
+                    release=args.sae_release,
+                    sae_id_template=args.sae_id_template,
+                    device=device,
+                )
+                basis = SAEBasis(sae)
+            mask = DBMMask(int(basis.feature_dim)).to(device)
+            with torch.no_grad():
+                mask.logits.copy_(checkpoint["mask_logits"].to(device=device, dtype=mask.logits.dtype))
+            test_metrics = evaluate_dbm(
+                model=model,
+                bank=banks_for_seed(seed)["test"][target],
+                layer=layer,
+                basis=basis,
+                mask=mask,
+                device=device,
+                batch_size=args.eval_batch_size,
+                tokenizer=tokenizer,
+            )
+            del mask, basis, sae
+        selected_test_seconds = perf_counter() - test_started
+        selected["test"] = test_metrics
+        selected["test_evaluated"] = True
+        selected["result_split"] = "test"
+        selected["selected_test_seconds"] = float(selected_test_seconds)
+        return selected
+
     rankings: dict[str, object] = {}
     for method in methods:
         for seed in seeds:
@@ -279,7 +354,22 @@ def main() -> None:
                 if not subset:
                     continue
                 subset.sort(key=lambda item: (-float(item["calibration"]["exact_acc"]), int(item["layer"])))
-                rankings[f"{method}/seed{seed}/{target}"] = {"calibration_selected": subset[0], "all_layers": subset}
+                selected = evaluate_selected(subset[0])
+                selected_path = run_dir / method / f"{method}_seed{seed}_{target}_layer{int(selected['layer'])}.json"
+                atomic_json(selected_path, selected)
+                calibration_sweep_seconds = sum(float(item.get("calibration_candidate_seconds", item["total_seconds"])) for item in subset)
+                reported_runtime_seconds = calibration_sweep_seconds + float(selected.get("selected_test_seconds", 0.0))
+                rankings[f"{method}/seed{seed}/{target}"] = {
+                    "calibration_selected": selected,
+                    "all_layers": subset,
+                    "selection_split": "calibration",
+                    "test_used_for_selection": False,
+                    "test_evaluation_policy": "selected_layer_only",
+                    "calibration_layer_sweep_seconds": float(calibration_sweep_seconds),
+                    "selected_test_seconds": float(selected.get("selected_test_seconds", 0.0)),
+                    "runtime_seconds": float(reported_runtime_seconds),
+                    "runtime_definition": "all-layer training/calibration sweep plus selected-layer test evaluation",
+                }
     atomic_json(run_dir / f"rankings_shard{args.shard_index}.json", rankings)
     print(f"All results saved under: {run_dir.resolve()}")
 

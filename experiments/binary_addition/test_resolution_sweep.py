@@ -57,7 +57,7 @@ def _stage(*, calibration: float, test: float, wall: float, sites: list[str]) ->
     }
 
 
-def test_resolution_sweep_separates_couplings_selects_by_calibration_and_charges_all_runtime() -> None:
+def test_resolution_sweep_selects_shared_epsilon_and_charges_its_full_resolution_sweep() -> None:
     calls: list[tuple[str, ...]] = []
 
     def fake_stage(**kwargs):
@@ -116,7 +116,9 @@ def test_resolution_sweep_separates_couplings_selects_by_calibration_and_charges
     assert calls == [("r1",), ("r2",)]
     assert result["selected_resolution_by_row"] == {"C1": 2}
     assert result["best_trial"]["test"]["subset"]["mean_combined"] == 0.4
-    assert result["calibration_sweep_runtime_seconds"] == 5.0
-    assert result["runtime_seconds"] >= 5.0
+    assert result["selected_epsilon"] == 0.1
+    assert result["calibration_sweep_runtime_seconds"] == 2.5
+    assert result["full_hyperparameter_sweep_wall_runtime_seconds"] == 5.0
+    assert result["runtime_seconds"] >= 2.5
     assert result["resolution_results"]["1"]["sites"] == ["r1"]
     assert result["resolution_results"]["2"]["sites"] == ["r2"]

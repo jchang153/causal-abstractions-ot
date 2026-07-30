@@ -1157,6 +1157,7 @@ def run_alignment_pipeline(
     calibration_banks: dict[str, MCQAPairBank] | None = None,
     holdout_banks: dict[str, MCQAPairBank] | None = None,
     target_vars: tuple[str, ...] | None = None,
+    evaluate_holdout: bool = True,
 ) -> dict[str, object]:
     """Run OT or UOT for one MCQA target variable using a two-source abstraction."""
     method_key = str(config.method).lower()
@@ -1297,23 +1298,30 @@ def run_alignment_pipeline(
         for entry in selected.get("ranking", [])
     ]
     selected_calibration_eval_seconds = 0.0
-    holdout_start = perf_counter()
-    holdout_result, holdout_ranking = _evaluate_soft_intervention(
-        model=model,
-        bank=holdout_bank,
-        sites=sites,
-        selected_transport=selected_transport,
-        top_k=top_k,
-        strength=strength,
-        batch_size=config.batch_size,
-        device=device,
-        tokenizer=tokenizer,
-        source_target_vars=target_source_target_vars,
-        include_details=bool(config.store_prediction_details),
-        pca_bases_by_id=pca_bases_by_id,
-    )
-    _synchronize_if_cuda(device)
-    holdout_eval_seconds = float(perf_counter() - holdout_start)
+    holdout_eval_seconds = 0.0
+    if bool(evaluate_holdout):
+        holdout_start = perf_counter()
+        holdout_result, holdout_ranking = _evaluate_soft_intervention(
+            model=model,
+            bank=holdout_bank,
+            sites=sites,
+            selected_transport=selected_transport,
+            top_k=top_k,
+            strength=strength,
+            batch_size=config.batch_size,
+            device=device,
+            tokenizer=tokenizer,
+            source_target_vars=target_source_target_vars,
+            include_details=bool(config.store_prediction_details),
+            pca_bases_by_id=pca_bases_by_id,
+        )
+        _synchronize_if_cuda(device)
+        holdout_eval_seconds = float(perf_counter() - holdout_start)
+    else:
+        # Preserve the result schema for calibration-only sweeps while making
+        # the split explicit.  No holdout examples are evaluated here.
+        holdout_result = dict(selected_calibration_result)
+        holdout_ranking = list(selected_calibration_ranking)
     total_wall_seconds = float(perf_counter() - total_start)
     localization_runtime_seconds = float(
         artifact_prepare_create_seconds
@@ -1332,6 +1340,8 @@ def run_alignment_pipeline(
     holdout_result["signature_mode"] = str(config.signature_mode)
     holdout_result["selected_transport_nonzero"] = int((selected_transport.sum(axis=0) > 0.0).sum())
     holdout_result["selected_raw_captured_mass"] = float(selected_raw_captured_mass)
+    holdout_result["result_split"] = "test" if bool(evaluate_holdout) else "calibration"
+    holdout_result["test_evaluated"] = bool(evaluate_holdout)
     if config.selection_verbose:
         print(
             f"[{config.method.upper()}] holdout variable={holdout_bank.target_var} "
@@ -1344,6 +1354,8 @@ def run_alignment_pipeline(
         "signature_mode": config.signature_mode,
         "calibration_metric": config.calibration_metric,
         "calibration_family_weights": [float(weight) for weight in config.calibration_family_weights],
+        "test_evaluated": bool(evaluate_holdout),
+        "result_split": "test" if bool(evaluate_holdout) else "calibration",
         "transport": transport.tolist(),
         "normalized_transport": normalized_transport.tolist(),
         "target_transport": target_transport.tolist(),

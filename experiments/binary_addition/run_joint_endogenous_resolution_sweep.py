@@ -1006,6 +1006,7 @@ def main() -> None:
     output_keys = [f"S{i}" for i in range(int(args.width)) if f"S{i}" in row_keys]
 
     per_resolution = []
+    sites_by_resolution: dict[int, tuple[Site, ...]] = {}
     best_by_method: dict[str, dict[str, object]] = {}
     for resolution in resolutions:
         if str(args.hidden_site_basis) == "pca":
@@ -1038,6 +1039,7 @@ def main() -> None:
             )
         output_sites = enumerate_output_logit_sites(output_dim=int(args.width) + 1)
         sites: tuple[Site, ...] = tuple(hidden_sites) + tuple(output_sites)
+        sites_by_resolution[int(resolution)] = sites
         cost, diagnostics = _fit_cost_matrix(
             model,
             specs=specs,
@@ -1090,8 +1092,6 @@ def main() -> None:
                 profile_row_results: dict[str, dict[str, dict[str, object]]] = {profile_key: {} for profile_key in profile_keys}
                 profile_calib_sens: dict[str, list[float]] = {profile_key: [] for profile_key in profile_keys}
                 profile_calib_inv: dict[str, list[float]] = {profile_key: [] for profile_key in profile_keys}
-                profile_test_sens: dict[str, list[float]] = {profile_key: [] for profile_key in profile_keys}
-                profile_test_inv: dict[str, list[float]] = {profile_key: [] for profile_key in profile_keys}
                 for row_idx, row_key in enumerate(row_keys):
                     candidates = enumerate_transport_row_candidates(
                         model,
@@ -1110,27 +1110,15 @@ def main() -> None:
                             selection_rule=str(selection_rule),
                             invariance_floor=float(invariance_floor),
                         )
-                        tested = evaluate_single_calibrated_transport(
-                            model,
-                            calibrated,
-                            sites,
-                            banks["test_positive_by_row"][row_key],
-                            banks["test_invariant_by_row"][row_key],
-                            device=device,
-                            run_cache=run_cache,
-                            rotation_map=rotation_map,
-                        )
                         profile_row_results[profile_key][row_key] = {
                             "calibration": calibrated["calibration"],
-                            "test": tested,
+                            "test": None,
                             "top_k": int(calibrated["top_k"]),
                             "lambda": float(calibrated["lambda"]),
                             "selected_sites": calibrated["selected_sites"],
                         }
                         profile_calib_sens[profile_key].append(float(calibrated["calibration"]["sensitivity"]))
                         profile_calib_inv[profile_key].append(float(calibrated["calibration"]["invariance"]))
-                        profile_test_sens[profile_key].append(float(tested["sensitivity"]))
-                        profile_test_inv[profile_key].append(float(tested["invariance"]))
 
                 profile_results: dict[str, dict[str, object]] = {}
                 for profile_key in profile_keys:
@@ -1143,20 +1131,10 @@ def main() -> None:
                             / max(1, 2 * len(profile_calib_sens[profile_key]))
                         ),
                     }
-                    test_summary = {
-                        "per_row": per_row,
-                        "mean_sensitivity": float(sum(profile_test_sens[profile_key]) / max(1, len(profile_test_sens[profile_key]))),
-                        "mean_invariance": float(sum(profile_test_inv[profile_key]) / max(1, len(profile_test_inv[profile_key]))),
-                        "mean_combined": float(
-                            (sum(profile_test_sens[profile_key]) + sum(profile_test_inv[profile_key]))
-                            / max(1, 2 * len(profile_test_sens[profile_key]))
-                        ),
-                        "carry_subset": _subset_summary({k: v["test"] for k, v in per_row.items()}, carry_keys),
-                        "output_subset": _subset_summary({k: v["test"] for k, v in per_row.items()}, output_keys) if output_keys else None,
-                    }
                     profile_results[profile_key] = {
                         "calibration": calibration_summary,
-                        "test": test_summary,
+                        "test": None,
+                        "per_row": per_row,
                     }
                     key = (
                         float(calibration_summary["mean_combined"]),
@@ -1180,7 +1158,7 @@ def main() -> None:
                 if len(profile_keys) == 1:
                     only_profile_key = profile_keys[0]
                     trial["calibration"] = profile_results[only_profile_key]["calibration"]
-                    trial["test"] = profile_results[only_profile_key]["test"]
+                    trial["test"] = None
                 trials.append(trial)
 
             resolution_result["methods"][method] = {
@@ -1205,11 +1183,137 @@ def main() -> None:
                         best_by_method[method] = method_best_trial
         per_resolution.append(resolution_result)
 
+    best_by_method_and_profile: dict[str, dict[str, dict[str, object]]] = {}
+    for method in requested_methods:
+        best_by_method_and_profile[method] = {}
+        for profile_key in profile_keys:
+            configs_in_order: list[tuple[tuple[str, float], ...]] = []
+            trials_by_config: dict[tuple[tuple[str, float], ...], list[tuple[int, dict[str, object]]]] = {}
+            for resolution_result in per_resolution:
+                resolution = int(resolution_result["resolution"])
+                for trial in resolution_result["methods"][method]["trials"]:
+                    config_key = tuple(
+                        sorted(
+                            (str(key), float(value))
+                            for key, value in trial["config"].items()
+                            if key not in {"method", "resolution"}
+                        )
+                    )
+                    if config_key not in trials_by_config:
+                        configs_in_order.append(config_key)
+                        trials_by_config[config_key] = []
+                    trials_by_config[config_key].append((resolution, trial))
+
+            config_plans: list[dict[str, object]] = []
+            for config_key in configs_in_order:
+                selected_by_row: dict[str, tuple[int, dict[str, object], dict[str, object]]] = {}
+                row_scores: dict[str, float] = {}
+                for row_key in row_keys:
+                    best = None
+                    best_key = None
+                    for resolution, trial in trials_by_config[config_key]:
+                        row = trial["profile_results"][profile_key]["per_row"][row_key]
+                        calibration = row["calibration"]
+                        key = (
+                            float(calibration["combined"]),
+                            float(calibration["sensitivity"]),
+                            float(calibration["invariance"]),
+                        )
+                        if best_key is None or key > best_key:
+                            best_key = key
+                            best = (resolution, trial, row)
+                    if best is None or best_key is None:
+                        raise RuntimeError(f"missing {method} candidate for {row_key} and {config_key}")
+                    selected_by_row[row_key] = best
+                    row_scores[row_key] = float(best_key[0])
+                config_plans.append(
+                    {
+                        "config_key": config_key,
+                        "mean_best_row_calibration_score": sum(row_scores.values()) / len(row_scores),
+                        "best_row_calibration_scores": row_scores,
+                        "selected_by_row": selected_by_row,
+                    }
+                )
+            if not config_plans:
+                continue
+            selected_plan = config_plans[0]
+            for candidate_plan in config_plans[1:]:
+                if float(candidate_plan["mean_best_row_calibration_score"]) > float(
+                    selected_plan["mean_best_row_calibration_score"]
+                ):
+                    selected_plan = candidate_plan
+
+            test_per_row: dict[str, dict[str, object]] = {}
+            test_sens: list[float] = []
+            test_inv: list[float] = []
+            calibration_sens: list[float] = []
+            calibration_inv: list[float] = []
+            selected_resolution_by_row: dict[str, int] = {}
+            for row_key, (resolution, _trial, row) in selected_plan["selected_by_row"].items():
+                tested = evaluate_single_calibrated_transport(
+                    model,
+                    row,
+                    sites_by_resolution[int(resolution)],
+                    banks["test_positive_by_row"][row_key],
+                    banks["test_invariant_by_row"][row_key],
+                    device=device,
+                    run_cache=run_cache,
+                    rotation_map=rotation_map,
+                )
+                selected_row = dict(row)
+                selected_row["test"] = tested
+                selected_row["resolution"] = int(resolution)
+                test_per_row[row_key] = selected_row
+                selected_resolution_by_row[row_key] = int(resolution)
+                calibration_sens.append(float(row["calibration"]["sensitivity"]))
+                calibration_inv.append(float(row["calibration"]["invariance"]))
+                test_sens.append(float(tested["sensitivity"]))
+                test_inv.append(float(tested["invariance"]))
+            selected_config = {key: value for key, value in selected_plan["config_key"]}
+            profile_result = {
+                "calibration": {
+                    "mean_sensitivity": sum(calibration_sens) / len(calibration_sens),
+                    "mean_invariance": sum(calibration_inv) / len(calibration_inv),
+                    "mean_combined": (sum(calibration_sens) + sum(calibration_inv)) / (2 * len(calibration_sens)),
+                },
+                "test": {
+                    "per_row": test_per_row,
+                    "mean_sensitivity": sum(test_sens) / len(test_sens),
+                    "mean_invariance": sum(test_inv) / len(test_inv),
+                    "mean_combined": (sum(test_sens) + sum(test_inv)) / (2 * len(test_sens)),
+                    "carry_subset": _subset_summary({k: v["test"] for k, v in test_per_row.items()}, carry_keys),
+                    "output_subset": _subset_summary({k: v["test"] for k, v in test_per_row.items()}, output_keys) if output_keys else None,
+                },
+            }
+            selected_record = {
+                "config": {"method": method, **selected_config},
+                "profile_key": profile_key,
+                "profile_result": profile_result,
+                "selected_resolution_by_row": selected_resolution_by_row,
+                "selection_rule": "macro_average_of_each_row_best_resolution_calibration_combined",
+                "test_evaluation_policy": "selected_global_configuration_only",
+                "config_calibration_plans": [
+                    {
+                        "config": {key: value for key, value in plan["config_key"]},
+                        "mean_best_row_calibration_score": plan["mean_best_row_calibration_score"],
+                        "best_row_calibration_scores": plan["best_row_calibration_scores"],
+                        "selected_resolution_by_row": {
+                            row_key: int(plan["selected_by_row"][row_key][0]) for row_key in row_keys
+                        },
+                    }
+                    for plan in config_plans
+                ],
+            }
+            best_by_method_and_profile[method][profile_key] = selected_record
+            if len(profile_keys) == 1:
+                best_by_method[method] = selected_record
+
     result = {
         "config": vars(args),
         "row_keys": row_keys,
         "family_order": list(family_order),
         "selection_profiles": [{"profile_key": key, "selection_rule": rule, "invariance_floor": floor} for key, (rule, floor) in zip(profile_keys, selection_profiles)],
+        "best_by_method_and_profile": best_by_method_and_profile,
         "factual_exact": {
             "all": exact_accuracy(model, examples, device=device),
             "fit": exact_accuracy(model, split.fit, device=device),

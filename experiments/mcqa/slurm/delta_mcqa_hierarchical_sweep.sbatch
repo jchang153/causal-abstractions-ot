@@ -31,7 +31,13 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export RESULTS_ROOT="${RESULTS_ROOT:-results/delta}"
 export RESULTS_TIMESTAMP="${RESULTS_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-export STAGES="${STAGES:-stage_a_layer_ot,stage_b_native_ot,stage_b_pca_ot,stage_c_guided_das}"
+export STAGES="${STAGES:-stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_layer,stage_c_plot_das_native_support,stage_c_plot_das_dimension,stage_c_plot_das_pca_support}"
+export DATASET_SIZE="${DATASET_SIZE:-2000}"
+export SPLIT_SEED="${SPLIT_SEED:-0}"
+export TRAIN_POOL_SIZE="${TRAIN_POOL_SIZE:-200}"
+export CALIBRATION_POOL_SIZE="${CALIBRATION_POOL_SIZE:-200}"
+export TEST_POOL_SIZE="${TEST_POOL_SIZE:-200}"
+export PLOT_ALIGNMENT_METHOD="${PLOT_ALIGNMENT_METHOD:-ot}"
 export STAGE_A_TOKEN_POSITION_IDS="${STAGE_A_TOKEN_POSITION_IDS:-last_token}"
 export STAGE_A_LAYER_INDICES="${STAGE_A_LAYER_INDICES:-}"
 export TARGET_VARS="${TARGET_VARS:-answer_pointer,answer_token}"
@@ -60,12 +66,18 @@ export REGULAR_DAS_SUBSPACE_DIMS="${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,
 
 mkdir -p "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}"
 
-echo "[delta-mcqa-hier] host=$(hostname) stages=${STAGES} token_positions=${STAGE_A_TOKEN_POSITION_IDS} timestamp=${RESULTS_TIMESTAMP}"
+echo "[delta-mcqa-hier] host=$(hostname) seed=${SPLIT_SEED} alignment=${PLOT_ALIGNMENT_METHOD} stages=${STAGES} timestamp=${RESULTS_TIMESTAMP}"
 nvidia-smi
 
 ARGS=(
   --device cuda
   --dataset-path jchang153/copycolors_mcqa
+  --dataset-size "${DATASET_SIZE}"
+  --split-seed "${SPLIT_SEED}"
+  --train-pool-size "${TRAIN_POOL_SIZE}"
+  --calibration-pool-size "${CALIBRATION_POOL_SIZE}"
+  --test-pool-size "${TEST_POOL_SIZE}"
+  --batch-size 64
   --results-root "${RESULTS_ROOT}"
   --results-timestamp "${RESULTS_TIMESTAMP}"
   --signatures-dir signatures
@@ -73,6 +85,7 @@ ARGS=(
   --stage-a-token-position-ids "${STAGE_A_TOKEN_POSITION_IDS}"
   --target-vars "${TARGET_VARS}"
   --signature-mode "${SIGNATURE_MODE}"
+  --plot-alignment-method "${PLOT_ALIGNMENT_METHOD}"
   --ot-epsilons "${OT_EPSILONS}"
   --ot-top-k-values "${OT_TOP_K_VALUES}"
   --ot-lambdas "${OT_LAMBDAS}"

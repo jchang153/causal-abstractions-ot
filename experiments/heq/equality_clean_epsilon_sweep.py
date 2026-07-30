@@ -130,7 +130,9 @@ def main() -> None:
                 model=model,
                 fit_bank=train_bank,
                 calibration_bank=calibration_bank,
-                holdout_bank=test_banks,
+                # Calibration-only sweep: the real test banks are not touched
+                # until one shared epsilon has been selected for both variables.
+                holdout_bank=calibration_bank,
                 device=device,
                 config=OTConfig(
                     method=method,
@@ -150,10 +152,47 @@ def main() -> None:
             )
             runtime_seconds = perf_counter() - start
             record = record_from_payload(method, epsilon, payload, runtime_seconds)
+            record["result_split"] = "calibration"
+            record["test_evaluated"] = False
             sweep_records.append(record)
             incumbent = best_by_method.get(method)
             if incumbent is None or float(record["average_exact_acc"]) > float(incumbent["average_exact_acc"]):
                 best_by_method[method] = record
+
+    for method in METHODS:
+        selected_calibration = best_by_method[method]
+        epsilon = float(selected_calibration["epsilon"])
+        start = perf_counter()
+        test_payload = run_alignment_pipeline(
+            model=model,
+            fit_bank=train_bank,
+            calibration_bank=calibration_bank,
+            holdout_bank=test_banks,
+            device=device,
+            config=OTConfig(
+                method=method,
+                batch_size=BATCH_SIZE,
+                resolution=RESOLUTION,
+                epsilon=epsilon,
+                tau=float(TAU),
+                uot_reg_m=float(UOT_REG_M),
+                target_vars=tuple(TARGET_VARS),
+                top_k_values=TOP_K_VALUES,
+                lambda_values=LAMBDAS,
+                signature_mode=SIGNATURE_MODE,
+                selection_verbose=True,
+                regularization_source="epsilon",
+                epsilon_retry_multipliers=(1.0,),
+            ),
+        )
+        selected_test = record_from_payload(method, epsilon, test_payload, perf_counter() - start)
+        selected_test["calibration_average_exact_acc"] = float(selected_calibration["average_exact_acc"])
+        selected_test["calibration_per_variable_exact_acc"] = dict(selected_calibration["per_variable_exact_acc"])
+        selected_test["epsilon_selection_rule"] = "macro_average_calibration_exact_across_variables"
+        selected_test["result_split"] = "test"
+        selected_test["test_evaluated"] = True
+        selected_test["test_evaluation_policy"] = "selected_global_epsilon_only"
+        best_by_method[method] = selected_test
 
     summary_payload = {
         "seed": SEED,

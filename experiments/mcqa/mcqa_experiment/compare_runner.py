@@ -48,6 +48,7 @@ class CompareExperimentConfig:
     resolution: int | None = None
     layers: tuple[int, ...] | None = None
     token_position_ids: tuple[str, ...] | None = ("correct_symbol", "correct_symbol_period", "last_token")
+    evaluate_test: bool = True
 
 
 def run_comparison(
@@ -158,6 +159,7 @@ def run_comparison(
                     tokenizer=tokenizer,
                     config=current_ot_config,
                     prepared_artifacts=prepared_artifacts,
+                    evaluate_holdout=bool(config.evaluate_test),
                 )
             elif method_key == "bruteforce":
                 current_ot_config = OTConfig(
@@ -272,6 +274,8 @@ def run_comparison(
         "data": data_metadata,
         "method_payloads": method_payloads,
         "method_runtime_breakdown_seconds": method_runtime_breakdown_seconds,
+        "test_evaluated": bool(config.evaluate_test),
+        "result_split": "test" if bool(config.evaluate_test) else "calibration",
         "results": all_records,
         "method_summary": summary_records,
     }
@@ -279,7 +283,10 @@ def run_comparison(
         payload["ot_epsilon"] = float(config.ot_epsilon)
     write_json(config.output_path, payload)
     write_text_report(config.summary_path, summary_text)
-    print_results_table(all_records, "MCQA Counterfactual Test Results")
+    print_results_table(
+        all_records,
+        "MCQA Counterfactual Test Results" if bool(config.evaluate_test) else "MCQA Calibration Sweep Results",
+    )
     print_results_table(summary_records, "MCQA Method Average Summary")
     print(f"Wrote comparison results to {Path(config.output_path).resolve()}")
     print(f"Wrote comparison summary to {Path(config.summary_path).resolve()}")

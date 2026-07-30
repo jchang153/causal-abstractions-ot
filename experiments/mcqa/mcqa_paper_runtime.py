@@ -231,7 +231,7 @@ def _native_selected_width_epsilon_runtime(
     restrict_to_selected_width: bool = True,
     restrict_to_selected_epsilon: bool = True,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, dict[int, float]]]:
-    if not bool(restrict_to_selected_width) or not bool(restrict_to_selected_epsilon):
+    if not bool(restrict_to_selected_epsilon):
         runtime_grid_by_width: dict[tuple[str, int, int], float] = {}
         for target_var in TARGET_VARS:
             entries = rankings.get(target_var)
@@ -331,11 +331,11 @@ def _native_selected_width_epsilon_runtime(
                 continue
             if restrict_to_selected_layer and int(layer) != int(selected_layer):
                 continue
-            if int(native_resolution) != int(selected_width):
+            if restrict_to_selected_width and int(native_resolution) != int(selected_width):
                 continue
             if not _float_matches(epsilon, selected_epsilon):
                 continue
-            layer_runtimes[int(layer)] = float(runtime_seconds)
+            layer_runtimes[int(layer)] = _as_float(layer_runtimes.get(int(layer))) + float(runtime_seconds)
         runtime_by_layer_by_var[str(target_var)] = layer_runtimes
         values = list(layer_runtimes.values())
         downstream_by_var[str(target_var)] = float(sum(values))
@@ -448,7 +448,7 @@ def _pca_selected_config_epsilon_runtime(
                     runtime_seconds
                 )
 
-    if not bool(restrict_to_selected_config) or not bool(restrict_to_selected_epsilon):
+    if not bool(restrict_to_selected_epsilon):
         downstream_by_var: dict[str, float] = {}
         parallel_by_var: dict[str, float] = {}
         runtime_by_layer_by_var: dict[str, dict[int, float]] = {}
@@ -499,15 +499,16 @@ def _pca_selected_config_epsilon_runtime(
         for (row_var, layer, basis_source_mode, site_menu, num_bands, epsilon), runtime_seconds in runtime_grid.items():
             if str(row_var) != str(target_var):
                 continue
-            if str(basis_source_mode) != selected_basis:
-                continue
-            if str(site_menu) != selected_menu:
-                continue
-            if int(num_bands) != selected_bands:
-                continue
+            if restrict_to_selected_config:
+                if str(basis_source_mode) != selected_basis:
+                    continue
+                if str(site_menu) != selected_menu:
+                    continue
+                if int(num_bands) != selected_bands:
+                    continue
             if not _float_matches(epsilon, selected_epsilon):
                 continue
-            layer_runtimes[int(layer)] = float(runtime_seconds)
+            layer_runtimes[int(layer)] = _as_float(layer_runtimes.get(int(layer))) + float(runtime_seconds)
         runtime_by_layer_by_var[str(target_var)] = layer_runtimes
         values = list(layer_runtimes.values())
         downstream_by_var[str(target_var)] = float(sum(values))
@@ -753,7 +754,7 @@ def build_paper_runtime_summary(
     native_downstream, native_parallel_by_var, native_runtime_by_layer_by_var = _native_selected_width_epsilon_runtime(
         rankings=native_rankings,
         entries_by_var=native_entries,
-        restrict_to_selected_width=True,
+        restrict_to_selected_width=False,
         restrict_to_selected_epsilon=True,
     )
     native_shared_by_layer = {
@@ -771,7 +772,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=native_serial,
             parallel_downstream_seconds=native_parallel,
             shared_runtime_seconds_by_layer=native_shared_by_layer,
-            notes="Stage A plus selected native-support localization runtime. For OT/PLOT, this restricts to the selected width and selected epsilon; runtimes are summed over abstract variables.",
+            notes="Stage A plus the complete native-resolution coupling+calibration sweep at one globally selected epsilon, followed by test evaluation of each variable's frozen best resolution.",
         )
     )
 
@@ -779,7 +780,7 @@ def build_paper_runtime_summary(
     pca_downstream, pca_parallel_by_var, pca_runtime_by_layer_by_var = _pca_selected_config_epsilon_runtime(
         rankings=pca_rankings,
         entries_by_var=pca_entries,
-        restrict_to_selected_config=True,
+        restrict_to_selected_config=False,
         restrict_to_selected_epsilon=True,
     )
     pca_shared_by_layer = {
@@ -797,7 +798,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=pca_serial,
             parallel_downstream_seconds=pca_parallel,
             shared_runtime_seconds_by_layer=pca_shared_by_layer,
-            notes="Stage A plus selected PCA-support localization runtime, summed over abstract variables. When per-epsilon child payloads are present this restricts to the selected epsilon; otherwise it uses the selected config's recorded runtime.",
+            notes="Stage A plus the complete PCA support-config coupling+calibration sweep at one globally selected epsilon, followed by test evaluation of each variable's frozen best config.",
         )
     )
 
@@ -830,7 +831,7 @@ def build_paper_runtime_summary(
         entries_by_var=native_guided_stage_b_entries,
         restrict_to_selected_layer=True,
         restrict_to_selected_width=False,
-        restrict_to_selected_epsilon=False,
+        restrict_to_selected_epsilon=True,
     )
     native_guided_stage_b_by_layer = {
         layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in native_guided_stage_b_runtime_by_layer_by_var.values())
@@ -860,7 +861,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=native_guided_serial,
             parallel_downstream_seconds=native_guided_parallel,
             shared_runtime_seconds_by_layer=native_guided_stage_b_by_layer,
-            notes="Stage A plus the full native-support localization sweep over all widths and epsilons for the selected layer, then DAS over the selected native support.",
+            notes="Stage A plus the full native-resolution sweep at the globally selected epsilon for the selected layer, then DAS over the selected native support.",
         )
     )
 
@@ -878,7 +879,7 @@ def build_paper_runtime_summary(
         entries_by_var=dimension_stage_b_entries,
         restrict_to_selected_layer=True,
         restrict_to_selected_width=False,
-        restrict_to_selected_epsilon=False,
+        restrict_to_selected_epsilon=True,
     )
     dimension_stage_b_by_layer = {
         layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in dimension_stage_b_runtime_by_layer_by_var.values())
@@ -908,7 +909,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=dimension_serial,
             parallel_downstream_seconds=dimension_parallel,
             shared_runtime_seconds_by_layer=dimension_stage_b_by_layer,
-            notes="Stage A plus the full native-support localization sweep over all widths and epsilons for the selected layer, then full-layer DAS over dimensions around the selected native support width.",
+            notes="Stage A plus the full native-resolution sweep at the globally selected epsilon for the selected layer, then full-layer DAS over dimensions around the selected native support width.",
         )
     )
 
@@ -922,7 +923,7 @@ def build_paper_runtime_summary(
         entries_by_var=pca_guided_entries,
         restrict_to_selected_layer=True,
         restrict_to_selected_config=False,
-        restrict_to_selected_epsilon=False,
+        restrict_to_selected_epsilon=True,
     )
     pca_guided_stage_b_by_layer = {
         layer: max(layer_runtimes.get(layer, 0.0) for layer_runtimes in pca_guided_stage_b_runtime_by_layer_by_var.values())
@@ -952,7 +953,7 @@ def build_paper_runtime_summary(
             serial_downstream_seconds=pca_guided_serial,
             parallel_downstream_seconds=pca_guided_parallel,
             shared_runtime_seconds_by_layer=pca_guided_stage_b_by_layer,
-            notes="Stage A plus the full PCA-support localization sweep over all configs and epsilons for the selected layer, then DAS over the selected PCA supports.",
+            notes="Stage A plus the full PCA-support config sweep at the globally selected epsilon for the selected layer, then DAS over the selected PCA supports.",
         )
     )
 

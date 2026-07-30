@@ -373,6 +373,14 @@ def run_transport_sweep(
     best_key = None
     best_trial = None
 
+    def calibration_key(calibrated: dict[int, dict[str, object]]) -> tuple[float, float, float]:
+        rows = [dict(record["calibration"]) for record in calibrated.values()]
+        return (
+            float(sum(float(row["combined"]) for row in rows) / max(1, len(rows))),
+            float(sum(float(row["sensitivity"]) for row in rows) / max(1, len(rows))),
+            float(sum(float(row["invariance"]) for row in rows) / max(1, len(rows))),
+        )
+
     if method == "ot":
         for eps in config.epsilon_grid:
             pi = sinkhorn_uniform_ot(cost, epsilon=float(eps), n_iter=config.sinkhorn_iters, temperature=config.temperature)
@@ -387,22 +395,17 @@ def run_transport_sweep(
                 run_cache=run_cache,
                 rotation_map=rotation_map,
             )
-            test_eval = evaluate_calibrated_transport(
-                model,
-                calibrated,
-                sites,
-                banks.test_positive_by_carry,
-                banks.test_invariant_by_carry,
-                device=device,
-                run_cache=run_cache,
-                rotation_map=rotation_map,
-            )
-            key = (test_eval["combined_mean"], test_eval["sensitivity_mean"], test_eval["invariance_mean"])
+            key = calibration_key(calibrated)
             trial = {
                 "config": {"method": method, "epsilon": float(eps)},
                 "coupling": pi.tolist(),
                 "calibrated": calibrated,
-                "test": test_eval,
+                "calibration_mean": {
+                    "combined": key[0],
+                    "sensitivity": key[1],
+                    "invariance": key[2],
+                },
+                "test": None,
             }
             trials.append(trial)
             if best_key is None or key > best_key:
@@ -429,22 +432,17 @@ def run_transport_sweep(
                     run_cache=run_cache,
                     rotation_map=rotation_map,
                 )
-                test_eval = evaluate_calibrated_transport(
-                    model,
-                    calibrated,
-                    sites,
-                    banks.test_positive_by_carry,
-                    banks.test_invariant_by_carry,
-                    device=device,
-                    run_cache=run_cache,
-                    rotation_map=rotation_map,
-                )
-                key = (test_eval["combined_mean"], test_eval["sensitivity_mean"], test_eval["invariance_mean"])
+                key = calibration_key(calibrated)
                 trial = {
                     "config": {"method": method, "epsilon": float(eps), "beta_neural": float(beta)},
                     "coupling": pi.tolist(),
                     "calibrated": calibrated,
-                    "test": test_eval,
+                    "calibration_mean": {
+                        "combined": key[0],
+                        "sensitivity": key[1],
+                        "invariance": key[2],
+                    },
+                    "test": None,
                 }
                 trials.append(trial)
                 if best_key is None or key > best_key:
@@ -453,12 +451,26 @@ def run_transport_sweep(
     else:
         raise ValueError(f"unknown transport method: {method!r}")
 
+    if best_trial is not None:
+        best_trial["test"] = evaluate_calibrated_transport(
+            model,
+            best_trial["calibrated"],
+            sites,
+            banks.test_positive_by_carry,
+            banks.test_invariant_by_carry,
+            device=device,
+            run_cache=run_cache,
+            rotation_map=rotation_map,
+        )
+
     return {
         "method": method,
         "transport_config": config.as_dict(),
         "fit_diagnostics": diagnostics,
         "trials": trials,
         "best_trial": best_trial,
+        "selection_rule": "macro_average_calibration_combined_across_variables",
+        "test_evaluation_policy": "selected_global_transport_configuration_only",
     }
 
 

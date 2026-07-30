@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -27,6 +28,7 @@ from mcqa_experiment.pca import (
 )
 from mcqa_experiment.reporting import write_text_report
 from mcqa_experiment.runtime import write_json
+from mcqa_experiment.selection import select_shared_epsilon
 from mcqa_experiment.sites import (
     RotatedBandSite,
     enumerate_rotated_band_sites,
@@ -961,6 +963,7 @@ def _run_pca_band(
     screen_mask_names: tuple[str, ...],
     guided_mask_names: tuple[str, ...],
     guided_subspace_dims: tuple[int, ...] | None,
+    evaluate_test: bool = False,
 ) -> dict[str, object]:
     if len(target_vars) != 1:
         raise ValueError(
@@ -1039,6 +1042,8 @@ def _run_pca_band(
                 expected_transport_target_vars=transport_target_vars,
             ):
                 compare_payload = None
+            if isinstance(compare_payload, dict) and bool(compare_payload.get("test_evaluated", True)) != bool(evaluate_test):
+                compare_payload = None
         if compare_payload is None:
             ot_config = OTConfig(
                 method=alignment_method,
@@ -1091,6 +1096,7 @@ def _run_pca_band(
                     config=ot_config,
                     prepared_artifacts=prepared_artifacts,
                     pca_bases_by_id=pca_bases_by_id,
+                    evaluate_holdout=bool(evaluate_test),
                 )
             ]
             compare_payload = {
@@ -1120,6 +1126,8 @@ def _run_pca_band(
                 "site_metrics": site_metrics,
                 "data": data_metadata,
                 "method_payloads": {alignment_method: method_payloads},
+                "test_evaluated": bool(evaluate_test),
+                "result_split": "test" if bool(evaluate_test) else "calibration",
             }
             if _method_uses_epsilon(alignment_method):
                 compare_payload["ot_epsilon"] = float(epsilon)
@@ -1307,6 +1315,7 @@ def _run_pca_band(
         "support_extraction_mode": "selected_only",
         "support_by_var": support_by_var,
         "method_by_var": best_ot_by_var,
+        "test_evaluated": bool(evaluate_test),
         "screen_mask_names": [str(mask_name) for mask_name in screen_mask_names],
         "screen_das_enabled": bool(args.screen_das),
         "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
@@ -1428,6 +1437,7 @@ def _run_pca_band(
         "timing_seconds": timing_for_manifest,
         "summary_path": str(layer_summary_path),
         "payload_path": str(payload_path_for_manifest),
+        "plot_support_payload_path": str(plot_support_payload_path),
     }
 
 
@@ -1496,6 +1506,7 @@ def main() -> None:
         raise ValueError(f"Unknown token_position_id {args.token_position_id!r}")
 
     manifest_runs: list[dict[str, object]] = []
+    calibration_run_specs: list[dict[str, object]] = []
 
     for layer in layers:
         target_vars = layer_target_vars.get(int(layer), requested_target_vars)
@@ -1542,35 +1553,128 @@ def main() -> None:
         pca_fit_seconds = float(perf_counter() - pca_fit_start)
         for target_var in target_vars:
             for num_bands in num_bands_values:
-                manifest_runs.append(
-                    _run_pca_band(
-                        args=args,
-                        stage_start=stage_start,
-                        context_timing_seconds=context_timing_seconds,
-                        model=model,
-                        tokenizer=tokenizer,
-                        banks_by_split=banks_by_split,
-                        data_metadata=data_metadata,
-                        device=device,
-                        fit_bank_for_basis=fit_bank_for_basis,
-                        layer=int(layer),
-                        target_vars=(str(target_var),),
-                        transport_target_vars=transport_target_vars,
-                        layer_dir=layer_dir,
-                        basis=basis,
-                        basis_path=basis_path,
-                        prompt_records=prompt_records,
-                        pca_fit_seconds=pca_fit_seconds,
-                        num_bands=int(num_bands),
-                        ot_epsilons=ot_epsilons,
-                        ot_top_k_values=ot_top_k_values,
-                        ot_lambdas=ot_lambdas,
-                        calibration_family_weights=calibration_family_weights,
-                        screen_mask_names=screen_mask_names,
-                        guided_mask_names=guided_mask_names,
-                        guided_subspace_dims=guided_subspace_dims,
-                    )
+                run_spec = {
+                    "args": args,
+                    "stage_start": stage_start,
+                    "context_timing_seconds": context_timing_seconds,
+                    "model": model,
+                    "tokenizer": tokenizer,
+                    "banks_by_split": banks_by_split,
+                    "data_metadata": data_metadata,
+                    "device": device,
+                    "fit_bank_for_basis": fit_bank_for_basis,
+                    "layer": int(layer),
+                    "target_vars": (str(target_var),),
+                    "transport_target_vars": transport_target_vars,
+                    "layer_dir": layer_dir,
+                    "basis": basis,
+                    "basis_path": basis_path,
+                    "prompt_records": prompt_records,
+                    "pca_fit_seconds": pca_fit_seconds,
+                    "num_bands": int(num_bands),
+                    "ot_epsilons": ot_epsilons,
+                    "ot_top_k_values": ot_top_k_values,
+                    "ot_lambdas": ot_lambdas,
+                    "calibration_family_weights": calibration_family_weights,
+                    "screen_mask_names": screen_mask_names,
+                    "guided_mask_names": guided_mask_names,
+                    "guided_subspace_dims": guided_subspace_dims,
+                    "evaluate_test": False,
+                }
+                run_record = _run_pca_band(
+                    **run_spec,
                 )
+                manifest_runs.append(run_record)
+                calibration_run_specs.append({"spec": run_spec, "record": run_record})
+
+    calibration_candidates: list[dict[str, object]] = []
+    alignment_method = _canonical_alignment_method(str(args.alignment_method))
+    for spec_index, run in enumerate(calibration_run_specs):
+        plot_payload = _load_existing_payload(Path(str(run["record"]["plot_support_payload_path"])))
+        if not isinstance(plot_payload, dict):
+            continue
+        target_var = str(run["spec"]["target_vars"][0])
+        for ot_path_str in plot_payload.get("ot_output_paths", []):
+            compare_payload = _load_existing_payload(Path(str(ot_path_str)))
+            if not isinstance(compare_payload, dict):
+                continue
+            epsilon = (
+                float(compare_payload.get("ot_epsilon", ot_epsilons[0]))
+                if _method_uses_epsilon(alignment_method)
+                else 0.0
+            )
+            for method_payload in compare_payload.get("method_payloads", {}).get(alignment_method, []):
+                if not isinstance(method_payload, dict):
+                    continue
+                results = method_payload.get("results", [])
+                if not results or not isinstance(results[0], dict):
+                    continue
+                result = results[0]
+                calibration_candidates.append(
+                    {
+                        "variable": target_var,
+                        "epsilon": epsilon,
+                        "calibration_score": float(
+                            result.get("selection_score", result.get("calibration_exact_acc", 0.0))
+                        ),
+                        "layer": int(run["spec"]["layer"]),
+                        "num_bands": int(run["spec"]["num_bands"]),
+                        "spec_index": int(spec_index),
+                    }
+                )
+    global_selection = select_shared_epsilon(
+        calibration_candidates,
+        variables=tuple(
+            target_var for target_var in transport_target_vars
+            if any(str(candidate["variable"]) == str(target_var) for candidate in calibration_candidates)
+        ),
+        epsilon_order=(
+            _effective_epsilons(alignment_method, ot_epsilons)
+            if _method_uses_epsilon(alignment_method)
+            else (0.0,)
+        ),
+    )
+    selected_epsilon = float(global_selection["selected_epsilon"])
+    selected_spec_indices: set[int] = set()
+    test_args = copy.copy(args)
+    test_args.screen_das = False
+    test_args.guided_das = False
+    test_args.write_epsilon_artifacts = True
+    for selected_candidate in global_selection["selected_by_variable"].values():
+        spec_index = int(selected_candidate["spec_index"])
+        selected_spec_indices.add(spec_index)
+        selected_spec = dict(calibration_run_specs[spec_index]["spec"])
+        selected_spec["args"] = test_args
+        selected_spec["ot_epsilons"] = (selected_epsilon,)
+        selected_spec["evaluate_test"] = True
+        _run_pca_band(**selected_spec)
+
+    serializable_plans = [
+        {
+            "epsilon": float(plan["epsilon"]),
+            "mean_best_variable_calibration_score": float(plan["mean_best_variable_calibration_score"]),
+            "best_variable_calibration_scores": plan["best_variable_calibration_scores"],
+            "selected_config_by_variable": {
+                variable: {
+                    "layer": int(plan["selected_by_variable"][variable]["layer"]),
+                    "num_bands": int(plan["selected_by_variable"][variable]["num_bands"]),
+                }
+                for variable in plan["selected_by_variable"]
+            },
+        }
+        for plan in global_selection["epsilon_plans"]
+    ]
+    for spec_index, run in enumerate(calibration_run_specs):
+        payload_path = Path(str(run["record"]["plot_support_payload_path"]))
+        payload = _load_existing_payload(payload_path)
+        if not isinstance(payload, dict):
+            continue
+        payload["selected_global_epsilon"] = selected_epsilon
+        payload["epsilon_selection_rule"] = global_selection["selection_rule"]
+        payload["epsilon_calibration_plans"] = serializable_plans
+        payload["selected_for_test"] = bool(spec_index in selected_spec_indices)
+        payload["test_evaluated"] = bool(spec_index in selected_spec_indices)
+        write_json(payload_path, payload)
     manifest_path = sweep_root / "layer_sweep_manifest.json"
     existing_manifest_runs = _load_existing_runs(manifest_path)
     current_payload_paths = {str(run["payload_path"]) for run in manifest_runs}
@@ -1594,6 +1698,9 @@ def main() -> None:
             "cache_signatures": bool(args.cache_signatures),
             "write_epsilon_artifacts": bool(args.write_epsilon_artifacts),
             "write_support_artifact": bool(args.write_support_artifact),
+            "selected_global_epsilon": selected_epsilon,
+            "epsilon_selection_rule": global_selection["selection_rule"],
+            "epsilon_calibration_plans": serializable_plans,
             "runtime_seconds": float(perf_counter() - stage_start),
             "runs": [
                 *[run for run in existing_manifest_runs if str(run.get("payload_path", "")) not in current_payload_paths],
