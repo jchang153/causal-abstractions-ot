@@ -14,6 +14,7 @@ SPLIT_SEED="${SPLIT_SEED:-0}"
 RESULTS_ROOT="${RESULTS_ROOT:-/work/nvme/bgvo/${USER}/mcqa_unified_iia_results}"
 CACHE_ROOT="${CACHE_ROOT:-/work/nvme/bgvo/${USER}/hf_cache}"
 PRECHECK_STAMP="${PRECHECK_STAMP:-${VENV_PATH}/mcqa_preflight.json}"
+PYTHON_MODULE="${PYTHON_MODULE:-python}"
 
 if [[ "${MCQA_ONE_SEED_INSIDE_SRUN:-0}" != "1" ]]; then
   exec srun \
@@ -30,9 +31,16 @@ if [[ "${MCQA_ONE_SEED_INSIDE_SRUN:-0}" != "1" ]]; then
       RESULTS_ROOT="${RESULTS_ROOT}" \
       CACHE_ROOT="${CACHE_ROOT}" \
       PRECHECK_STAMP="${PRECHECK_STAMP}" \
+      PYTHON_MODULE="${PYTHON_MODULE}" \
       HF_TOKEN="${HF_TOKEN:-}" \
       bash "$0"
 fi
+
+if ! command -v module >/dev/null 2>&1; then
+  echo "Delta's Lmod command is unavailable inside the srun step." >&2
+  exit 2
+fi
+module load gcc "${PYTHON_MODULE}"
 
 if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
   echo "Virtual environment not found at ${VENV_PATH}" >&2

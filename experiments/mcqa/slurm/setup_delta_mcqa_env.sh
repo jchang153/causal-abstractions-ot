@@ -19,6 +19,7 @@ CACHE_ROOT="${CACHE_ROOT:-${NVME_ROOT}/hf_cache}"
 PIP_CACHE_DIR="${PIP_CACHE_DIR:-${NVME_ROOT}/pip_cache}"
 TMPDIR="${TMPDIR:-${NVME_ROOT}/tmp}"
 PRECHECK_STAMP="${PRECHECK_STAMP:-${VENV_PATH}/mcqa_preflight.json}"
+PYTHON_MODULE="${PYTHON_MODULE:-python}"
 
 for path in "${VENV_PATH}" "${CACHE_ROOT}" "${PIP_CACHE_DIR}" "${TMPDIR}" "${PRECHECK_STAMP}"; do
   case "${path}" in
@@ -46,6 +47,7 @@ if [[ "${MCQA_SETUP_INSIDE_SRUN:-0}" != "1" ]]; then
       PIP_CACHE_DIR="${PIP_CACHE_DIR}" \
       TMPDIR="${TMPDIR}" \
       PRECHECK_STAMP="${PRECHECK_STAMP}" \
+      PYTHON_MODULE="${PYTHON_MODULE}" \
       HF_TOKEN="${HF_TOKEN:-}" \
       HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}" \
       bash "$0"
@@ -72,6 +74,16 @@ export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=1
 export PIP_REQUIRE_VIRTUALENV=true
 unset PYTHONPATH
+
+# Delta's OS python3 is currently 3.9.  Load the supported Spack Python before
+# creating or activating the venv; the unversioned module tracks Delta's current
+# supported Python stack and can be overridden with PYTHON_MODULE if necessary.
+if ! command -v module >/dev/null 2>&1; then
+  echo "Delta's Lmod command is unavailable inside the srun step." >&2
+  exit 2
+fi
+module load gcc "${PYTHON_MODULE}"
+module list
 
 cd "${REPO_ROOT}"
 if [[ ! -x "${VENV_PATH}/bin/python" ]]; then
