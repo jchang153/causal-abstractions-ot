@@ -40,7 +40,7 @@ if ! command -v module >/dev/null 2>&1; then
   echo "Delta's Lmod command is unavailable inside the srun step." >&2
   exit 2
 fi
-module load gcc "${PYTHON_MODULE}"
+module load "${PYTHON_MODULE}"
 
 if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
   echo "Virtual environment not found at ${VENV_PATH}" >&2

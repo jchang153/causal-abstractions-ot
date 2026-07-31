@@ -75,14 +75,16 @@ export PYTHONNOUSERSITE=1
 export PIP_REQUIRE_VIRTUALENV=true
 unset PYTHONPATH
 
-# Delta's OS python3 is currently 3.9.  Load the supported Spack Python before
+# Delta's OS python3 is currently 3.9.  Load the supported Python before
 # creating or activating the venv; the unversioned module tracks Delta's current
 # supported Python stack and can be overridden with PYTHON_MODULE if necessary.
+# The RH9 default environment already provides PrgEnv-gnu; unlike older Delta
+# documentation examples, it does not expose a standalone module named "gcc".
 if ! command -v module >/dev/null 2>&1; then
   echo "Delta's Lmod command is unavailable inside the srun step." >&2
   exit 2
 fi
-module load gcc "${PYTHON_MODULE}"
+module load "${PYTHON_MODULE}"
 module list
 
 cd "${REPO_ROOT}"
