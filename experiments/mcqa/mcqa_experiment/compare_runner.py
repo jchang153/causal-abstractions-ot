@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
 
+from .checking import IIA_METRIC_NAME
 from .das import DASConfig, run_das_pipeline
 from .data import canonicalize_target_var
 from .ot import OTConfig, prepare_alignment_artifacts, run_alignment_pipeline, run_bruteforce_site_pipeline
@@ -31,7 +32,7 @@ class CompareExperimentConfig:
     signature_mode: str = "family_label_delta_norm"
     ot_top_k_values: tuple[int, ...] | None = None
     ot_lambdas: tuple[float, ...] = (1.0,)
-    calibration_metric: str = "exact_acc"
+    calibration_metric: str = "iia_acc"
     calibration_family_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
     ot_top_k_values_by_var: dict[str, tuple[int, ...]] | None = None
     ot_lambdas_by_var: dict[str, tuple[float, ...]] | None = None
@@ -259,6 +260,7 @@ def run_comparison(
     if not methods_use_epsilon:
         config_payload.pop("ot_epsilon", None)
     payload = {
+        "metric_name": IIA_METRIC_NAME,
         "config": config_payload,
         "model_name": config.model_name,
         "methods": list(config.methods),

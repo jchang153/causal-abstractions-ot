@@ -316,13 +316,13 @@ def run_boundless_das_pipeline(
                 "restart_index": int(restart_index),
                 "boundary_fraction": float(intervention.clamped_boundary().detach().cpu().item()),
                 "hard_dimension": int(hard_dimension),
-                "calibration_exact_acc": float(calibration["exact_acc"]),
-                "selection_exact_acc": float(calibration["exact_acc"]),
+                "calibration_iia_acc": float(calibration["iia_acc"]),
+                "selection_iia_acc": float(calibration["iia_acc"]),
                 "train_calibrate_seconds": float(candidate_seconds),
                 "training": training,
             }
             trials.append(trial)
-            key = (float(calibration["exact_acc"]), -int(hard_dimension), -int(site.layer))
+            key = (float(calibration["iia_acc"]), -int(hard_dimension), -int(site.layer))
             if best_key is None or key > best_key:
                 best_key = key
                 best_site = site

@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+from pathlib import Path
+import sys
+
 import torch
 
+MCQA_DIR = Path(__file__).resolve().parent
+if str(MCQA_DIR) not in sys.path:
+    sys.path.insert(0, str(MCQA_DIR))
+
 from experiments.mcqa.mcqa_experiment.bdas import BoundlessDASConfig, BoundlessDASIntervention
+from mcqa_boundless_das import _layers_by_target
 
 
 def test_recommended_boundless_das_defaults_match_binary_baseline() -> None:
@@ -46,3 +54,10 @@ def test_soft_boundary_receives_gradient() -> None:
     intervention(base, source).square().mean().backward()
     assert intervention.boundary_fraction.grad is not None
     assert torch.isfinite(intervention.boundary_fraction.grad).all()
+
+
+def test_plot_bdas_parses_variable_specific_layers() -> None:
+    assert _layers_by_target("answer_pointer:18|19,answer_token:24") == {
+        "answer_pointer": (18, 19),
+        "answer_token": (24,),
+    }

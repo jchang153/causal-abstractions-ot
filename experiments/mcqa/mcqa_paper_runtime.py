@@ -715,7 +715,7 @@ def build_paper_runtime_summary(
     sweep_root: Path,
     full_das_outputs: list[Path] | None = None,
 ) -> dict[str, object]:
-    stage_a_seconds = _stage_a_runtime(sweep_root)
+    stage_a_sweep_wall_seconds = _stage_a_runtime(sweep_root)
     stage_a_rankings = _read_rankings(sweep_root, "stage_a_last_token_layer_rankings.json")
     native_rankings = _read_rankings(sweep_root, "stage_b_native_support_rankings.json")
     pca_rankings = _read_rankings(sweep_root, "stage_b_pca_support_rankings.json")
@@ -732,6 +732,11 @@ def build_paper_runtime_summary(
         sweep_root=sweep_root,
         rankings=stage_a_rankings,
         entries_by_var=stage_a_entries,
+    )
+    stage_a_seconds = (
+        float(stage_a_selected_shared_runtime)
+        if stage_a_selected_shared_runtime is not None and float(stage_a_selected_shared_runtime) > 0.0
+        else float(stage_a_sweep_wall_seconds)
     )
     records: list[dict[str, object]] = []
     records.append(
@@ -965,6 +970,7 @@ def build_paper_runtime_summary(
         "kind": "mcqa_paper_runtime_summary",
         "sweep_root": str(sweep_root),
         "stage_a_runtime_seconds": float(stage_a_seconds),
+        "stage_a_sweep_wall_runtime_seconds": float(stage_a_sweep_wall_seconds),
         "native_stage_b_runtime_seconds_by_layer": {str(k): float(v) for k, v in native_shared_by_layer.items()},
         "pca_stage_b_runtime_seconds_by_layer": {str(k): float(v) for k, v in pca_shared_by_layer.items()},
         "methods": records,
@@ -977,6 +983,7 @@ def format_paper_runtime_summary(payload: dict[str, object]) -> str:
         "MCQA paper runtime summary",
         f"sweep_root: {payload.get('sweep_root')}",
         f"stage_a_runtime_seconds: {_as_float(payload.get('stage_a_runtime_seconds')):.2f}",
+        f"stage_a_sweep_wall_runtime_seconds: {_as_float(payload.get('stage_a_sweep_wall_runtime_seconds')):.2f}",
         "test_used_for_selection: false",
         "",
         "method\tserial_runtime_s\tparallel_runtime_s",

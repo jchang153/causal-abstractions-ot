@@ -41,6 +41,22 @@ for split_seed in 0 1 2; do
   done
 done
 
+for split_seed in 0 1 2; do
+  echo "[submit-mcqa-corrected] Full DAS seed=${split_seed}"
+  RESULTS_ROOT="${RESULTS_ROOT}" \
+  RESULTS_TIMESTAMP="${TIMESTAMP}_full_das_seed${split_seed}" \
+  SPLIT_SEED="${split_seed}" \
+  TRAIN_POOL_SIZE=200 \
+  CALIBRATION_POOL_SIZE=200 \
+  TEST_POOL_SIZE=200 \
+  sbatch \
+    --account="${DELTA_ACCOUNT}" \
+    --partition="${DELTA_PARTITION}" \
+    --export=ALL \
+    --job-name="mcqa-full-das-s${split_seed}" \
+    experiments/mcqa/slurm/delta_mcqa_full_das_timed.sbatch
+done
+
 echo "[submit-mcqa-corrected] bDAS seeds=0,1,2"
 RESULTS_ROOT="${RESULTS_ROOT}" \
 RESULTS_TIMESTAMP="${TIMESTAMP}_bdas" \

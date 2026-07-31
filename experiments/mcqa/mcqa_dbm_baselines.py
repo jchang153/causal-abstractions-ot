@@ -14,6 +14,7 @@ from time import perf_counter
 
 import torch
 
+from mcqa_experiment.checking import payload_uses_unified_iia
 from mcqa_experiment.data import build_pair_banks, load_filtered_mcqa_pipeline
 from mcqa_experiment.dbm import (
     DBMMask,
@@ -186,10 +187,14 @@ def main() -> None:
                 existing_payload = json.loads(output_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 existing_payload = None
-            if isinstance(existing_payload, dict) and "calibration_candidate_seconds" in existing_payload:
+            if (
+                isinstance(existing_payload, dict)
+                and "calibration_candidate_seconds" in existing_payload
+                and payload_uses_unified_iia(existing_payload)
+            ):
                 print(f"[resume] {output_path}")
                 continue
-            print(f"[rebuild] {output_path} uses the legacy every-layer test protocol")
+            print(f"[rebuild] {output_path} uses a legacy runtime or IIA protocol")
         if seed not in banks_by_seed:
             banks, metadata = build_pair_banks(
                 tokenizer=tokenizer,
@@ -263,14 +268,16 @@ def main() -> None:
         payload["total_seconds"] = float(payload["calibration_candidate_seconds"])
         atomic_json(output_path, payload)
         print(
-            f"[done] {stem} cal={payload['calibration']['exact_acc']:.4f} "
+            f"[done] {stem} cal={payload['calibration']['iia_acc']:.4f} "
             f"seconds={payload['total_seconds']:.1f}"
         )
 
     records = []
     for path in run_dir.glob("*/*.json"):
         try:
-            records.append(json.loads(path.read_text(encoding="utf-8")))
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if payload_uses_unified_iia(record):
+                records.append(record)
         except (json.JSONDecodeError, OSError):
             pass
     def banks_for_seed(seed: int) -> dict[str, dict[str, object]]:
@@ -353,7 +360,7 @@ def main() -> None:
                 subset = [record for record in records if record.get("method") == method and record.get("seed") == seed and record.get("target_var") == target]
                 if not subset:
                     continue
-                subset.sort(key=lambda item: (-float(item["calibration"]["exact_acc"]), int(item["layer"])))
+                subset.sort(key=lambda item: (-float(item["calibration"]["iia_acc"]), int(item["layer"])))
                 selected = evaluate_selected(subset[0])
                 selected_path = run_dir / method / f"{method}_seed{seed}_{target}_layer{int(selected['layer'])}.json"
                 atomic_json(selected_path, selected)

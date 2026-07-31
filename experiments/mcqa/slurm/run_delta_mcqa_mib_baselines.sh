@@ -36,6 +36,7 @@ python -c 'import sys; assert sys.version_info >= (3, 10), f"Python 3.10+ requir
 run_baseline_shard() {
   python experiments/mcqa/mcqa_dbm_baselines.py \
     --device cuda \
+    --dataset-size 2000 \
     --methods full-layer,dbm-canonical,dbm-pca,dbm-sae \
     --targets answer_pointer,answer_token \
     --layers all \

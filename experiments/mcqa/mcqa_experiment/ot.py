@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover
     tqdm = None
 
 from . import _env  # noqa: F401
+from .checking import iia_acc_from_metrics
 from .data import COUNTERFACTUAL_FAMILIES, MCQAPairBank, canonicalize_target_var
 from .intervention import run_soft_site_intervention
 from .metrics import build_variable_signature, metrics_from_logits, prediction_details_from_logits
@@ -218,7 +219,7 @@ class OTConfig:
     lambda_values: tuple[float, ...] = (1.0,)
     selection_verbose: bool = True
     source_target_vars: tuple[str, ...] = ("answer_pointer", "answer_token")
-    calibration_metric: str = "exact_acc"
+    calibration_metric: str = "iia_acc"
     calibration_family_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
     top_k_values_by_var: dict[str, tuple[int, ...]] | None = None
     lambda_values_by_var: dict[str, tuple[float, ...]] | None = None
@@ -788,21 +789,21 @@ def _resolve_calibration_grids(
 
 
 def _calibration_score_from_result(result: dict[str, object], config: OTConfig) -> float:
-    exact_acc = float(result.get("exact_acc", 0.0))
-    if config.calibration_metric == "exact_acc":
-        return exact_acc
-    if config.calibration_metric == "family_weighted_macro_exact_acc":
-        family_exact_accs = result.get("family_exact_accs", {})
-        if not isinstance(family_exact_accs, dict):
-            return exact_acc
+    iia_acc = iia_acc_from_metrics(result)
+    if config.calibration_metric == "iia_acc":
+        return iia_acc
+    if config.calibration_metric == "family_weighted_macro_iia_acc":
+        family_iia_accs = result.get("family_iia_accs", {})
+        if not isinstance(family_iia_accs, dict):
+            return iia_acc
         weighted_sum = 0.0
         total_weight = 0.0
         for family_name, weight in zip(COUNTERFACTUAL_FAMILIES, config.calibration_family_weights):
-            if family_name not in family_exact_accs:
+            if family_name not in family_iia_accs:
                 continue
-            weighted_sum += float(weight) * float(family_exact_accs[family_name])
+            weighted_sum += float(weight) * float(family_iia_accs[family_name])
             total_weight += float(weight)
-        return exact_acc if total_weight <= 0.0 else float(weighted_sum / total_weight)
+        return iia_acc if total_weight <= 0.0 else float(weighted_sum / total_weight)
     raise ValueError(f"Unsupported calibration_metric={config.calibration_metric}")
 
 
@@ -926,7 +927,7 @@ def solve_bruteforce_coupling_transport(
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Build row scores by evaluating every site on the fit bank for each abstract variable."""
     row_scores: list[list[float]] = []
-    row_exact_accs: dict[str, list[float]] = {}
+    row_iia_accs: dict[str, list[float]] = {}
     start = perf_counter()
     for target_var in config.source_target_vars:
         bank = fit_banks_by_var[str(target_var)]
@@ -951,20 +952,20 @@ def solve_bruteforce_coupling_transport(
                 include_details=False,
                 pca_bases_by_id=pca_bases_by_id,
             )
-            scores.append(float(result.get("exact_acc", 0.0)))
+            scores.append(float(result.get("iia_acc", 0.0)))
         row_scores.append(scores)
-        row_exact_accs[str(target_var)] = [float(score) for score in scores]
+        row_iia_accs[str(target_var)] = [float(score) for score in scores]
     score_tensor = torch.tensor(row_scores, dtype=torch.float32, device=device)
     transport = _row_softmax(score_tensor, temperature=float(config.bruteforce_temperature))
     return transport, {
         "method": "bruteforce-coupling",
-        "score_type": "fit_bank_single_site_exact_acc",
+        "score_type": "fit_bank_single_site_normalized_full_vocab_iia",
         "temperature": float(config.bruteforce_temperature),
         "matched_mass": float(np.sum(transport)),
         "score_runtime_seconds": float(perf_counter() - start),
         "row_max_scores": [float(max(scores) if scores else 0.0) for scores in row_scores],
         "row_min_scores": [float(min(scores) if scores else 0.0) for scores in row_scores],
-        "row_exact_accs": row_exact_accs,
+        "row_iia_accs": row_iia_accs,
     }
 
 
@@ -1029,13 +1030,13 @@ def _select_hyperparameters(
             "lambda": strength,
             "result": result,
             "ranking": ranking,
-            "exact_acc": float(result["exact_acc"]),
+            "iia_acc": float(result["iia_acc"]),
             "calibration_score": float(calibration_score),
             "calibration_metric": str(config.calibration_metric),
         }
         sweep_records.append(candidate)
         if best is None or float(candidate["calibration_score"]) > float(best["calibration_score"]) or (
-            float(candidate["calibration_score"]) == float(best["calibration_score"]) and float(candidate["exact_acc"]) > float(best["exact_acc"])
+            float(candidate["calibration_score"]) == float(best["calibration_score"]) and float(candidate["iia_acc"]) > float(best["iia_acc"])
         ):
             best = candidate
             if config.selection_verbose:
@@ -1043,7 +1044,7 @@ def _select_hyperparameters(
                     f"[{config.method.upper()}] new best variable={calibration_bank.target_var} "
                     f"top_k={int(top_k)} lambda={float(strength):g} "
                     f"calibration_score={float(candidate['calibration_score']):.4f} "
-                    f"calibration_exact_acc={float(candidate['exact_acc']):.4f}"
+                    f"calibration_iia_acc={float(candidate['iia_acc']):.4f}"
                 )
     if best is None:
         raise RuntimeError(f"Failed to select OT/UOT hyperparameters for {calibration_bank.target_var}")
@@ -1052,7 +1053,7 @@ def _select_hyperparameters(
             f"[{config.method.upper()}] selected variable={calibration_bank.target_var} "
             f"top_k={int(best['top_k'])} lambda={float(best['lambda']):g} "
             f"calibration_score={float(best['calibration_score']):.4f} "
-            f"calibration_exact_acc={float(best['exact_acc']):.4f}"
+            f"calibration_iia_acc={float(best['iia_acc']):.4f}"
         )
     return best, sweep_records
 
@@ -1113,13 +1114,13 @@ def _select_bruteforce_site(
             "lambda": strength,
             "result": result,
             "ranking": ranking,
-            "exact_acc": float(result["exact_acc"]),
+            "iia_acc": float(result["iia_acc"]),
             "calibration_score": float(calibration_score),
             "calibration_metric": str(config.calibration_metric),
         }
         sweep_records.append(candidate)
         if best is None or float(candidate["calibration_score"]) > float(best["calibration_score"]) or (
-            float(candidate["calibration_score"]) == float(best["calibration_score"]) and float(candidate["exact_acc"]) > float(best["exact_acc"])
+            float(candidate["calibration_score"]) == float(best["calibration_score"]) and float(candidate["iia_acc"]) > float(best["iia_acc"])
         ):
             best = candidate
             if config.selection_verbose:
@@ -1127,7 +1128,7 @@ def _select_bruteforce_site(
                     f"[BRUTEFORCE] new best variable={calibration_bank.target_var} "
                     f"site={site.label} lambda={float(strength):g} "
                     f"calibration_score={float(candidate['calibration_score']):.4f} "
-                    f"calibration_exact_acc={float(candidate['exact_acc']):.4f}"
+                    f"calibration_iia_acc={float(candidate['iia_acc']):.4f}"
                 )
     if best is None:
         raise RuntimeError(f"Failed to select a brute-force site for {calibration_bank.target_var}")
@@ -1136,7 +1137,7 @@ def _select_bruteforce_site(
             f"[BRUTEFORCE] selected variable={calibration_bank.target_var} "
             f"site={best['site_label']} lambda={float(best['lambda']):g} "
             f"calibration_score={float(best['calibration_score']):.4f} "
-            f"calibration_exact_acc={float(best['exact_acc']):.4f}"
+            f"calibration_iia_acc={float(best['iia_acc']):.4f}"
         )
     return best, sweep_records
 
@@ -1333,8 +1334,8 @@ def run_alignment_pipeline(
         + holdout_eval_seconds
     )
     holdout_result["method"] = method_key
-    holdout_result["selection_exact_acc"] = float(selected["result"]["exact_acc"])
-    holdout_result["calibration_exact_acc"] = float(selected["result"]["exact_acc"])
+    holdout_result["selection_iia_acc"] = float(selected["result"]["iia_acc"])
+    holdout_result["calibration_iia_acc"] = float(selected["result"]["iia_acc"])
     holdout_result["selection_score"] = float(selected["calibration_score"])
     holdout_result["calibration_metric"] = str(config.calibration_metric)
     holdout_result["signature_mode"] = str(config.signature_mode)
@@ -1345,7 +1346,7 @@ def run_alignment_pipeline(
     if config.selection_verbose:
         print(
             f"[{config.method.upper()}] holdout variable={holdout_bank.target_var} "
-            f"top_k={top_k} lambda={strength:g} exact_acc={float(holdout_result['exact_acc']):.4f}"
+            f"top_k={top_k} lambda={strength:g} iia_acc={float(holdout_result['iia_acc']):.4f}"
         )
     return {
         "target_var": holdout_bank.target_var,
@@ -1461,15 +1462,15 @@ def run_bruteforce_site_pipeline(
         pca_bases_by_id=pca_bases_by_id,
     )
     holdout_result["method"] = "bruteforce"
-    holdout_result["selection_exact_acc"] = float(selected["result"]["exact_acc"])
-    holdout_result["calibration_exact_acc"] = float(selected["result"]["exact_acc"])
+    holdout_result["selection_iia_acc"] = float(selected["result"]["iia_acc"])
+    holdout_result["calibration_iia_acc"] = float(selected["result"]["iia_acc"])
     holdout_result["selection_score"] = float(selected["calibration_score"])
     holdout_result["calibration_metric"] = str(config.calibration_metric)
     holdout_result["signature_mode"] = str(config.signature_mode)
     if config.selection_verbose:
         print(
             f"[BRUTEFORCE] holdout variable={holdout_bank.target_var} "
-            f"site={selected_site.label} lambda={strength:g} exact_acc={float(holdout_result['exact_acc']):.4f}"
+            f"site={selected_site.label} lambda={strength:g} iia_acc={float(holdout_result['iia_acc']):.4f}"
         )
     return {
         "target_var": holdout_bank.target_var,

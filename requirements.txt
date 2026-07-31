@@ -9,5 +9,6 @@ accelerate>=1.0,<2
 sentencepiece>=0.2
 safetensors>=0.4
 tqdm>=4.66
+pytest>=8,<10
 pyvene
-sae-lens>=6.39,<7
+sae-lens==6.39.0

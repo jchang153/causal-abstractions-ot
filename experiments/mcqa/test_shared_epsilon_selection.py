@@ -133,8 +133,8 @@ def test_native_rankings_use_one_macro_selected_epsilon(tmp_path: Path) -> None:
                                             {
                                                 "variable": variable,
                                                 "selection_score": score,
-                                                "calibration_exact_acc": score,
-                                                "exact_acc": score,
+                                                "calibration_iia_acc": score,
+                                                "iia_acc": score,
                                             }
                                         ],
                                     }
@@ -192,8 +192,8 @@ def test_pca_rankings_use_one_macro_selected_epsilon(tmp_path: Path) -> None:
                                         {
                                             "variable": variable,
                                             "selection_score": score,
-                                            "calibration_exact_acc": score,
-                                            "exact_acc": score,
+                                            "calibration_iia_acc": score,
+                                            "iia_acc": score,
                                         }
                                     ],
                                 }

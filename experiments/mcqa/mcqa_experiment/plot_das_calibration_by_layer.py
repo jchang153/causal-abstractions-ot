@@ -20,7 +20,7 @@ def load_heatmap_records(path: Path, target_var: str) -> tuple[list[int], list[i
     values: dict[tuple[int, int], float] = {}
     for record in records:
         key = (int(record["layer"]), int(record["subspace_dim"]))
-        values[key] = max(values.get(key, 0.0), float(record["calibration_exact_acc"]))
+        values[key] = max(values.get(key, 0.0), float(record["calibration_iia_acc"]))
     return layers, subspace_dims, values
 
 

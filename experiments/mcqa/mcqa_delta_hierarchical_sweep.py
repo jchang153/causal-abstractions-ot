@@ -12,13 +12,14 @@ from time import perf_counter
 from typing import Iterable
 
 from mcqa_paper_runtime import write_paper_runtime_summary
+from mcqa_experiment.checking import payload_uses_unified_iia
 from mcqa_experiment.selection import select_shared_epsilon
 
 
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_STAGE_A_TOKEN_POSITION_IDS = ("last_token",)
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
-DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
+DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_iia_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_STAGE_A_TRANSPORT_METHODS = ("uot",)
@@ -171,7 +172,7 @@ def _append_optional_arg(args: list[str], name: str, value: str | None) -> None:
 
 def _score_tuple(entry: dict[str, object]) -> tuple[float, float]:
     return (
-        float(entry.get("exact_acc", -1.0)),
+        float(entry.get("iia_acc", -1.0)),
         float(entry.get("selection_score", entry.get("cal", -1.0))),
     )
 
@@ -182,7 +183,7 @@ def _sort_best_first(entries: Iterable[dict[str, object]]) -> list[dict[str, obj
         key=lambda entry: (
             bool(entry.get("selected_for_global_plan", False)),
             float(entry.get("selection_score", entry.get("cal", -1.0))),
-            float(entry.get("exact_acc", -1.0)),
+            float(entry.get("iia_acc", -1.0)),
             -int(entry.get("layer", 10**9)),
         ),
         reverse=True,
@@ -192,10 +193,10 @@ def _sort_best_first(entries: Iterable[dict[str, object]]) -> list[dict[str, obj
 def _selection_score(record: dict[str, object]) -> float:
     if "selection_score" in record and record["selection_score"] is not None:
         return float(record["selection_score"])
-    if "selection_exact_acc" in record and record["selection_exact_acc"] is not None:
-        return float(record["selection_exact_acc"])
-    if "calibration_exact_acc" in record and record["calibration_exact_acc"] is not None:
-        return float(record["calibration_exact_acc"])
+    if "selection_iia_acc" in record and record["selection_iia_acc"] is not None:
+        return float(record["selection_iia_acc"])
+    if "calibration_iia_acc" in record and record["calibration_iia_acc"] is not None:
+        return float(record["calibration_iia_acc"])
     return -1.0
 
 
@@ -222,7 +223,7 @@ def _best_result_record(payloads: Iterable[dict[str, object]]) -> dict[str, obje
         candidate = {
             "epsilon": float(payload.get("_ot_epsilon", payload.get("ot_epsilon", -1.0))),
             "selection_score": _selection_score(result),
-            "exact_acc": float(result.get("exact_acc", -1.0)),
+            "iia_acc": float(result.get("iia_acc", -1.0)),
             "site_label": result.get("site_label"),
             "runtime_seconds": payload.get("runtime_seconds"),
             "wall_runtime_seconds": payload.get("wall_runtime_seconds"),
@@ -232,10 +233,10 @@ def _best_result_record(payloads: Iterable[dict[str, object]]) -> dict[str, obje
         }
         if best is None or (
             float(candidate["selection_score"]),
-            float(candidate["exact_acc"]),
+            float(candidate["iia_acc"]),
         ) > (
             float(best["selection_score"]),
-            float(best["exact_acc"]),
+            float(best["iia_acc"]),
         ):
             best = candidate
     return best
@@ -313,7 +314,7 @@ def _stage_output_is_valid(path: Path) -> bool:
         payload = _load_json(path)
     except Exception:
         return False
-    return isinstance(payload, (dict, list))
+    return isinstance(payload, (dict, list)) and payload_uses_unified_iia(payload)
 
 
 def _resolve_num_layers(model_name: str) -> int:
@@ -915,6 +916,65 @@ def _build_native_support_das_command(
     return tuple(command)
 
 
+def _build_pca_support_das_command(
+    *,
+    args: argparse.Namespace,
+    normalized: dict[str, object],
+    stage_timestamp: str,
+    pca_support_path: Path,
+    target_vars: tuple[str, ...],
+) -> tuple[str, ...]:
+    command = [
+        sys.executable,
+        "experiments/mcqa/mcqa_plot_das_pca_support.py",
+        "--device",
+        str(args.device),
+        "--model-name",
+        str(args.model_name),
+        "--dataset-path",
+        str(args.dataset_path),
+        "--dataset-size",
+        str(int(args.dataset_size)),
+        "--split-seed",
+        str(int(args.split_seed)),
+        "--train-pool-size",
+        str(int(args.train_pool_size)),
+        "--calibration-pool-size",
+        str(int(args.calibration_pool_size)),
+        "--test-pool-size",
+        str(int(args.test_pool_size)),
+        "--batch-size",
+        str(int(args.batch_size)),
+        "--pca-support-path",
+        str(pca_support_path),
+        "--target-vars",
+        ",".join(str(target_var) for target_var in target_vars),
+        "--guided-max-epochs",
+        str(int(args.guided_max_epochs)),
+        "--guided-min-epochs",
+        str(int(args.guided_min_epochs)),
+        "--guided-restarts",
+        str(max(1, int(args.guided_restarts))),
+        "--results-root",
+        str(args.results_root),
+        "--results-timestamp",
+        str(stage_timestamp),
+        "--signatures-dir",
+        str(args.signatures_dir),
+    ]
+    if normalized["guided_subspace_dims"] is not None:
+        command.extend(
+            [
+                "--guided-subspace-dims",
+                ",".join(str(dim) for dim in normalized["guided_subspace_dims"]),
+            ]
+        )
+    _append_optional_arg(command, "--dataset-config", args.dataset_config)
+    if bool(args.prompt_hf_login):
+        command.append("--prompt-hf-login")
+    return tuple(command)
+
+
 def _run_stage_command(*, stage: SweepStage, repo_root: Path) -> float:
     start = perf_counter()
     subprocess.run(stage.command, cwd=repo_root, check=True)
@@ -979,7 +1039,7 @@ def _stage_a_rankings_from_layer_sweep(*, manifest_path: Path, manifest_payload:
                     "layer": int(layer),
                     "selection_score": float(best["selection_score"]),
                     "calibration_score": float(best["selection_score"]),
-                    "exact_acc": float(best["exact_acc"]),
+                    "iia_acc": float(best["iia_acc"]),
                     "epsilon": float(best["epsilon"]),
                     "site_label": best.get("site_label"),
                     "runtime_seconds": best.get("runtime_seconds"),
@@ -1086,7 +1146,7 @@ def _stage_a_rankings_from_joint_run(*, aggregate_path: Path, aggregate_payload:
                     "variable": str(target_var),
                     "layer": int(layer),
                     "selection_score": float(best["selection_score"]),
-                    "exact_acc": float(best["exact_acc"]),
+                    "iia_acc": float(best["iia_acc"]),
                     "epsilon": float(best["epsilon"]),
                     "selected_global_epsilon": selected_epsilon,
                     "epsilon_selection_rule": epsilon_selection["selection_rule"],
@@ -1109,7 +1169,7 @@ def _stage_a_rankings_from_joint_run(*, aggregate_path: Path, aggregate_payload:
             rankings[target_var],
             key=lambda entry: (
                 float(entry.get("selection_score", -1.0)),
-                float(entry.get("exact_acc", -1.0)),
+                float(entry.get("iia_acc", -1.0)),
                 float(entry.get("row_dominant_mass", 0.0)),
                 -int(entry.get("layer", 10**9)),
             ),
@@ -1155,12 +1215,12 @@ def _format_stage_a_summary(*, token_position_id: str, rankings: dict[str, list[
         lines.append(f"[{target_var}]")
         display_entry = display_method_by_var.get(target_var) if isinstance(display_method_by_var, dict) else None
         if isinstance(display_entry, dict):
-            exact_acc = display_entry.get("exact_acc")
+            iia_acc = display_entry.get("iia_acc")
             selection_score = display_entry.get("selection_score")
             parts = [
                 f"method={display_entry.get('method')}",
                 f"layer={int(display_entry.get('layer', -1))}",
-                f"exact={float(exact_acc):.4f}" if exact_acc is not None else "exact=NA",
+                f"iia={float(iia_acc):.4f}" if iia_acc is not None else "iia=NA",
                 f"cal={float(selection_score):.4f}" if selection_score is not None else "cal=NA",
                 (
                     f"eps={float(display_entry.get('epsilon', 0.0)):g}"
@@ -1222,7 +1282,7 @@ def _fixed_stage_a_rankings(
         display_method_by_var[str(target_var)] = {
             "method": "fixed_layer_override",
             "layer": int(lead_layer),
-            "exact_acc": None,
+            "iia_acc": None,
             "selection_score": None,
             "epsilon": None,
             "site_label": f"L{int(lead_layer)}:{str(token_position_id)}",
@@ -1477,7 +1537,7 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
     def _stage_b_config_score(entry: dict[str, object]) -> tuple[float, float]:
         return (
             float(entry.get("selection_score", entry.get("cal", -1.0))),
-            float(entry.get("exact_acc", -1.0)),
+            float(entry.get("iia_acc", -1.0)),
         )
 
     for payload_path in payload_paths:
@@ -1510,7 +1570,7 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
                     "basis_source_mode": basis_source_mode,
                     "site_menu": site_menu,
                     "num_bands": num_bands,
-                    "exact_acc": float(method_summary.get("exact_acc", -1.0)),
+                    "iia_acc": float(method_summary.get("iia_acc", -1.0)),
                     "selection_score": float(method_summary.get("selection_score", -1.0)),
                     "calibration_score": float(method_summary.get("selection_score", -1.0)),
                     "epsilon": epsilon,
@@ -1553,7 +1613,7 @@ def _extract_stage_b_best_configs(*, payload_paths: Iterable[Path]) -> dict[str,
                     "basis_source_mode": basis_source_mode,
                     "site_menu": site_menu,
                     "num_bands": num_bands,
-                    "exact_acc": float(result.get("exact_acc", -1.0)),
+                    "iia_acc": float(result.get("iia_acc", -1.0)),
                     "selection_score": selection_score,
                     "calibration_score": selection_score,
                     "epsilon": epsilon,
@@ -1598,7 +1658,7 @@ def _format_stage_b_summary(*, rankings: dict[str, list[dict[str, object]]]) -> 
                 f"basis={entry['basis_source_mode']}",
                 f"menu={entry['site_menu']}",
                 f"bands={int(entry['num_bands'])}",
-                f"exact={float(entry['exact_acc']):.4f}",
+                f"iia={float(entry['iia_acc']):.4f}",
                 f"cal={float(entry['selection_score']):.4f}",
                 f"eps={float(entry['epsilon']):g}",
                 f"site={entry.get('site_label')}",
@@ -1655,9 +1715,9 @@ def _extract_native_support_rankings(*, payload_paths: Iterable[Path]) -> dict[s
                         "variable": target_var,
                         "layer": int(layer),
                         "native_resolution": int(native_resolution),
-                        "exact_acc": float(result.get("exact_acc", 0.0)),
-                        "selection_score": float(result.get("selection_score", result.get("calibration_exact_acc", 0.0))),
-                        "calibration_score": float(result.get("selection_score", result.get("calibration_exact_acc", 0.0))),
+                        "iia_acc": float(result.get("iia_acc", 0.0)),
+                        "selection_score": float(result.get("selection_score", result.get("calibration_iia_acc", 0.0))),
+                        "calibration_score": float(result.get("selection_score", result.get("calibration_iia_acc", 0.0))),
                         "epsilon": float(epsilon),
                         "site_label": result.get("site_label"),
                         "selected_top_k": selected_hyperparameters.get("top_k"),
@@ -1707,7 +1767,7 @@ def _extract_layer_das_rankings(*, payload_paths: Iterable[Path]) -> dict[str, l
                 {
                     "variable": target_var,
                     "layer": int(layer),
-                    "exact_acc": float(result.get("exact_acc", 0.0)),
+                    "iia_acc": float(result.get("iia_acc", 0.0)),
                     "selection_score": _selection_score(result),
                     "site_label": result.get("site_label"),
                     "subspace_dim": result.get("subspace_dim"),
@@ -1764,7 +1824,7 @@ def _extract_native_support_das_rankings(*, payload_paths: Iterable[Path]) -> di
                     "variable": str(target_var),
                     "layer": int(layer),
                     "native_resolution": int(native_resolution),
-                    "exact_acc": float(result.get("exact_acc", 0.0)),
+                    "iia_acc": float(result.get("iia_acc", 0.0)),
                     "selection_score": _selection_score(result),
                     "site_label": result.get("site_label"),
                     "subspace_dim": result.get("subspace_dim"),
@@ -1806,7 +1866,7 @@ def _extract_dimension_das_rankings(
                     "variable": target_var,
                     "layer": int(layer),
                     "native_resolution": int(native_resolution),
-                    "exact_acc": float(result.get("exact_acc", 0.0)),
+                    "iia_acc": float(result.get("iia_acc", 0.0)),
                     "selection_score": _selection_score(result),
                     "site_label": result.get("site_label"),
                     "subspace_dim": result.get("subspace_dim"),
@@ -1837,7 +1897,7 @@ def _format_native_summary(*, title: str, rankings: dict[str, list[dict[str, obj
             parts = [
                 f"layer={int(entry['layer'])}",
                 f"width={width_value}",
-                f"exact={float(entry['exact_acc']):.4f}",
+                f"iia={float(entry['iia_acc']):.4f}",
                 f"cal={float(entry['selection_score']):.4f}",
             ]
             if entry.get("epsilon") is not None:
@@ -2006,7 +2066,7 @@ def _extract_stage_c_rankings(*, payload_paths: Iterable[Path]) -> dict[str, lis
                     "basis_source_mode": basis_source_mode,
                     "site_menu": site_menu,
                     "num_bands": num_bands,
-                    "exact_acc": float(result.get("exact_acc", -1.0)),
+                    "iia_acc": float(result.get("iia_acc", -1.0)),
                     "selection_score": _selection_score(result),
                     "site_label": result.get("site_label"),
                     "subspace_dim": result.get("subspace_dim"),
@@ -2031,7 +2091,7 @@ def _format_stage_c_summary(*, rankings: dict[str, list[dict[str, object]]]) -> 
                 f"basis={entry['basis_source_mode']}",
                 f"menu={entry['site_menu']}",
                 f"bands={int(entry['num_bands'])}",
-                f"exact={float(entry['exact_acc']):.4f}",
+                f"iia={float(entry['iia_acc']):.4f}",
                 f"cal={float(entry['selection_score']):.4f}",
                 f"site={entry.get('site_label')}",
                 f"dim={entry.get('subspace_dim')}",
@@ -2835,13 +2895,14 @@ def main() -> None:
             target_var = str(entry.get("variable"))
             if target_var not in DEFAULT_TARGET_VARS:
                 continue
+            pca_support_path = Path(str(entry.get("layer_payload_path", "")))
+            if not _stage_output_is_valid(pca_support_path):
+                continue
             token_position_id = str(entry["token_position_id"])
             basis_source_mode = str(entry["basis_source_mode"])
             site_menu = str(entry["site_menu"])
             num_bands = int(entry["num_bands"])
             layer = int(entry["layer"])
-            layers = (int(layer),)
-            layer_target_vars = {int(layer): (target_var,)}
             stage_slug = _stage_b_slug(
                 token_position_id=str(token_position_id),
                 basis_source_mode=str(basis_source_mode),
@@ -2853,53 +2914,29 @@ def main() -> None:
                 f"{str(normalized['results_timestamp'])}_stageC_pca_{target_var}"
                 f"_{stage_slug}_L{int(layer):02d}"
             )
-            sweep_run_root = results_root / f"{stage_timestamp}_mcqa_ot_pca_focus"
+            sweep_run_root = results_root / f"{stage_timestamp}_mcqa_plot_das_pca_support"
             site_catalog_tag = _site_catalog_tag(
                 site_menu=str(site_menu),
                 num_bands=int(num_bands),
                 band_scheme=str(args.pca_band_scheme),
             )
-            target_suffix = _target_file_suffix(target_var)
-            plot_payload_path = (
+            summary_payload_path = (
                 sweep_run_root
                 / f"layer_{int(layer):02d}"
-                / (
-                    f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
-                    f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}"
-                    f"{target_suffix}_plot_pca_support.json"
-                )
-            )
-            das_payload_path = (
-                sweep_run_root
-                / f"layer_{int(layer):02d}"
-                / (
-                    f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
-                    f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}"
-                    f"{target_suffix}_plot_das_pca_support.json"
-                )
+                / f"mcqa_plot_das_pca_support_layer-{int(layer)}_summary.json"
             )
             guided_payload_path = (
                 sweep_run_root
                 / f"layer_{int(layer):02d}"
                 / (
                     f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
-                    f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}_{target_var}_das_guided.json"
+                    f"_basis-{str(basis_source_mode)}_sig-{str(args.signature_mode)}"
+                    f"_{target_var}_das_guided.json"
                 )
             )
-            expected_outputs = [str(plot_payload_path), str(das_payload_path), str(guided_payload_path)]
-            if (
-                all(_stage_output_is_valid(Path(path)) for path in expected_outputs)
-                and _stage_b_payload_matches_target_vars(
-                    payload_path=plot_payload_path,
-                    expected_target_vars=(target_var,),
-                    expected_support_extraction_mode=str(normalized["pca_support_extraction_mode"]),
-                )
-                and _das_payload_matches_target_vars(
-                    payload_path=das_payload_path,
-                    expected_target_vars=(target_var,),
-                )
-            ):
-                stage_c_payload_paths.append(das_payload_path)
+            expected_outputs = [str(summary_payload_path), str(guided_payload_path)]
+            if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
+                stage_c_payload_paths.append(summary_payload_path)
                 _mark_stage(
                     manifest_path=manifest_path,
                     repo_root=repo_root,
@@ -2919,22 +2956,17 @@ def main() -> None:
                 name=stage_name,
                 category="stage_c_plot_das_pca_support",
                 description=(
-                    f"Guided DAS on selected PCA OT coupling for {target_var}: token_position={token_position_id}, "
-                    f"basis={basis_source_mode}, menu={site_menu}, bands={num_bands}, layer={int(layer)}."
+                    f"Cached-support DAS on the selected PCA PLOT handle for {target_var}: "
+                    f"token_position={token_position_id}, basis={basis_source_mode}, "
+                    f"menu={site_menu}, bands={num_bands}, layer={int(layer)}."
                 ),
                 stage_timestamp=stage_timestamp,
-                command=_build_stage_b_or_c_command(
+                command=_build_pca_support_das_command(
                     args=args,
                     normalized=normalized,
                     stage_timestamp=stage_timestamp,
-                    token_position_id=str(token_position_id),
-                    layers=layers,
-                    requested_target_vars=(target_var,),
-                    layer_target_vars=layer_target_vars,
-                    basis_source_mode=str(basis_source_mode),
-                    site_menu=str(site_menu),
-                    num_bands=int(num_bands),
-                    guided_das=True,
+                    pca_support_path=pca_support_path,
+                    target_vars=(target_var,),
                 ),
                 expected_outputs=tuple(expected_outputs),
             )
@@ -2956,7 +2988,7 @@ def main() -> None:
             missing_outputs = [path for path in expected_outputs if not _stage_output_is_valid(Path(path))]
             if missing_outputs:
                 raise RuntimeError(f"Stage {stage_name} missing outputs: {missing_outputs}")
-            stage_c_payload_paths.append(das_payload_path)
+            stage_c_payload_paths.append(summary_payload_path)
             _mark_stage(
                 manifest_path=manifest_path,
                 repo_root=repo_root,

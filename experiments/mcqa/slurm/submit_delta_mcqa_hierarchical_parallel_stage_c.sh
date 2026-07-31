@@ -40,7 +40,7 @@ COMMON_ARGS=(
   --ot-epsilons "${OT_EPSILONS:-0.5,1,2,4}"
   --ot-top-k-values "${OT_TOP_K_VALUES:-1,2,4}"
   --ot-lambdas "${OT_LAMBDAS:-0.5,1,2,4}"
-  --calibration-metric "${CALIBRATION_METRIC:-family_weighted_macro_exact_acc}"
+  --calibration-metric "${CALIBRATION_METRIC:-family_weighted_macro_iia_acc}"
   --calibration-family-weights "${CALIBRATION_FAMILY_WEIGHTS:-1,1,1}"
   --split-seed "${SPLIT_SEED}"
   --stage-b-top-layers-per-var "${STAGE_B_TOP_LAYERS_PER_VAR:-1}"
