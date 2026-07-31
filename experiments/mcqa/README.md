@@ -2,6 +2,16 @@
 
 Main-paper MCQA code lives here. The benchmark evaluates Gemma-2-2B on CopyColors-style multiple-choice prompts and localizes the abstract variables `answer_pointer` and `answer_token`.
 
+## Evaluation metric
+
+Every calibration, selection, and test verdict uses `iia_acc`: Gemma's actual
+full-vocabulary top-1 next token is decoded, NFKC-normalized, stripped, folded
+to uppercase, and accepted only when it is exactly one ASCII symbol A-Z matching
+the causal interchange's final expected answer. Alphabet-restricted and raw
+token-ID accuracies are diagnostics only. OT/UOT/cosine effect signatures remain
+projected onto the 26 answer symbols; brute-force evaluates candidate
+interventions directly with `iia_acc`.
+
 Method families:
 
 - `PLOT`: Stage A UOT layer localization.

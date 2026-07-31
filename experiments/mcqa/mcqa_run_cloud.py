@@ -111,7 +111,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.ot_lambdas is None:
             args.ot_lambdas = "0.25,0.5,1,2,4,8"
         if args.calibration_metric is None:
-            args.calibration_metric = "family_weighted_macro_exact_acc"
+            args.calibration_metric = "family_weighted_macro_iia_acc"
         if args.calibration_family_weights is None:
             args.calibration_family_weights = "1,1,1"
     elif args.preset == "next_bf":
@@ -140,7 +140,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.ot_lambdas is None:
             args.ot_lambdas = "0.25,0.5,1,2,4,8"
         if args.calibration_metric is None:
-            args.calibration_metric = "family_weighted_macro_exact_acc"
+            args.calibration_metric = "family_weighted_macro_iia_acc"
         if args.calibration_family_weights is None:
             args.calibration_family_weights = "1,1,1"
     else:

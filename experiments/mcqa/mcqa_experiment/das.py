@@ -336,8 +336,8 @@ def run_das_pipeline(
                     "subspace_dim": int(subspace_dim),
                     "restart_index": int(restart_index),
                     "restart_count": int(restart_count),
-                    "selection_exact_acc": float(calibration_metrics["exact_acc"]),
-                    "calibration_exact_acc": float(calibration_metrics["exact_acc"]),
+                    "selection_iia_acc": float(calibration_metrics["iia_acc"]),
+                    "calibration_iia_acc": float(calibration_metrics["iia_acc"]),
                     "train_epochs_ran": len(loss_history),
                     "train_loss_history": loss_history,
                     "train_seconds": float(train_seconds),
@@ -348,7 +348,7 @@ def run_das_pipeline(
                 if len(record["token_position_ids"]) == 1:
                     record["token_position_id"] = str(record["token_position_ids"][0])
                 if holdout_metrics_for_candidate is not None:
-                    record["holdout_exact_acc"] = float(holdout_metrics_for_candidate["exact_acc"])
+                    record["holdout_iia_acc"] = float(holdout_metrics_for_candidate["iia_acc"])
                     if "decoded_answer_acc" in holdout_metrics_for_candidate:
                         record["holdout_decoded_answer_acc"] = float(holdout_metrics_for_candidate["decoded_answer_acc"])
                 search_records.append(record)
@@ -356,12 +356,12 @@ def run_das_pipeline(
                     message = (
                         f"[{config.method_name.upper()}] calibration variable={train_bank.target_var} site={site.label} "
                         f"dim={int(subspace_dim)} restart={restart_index + 1}/{restart_count} "
-                        f"epochs={len(loss_history)} exact_acc={float(calibration_metrics['exact_acc']):.4f}"
+                        f"epochs={len(loss_history)} iia_acc={float(calibration_metrics['iia_acc']):.4f}"
                     )
                     if holdout_metrics_for_candidate is not None:
-                        message += f" holdout_exact_acc={float(holdout_metrics_for_candidate['exact_acc']):.4f}"
+                        message += f" holdout_iia_acc={float(holdout_metrics_for_candidate['iia_acc']):.4f}"
                     print(message)
-                if best is None or float(record["selection_exact_acc"]) > float(best["selection_exact_acc"]):
+                if best is None or float(record["selection_iia_acc"]) > float(best["selection_iia_acc"]):
                     best = record
                     best_intervention = intervention
                     best_site = site
@@ -369,7 +369,7 @@ def run_das_pipeline(
                         print(
                             f"[{config.method_name.upper()}] new best variable={train_bank.target_var} "
                             f"site={site.label} dim={int(subspace_dim)} restart={restart_index + 1}/{restart_count} "
-                            f"calibration_exact_acc={float(record['selection_exact_acc']):.4f}"
+                            f"calibration_iia_acc={float(record['selection_iia_acc']):.4f}"
                         )
     if best is None or best_intervention is None or best_site is None:
         raise RuntimeError(f"Failed to select a DAS candidate for {train_bank.target_var}")
@@ -413,7 +413,7 @@ def run_das_pipeline(
         print(
             f"[{config.method_name.upper()}] holdout variable={train_bank.target_var} "
             f"site={best_site.label} dim={int(best['subspace_dim'])} "
-            f"exact_acc={float(holdout_metrics['exact_acc']):.4f}"
+            f"iia_acc={float(holdout_metrics['iia_acc']):.4f}"
         )
     return {
         "target_var": train_bank.target_var,

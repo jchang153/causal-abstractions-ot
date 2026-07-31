@@ -8,6 +8,7 @@ from time import perf_counter
 
 import mcqa_run as base_run
 import torch
+from mcqa_experiment.checking import payload_uses_unified_iia
 from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparison
 from mcqa_experiment.data import canonicalize_target_var
 from mcqa_experiment.ot import (
@@ -30,7 +31,7 @@ DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPositio
 DEFAULT_TOKEN_POSITION_ID = "last_token"
 DEFAULT_NATIVE_RESOLUTIONS = [128, 144, 192, 256, 288, 384, 576, 768]
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
-DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
+DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_iia_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
@@ -179,9 +180,10 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    return payload if isinstance(payload, dict) and payload_uses_unified_iia(payload) else None
 
 
 def _compare_payload_matches_target_vars(
@@ -243,7 +245,7 @@ def _best_alignment_method_payloads(
             result = payload.get("results", [{}])[0]
             target_var = str(payload.get("target_var"))
             candidate = {
-                "exact_acc": float(result.get("exact_acc", 0.0)),
+                "iia_acc": float(result.get("iia_acc", 0.0)),
                 "selection_score": float(result.get("selection_score", 0.0)),
                 "site_label": str(result.get("site_label", "")),
                 "method": method,
@@ -254,10 +256,10 @@ def _best_alignment_method_payloads(
             previous = best_records_by_var.get(target_var)
             if previous is None or (
                 float(candidate["selection_score"]),
-                float(candidate["exact_acc"]),
+                float(candidate["iia_acc"]),
             ) > (
                 float(previous["selection_score"]),
-                float(previous["exact_acc"]),
+                float(previous["iia_acc"]),
             ):
                 best_records_by_var[target_var] = candidate
                 best_method_payload_by_var[target_var] = payload
@@ -291,7 +293,7 @@ def _format_summary(
             else ""
         )
         lines.append(
-            f"best_{str(best.get('method', 'alignment'))} exact={float(best.get('exact_acc', 0.0)):.4f} "
+            f"best_{str(best.get('method', 'alignment'))} iia={float(best.get('iia_acc', 0.0)):.4f} "
             f"cal={float(best.get('selection_score', 0.0)):.4f} "
             f"{eps_fragment}"
             f"site={best.get('site_label')}"
@@ -741,9 +743,9 @@ def main() -> None:
                         "variable": target_var,
                         "epsilon": float(epsilon),
                         "calibration_score": float(
-                            result.get("selection_score", result.get("calibration_exact_acc", 0.0))
+                            result.get("selection_score", result.get("calibration_iia_acc", 0.0))
                         ),
-                        "calibration_exact_acc": float(result.get("calibration_exact_acc", result.get("exact_acc", 0.0))),
+                        "calibration_iia_acc": float(result.get("calibration_iia_acc", result.get("iia_acc", 0.0))),
                         "layer": int(payload["layer"]),
                         "native_resolution": int(payload["native_resolution"]),
                         "payload": payload,
@@ -836,7 +838,7 @@ def main() -> None:
         method_summary = {
             "method": alignment_method,
             "epsilon": selected_epsilon,
-            "exact_acc": float(result.get("exact_acc", 0.0)),
+            "iia_acc": float(result.get("iia_acc", 0.0)),
             "selection_score": float(result.get("selection_score", 0.0)),
             "site_label": result.get("site_label"),
             "selected_hyperparameters": selected_hyperparameters,

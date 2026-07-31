@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .checking import checker_accuracy
+from .checking import IIA_METRIC_NAME, normalize_answer_symbol
 from .data import (
     ALPHABET_LABELS,
     COUNTERFACTUAL_FAMILIES,
@@ -20,8 +20,10 @@ STRUCTURED_FEATURE_DIM = STRUCTURED_SLOT_DIM + STRUCTURED_LABEL_DIM
 
 
 def _label_indices_from_texts(texts: list[object]) -> torch.Tensor:
-    labels = [str(text).strip() for text in texts]
-    return torch.tensor([ALPHABET_LABELS.index(label) for label in labels], dtype=torch.long)
+    labels = [normalize_answer_symbol(text) for text in texts]
+    if any(label is None for label in labels):
+        raise ValueError(f"Expected one ASCII answer symbol A-Z, got {texts!r}")
+    return torch.tensor([ALPHABET_LABELS.index(str(label)) for label in labels], dtype=torch.long)
 
 
 def _base_answer_indices(bank: MCQAPairBank) -> torch.Tensor:
@@ -165,23 +167,40 @@ def cross_entropy_for_bank(logits: torch.Tensor, bank: MCQAPairBank) -> torch.Te
     return F.cross_entropy(target_logits.float(), bank.labels.to(target_logits.device))
 
 
-def _family_exact_accs(
-    predictions: torch.Tensor,
-    labels: torch.Tensor,
+def _family_iia_metrics(
+    correct: torch.Tensor,
+    prediction_valid: torch.Tensor,
+    expected_valid: torch.Tensor,
     bank: MCQAPairBank,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, dict[str, int]]]:
+    """Return per-family normalized IIA and explicit validity counts."""
+
     if not hasattr(bank, "counterfactual_family_names"):
-        return {}
-    metrics: dict[str, float] = {}
+        return {}, {}
+    family_accs: dict[str, float] = {}
+    family_counts: dict[str, dict[str, int]] = {}
     for family_name in COUNTERFACTUAL_FAMILIES:
         mask = torch.tensor(
             [str(current_family) == str(family_name) for current_family in bank.counterfactual_family_names],
-            device=predictions.device,
             dtype=torch.bool,
         )
-        if bool(mask.any()):
-            metrics[str(family_name)] = float((predictions[mask] == labels[mask]).float().mean().item())
-    return metrics
+        if not bool(mask.any()):
+            continue
+        family_correct = correct[mask]
+        family_prediction_valid = prediction_valid[mask]
+        family_expected_valid = expected_valid[mask]
+        total = int(mask.sum().item())
+        correct_count = int(family_correct.sum().item())
+        family_accs[str(family_name)] = float(correct_count / total)
+        family_counts[str(family_name)] = {
+            "total": total,
+            "correct": correct_count,
+            "valid_predictions": int(family_prediction_valid.sum().item()),
+            "invalid_predictions": int((~family_prediction_valid).sum().item()),
+            "valid_expected": int(family_expected_valid.sum().item()),
+            "invalid_expected": int((~family_expected_valid).sum().item()),
+        }
+    return family_accs, family_counts
 
 
 def cross_entropy_for_das(logits: torch.Tensor, bank: MCQAPairBank) -> torch.Tensor:
@@ -189,130 +208,201 @@ def cross_entropy_for_das(logits: torch.Tensor, bank: MCQAPairBank) -> torch.Ten
     return F.cross_entropy(logits, bank.answer_token_ids.to(logits.device))
 
 
-def metrics_from_logits(logits: torch.Tensor, bank: MCQAPairBank, tokenizer=None) -> dict[str, float]:
-    """Compute exact accuracy, family-wise accuracy, and optional decoded answer accuracy."""
-    target_logits = gather_variable_logits(logits, bank)
-    predictions = target_logits.argmax(dim=-1)
-    labels = (
-        bank.labels.to(predictions.device)
-        if hasattr(bank, "labels")
-        else bank.answer_token_ids.to(predictions.device)
+def _decoded_full_vocab_top1(logits: torch.Tensor, tokenizer) -> tuple[torch.Tensor, list[str]]:
+    if tokenizer is None:
+        raise ValueError("tokenizer is required for normalized full-vocabulary MCQA IIA")
+    if logits.ndim != 2:
+        raise ValueError(f"Expected [batch, vocab] logits, got shape={tuple(logits.shape)}")
+    token_ids = logits.argmax(dim=-1)
+    decoded = [tokenizer.decode([int(token_id)]) for token_id in token_ids.detach().cpu().tolist()]
+    return token_ids, decoded
+
+
+def _normalized_iia_state(
+    logits: torch.Tensor,
+    bank: MCQAPairBank,
+    tokenizer,
+) -> dict[str, object]:
+    predicted_token_ids, predicted_texts = _decoded_full_vocab_top1(logits, tokenizer)
+    expected_texts = [str(text) for text in bank.expected_answer_texts]
+    if len(expected_texts) != len(predicted_texts):
+        raise ValueError(
+            f"Expected {len(predicted_texts)} answer texts, got {len(expected_texts)}"
+        )
+    normalized_predictions = [normalize_answer_symbol(text) for text in predicted_texts]
+    normalized_expected = [normalize_answer_symbol(text) for text in expected_texts]
+    prediction_valid = torch.tensor(
+        [symbol is not None for symbol in normalized_predictions], dtype=torch.bool
     )
-    exact_acc = float((predictions == labels).float().mean().item())
+    expected_valid = torch.tensor(
+        [symbol is not None for symbol in normalized_expected], dtype=torch.bool
+    )
+    correct = torch.tensor(
+        [
+            predicted is not None and expected is not None and predicted == expected
+            for predicted, expected in zip(normalized_predictions, normalized_expected)
+        ],
+        dtype=torch.bool,
+    )
+    return {
+        "predicted_token_ids": predicted_token_ids.detach().cpu(),
+        "predicted_texts": predicted_texts,
+        "expected_texts": expected_texts,
+        "normalized_predictions": normalized_predictions,
+        "normalized_expected": normalized_expected,
+        "prediction_valid": prediction_valid,
+        "expected_valid": expected_valid,
+        "correct": correct,
+    }
+
+
+def _diagnostic_alphabet_metrics(
+    logits: torch.Tensor,
+    bank: MCQAPairBank,
+    normalized_expected: list[str | None],
+) -> dict[str, object]:
+    if not hasattr(bank, "alphabet_variant_token_ids"):
+        return {}
+    alphabet_logits = _gather_label_logits(logits, bank)
+    alphabet_predictions = alphabet_logits.argmax(dim=-1).detach().cpu()
+    expected_indices = torch.tensor(
+        [ALPHABET_LABELS.index(symbol) if symbol in ALPHABET_LABELS else -1 for symbol in normalized_expected],
+        dtype=torch.long,
+    )
+    alphabet_correct = (expected_indices >= 0) & (alphabet_predictions == expected_indices)
+    total = int(alphabet_predictions.numel())
+    return {
+        "diagnostic_alphabet_restricted_acc": (
+            float(alphabet_correct.float().mean().item()) if total else 0.0
+        ),
+        "diagnostic_alphabet_prediction_indices": alphabet_predictions.tolist(),
+        "diagnostic_alphabet_prediction_texts": [
+            ALPHABET_LABELS[int(index)] for index in alphabet_predictions.tolist()
+        ],
+    }
+
+
+def full_vocab_iia_metrics(
+    logits: torch.Tensor,
+    bank: MCQAPairBank,
+    tokenizer,
+) -> dict[str, object]:
+    """Evaluate normalized agreement of the model's actual full-vocab top-1 token."""
+
+    state = _normalized_iia_state(logits, bank, tokenizer)
+    correct = state["correct"]
+    prediction_valid = state["prediction_valid"]
+    expected_valid = state["expected_valid"]
+    assert isinstance(correct, torch.Tensor)
+    assert isinstance(prediction_valid, torch.Tensor)
+    assert isinstance(expected_valid, torch.Tensor)
+    total = int(correct.numel())
+    correct_count = int(correct.sum().item())
+    iia_acc = float(correct_count / total) if total else 0.0
+    family_iia_accs, family_iia_counts = _family_iia_metrics(
+        correct, prediction_valid, expected_valid, bank
+    )
     metrics: dict[str, object] = {
-        "exact_acc": exact_acc,
-        "family_exact_accs": _family_exact_accs(predictions, labels, bank),
+        "metric_name": IIA_METRIC_NAME,
+        "iia_acc": iia_acc,
+        "family_iia_accs": family_iia_accs,
+        "iia_validity_counts": {
+            "total": total,
+            "correct": correct_count,
+            "valid_predictions": int(prediction_valid.sum().item()),
+            "invalid_predictions": int((~prediction_valid).sum().item()),
+            "valid_expected": int(expected_valid.sum().item()),
+            "invalid_expected": int((~expected_valid).sum().item()),
+        },
+        "family_iia_counts": family_iia_counts,
+        # Compatibility aliases: these are deliberately equal to normalized IIA.
+        "exact_acc": iia_acc,
+        "family_exact_accs": dict(family_iia_accs),
+        "decoded_answer_acc": iia_acc,
+        "checker_acc": iia_acc,
     }
-    if tokenizer is not None:
-        canonical_target_var = canonicalize_target_var(bank.target_var) if hasattr(bank, "target_var") else "answer_token"
-        if hasattr(bank, "symbol_token_ids") and hasattr(bank, "alphabet_token_ids"):
-            token_bank = bank.symbol_token_ids if canonical_target_var == "answer_pointer" else bank.alphabet_token_ids
-            token_predictions = torch.gather(
-                token_bank.to(logits.device),
-                dim=1,
-                index=predictions.view(-1, 1),
-            ).view(-1)
-        else:
-            token_predictions = predictions
-        decoded_predictions = [tokenizer.decode([int(token_id)]) for token_id in token_predictions.detach().cpu().tolist()]
-        decoded_acc = 0.0
-        if decoded_predictions:
-            if canonical_target_var == "answer_pointer" and hasattr(bank, "symbol_token_ids"):
-                target_token_ids = torch.gather(
-                    bank.symbol_token_ids.to(logits.device),
-                    dim=1,
-                    index=labels.view(-1, 1),
-                ).view(-1)
-            else:
-                target_token_ids = bank.answer_token_ids.to(logits.device)
-            decoded_targets = [tokenizer.decode([int(token_id)]) for token_id in target_token_ids.detach().cpu().tolist()]
-            decoded_acc = sum(
-                int(str(expected).strip() == str(decoded).strip())
-                for expected, decoded in zip(decoded_targets, decoded_predictions)
-            ) / len(decoded_predictions)
-        metrics["decoded_answer_acc"] = float(decoded_acc)
-        metrics["checker_acc"] = float(checker_accuracy(decoded_predictions, bank.expected_answer_texts))
-    return metrics
-
-
-def das_metrics_from_logits(logits: torch.Tensor, bank: MCQAPairBank, tokenizer=None) -> dict[str, float]:
-    """Compute DAS metrics directly on full-vocab next-token predictions."""
-    predictions = logits.argmax(dim=-1)
-    labels = bank.answer_token_ids.to(predictions.device)
-    exact_acc = float((predictions == labels).float().mean().item())
-    metrics = {"exact_acc": exact_acc}
-    if tokenizer is not None:
-        decoded_predictions = [tokenizer.decode([int(token_id)]) for token_id in predictions.detach().cpu().tolist()]
-        decoded_acc = 0.0
-        if decoded_predictions:
-            decoded_acc = sum(
-                int(str(expected).strip() == str(decoded).strip())
-                for expected, decoded in zip(bank.expected_answer_texts, decoded_predictions)
-            ) / len(decoded_predictions)
-        metrics["decoded_answer_acc"] = float(decoded_acc)
-        metrics["checker_acc"] = float(checker_accuracy(decoded_predictions, bank.expected_answer_texts))
-    return metrics
-
-
-def prediction_details_from_logits(logits: torch.Tensor, bank: MCQAPairBank, tokenizer=None) -> dict[str, object]:
-    """Return parse-friendly per-example prediction details for one bank."""
-    target_logits = gather_variable_logits(logits, bank)
-    predictions = target_logits.argmax(dim=-1)
-    labels = (
-        bank.labels.to(predictions.device)
-        if hasattr(bank, "labels")
-        else bank.answer_token_ids.to(predictions.device)
+    predicted_token_ids = state["predicted_token_ids"]
+    assert isinstance(predicted_token_ids, torch.Tensor)
+    if hasattr(bank, "answer_token_ids"):
+        target_token_ids = bank.answer_token_ids.detach().cpu().to(torch.long)
+        metrics["diagnostic_full_vocab_raw_token_acc"] = (
+            float((predicted_token_ids == target_token_ids).float().mean().item())
+            if total else 0.0
+        )
+    metrics.update(
+        _diagnostic_alphabet_metrics(
+            logits, bank, state["normalized_expected"]
+        )
     )
+    return metrics
+
+
+def metrics_from_logits(logits: torch.Tensor, bank: MCQAPairBank, tokenizer=None) -> dict[str, object]:
+    """Compute normalized full-vocabulary IIA plus explicit diagnostics."""
+    return full_vocab_iia_metrics(logits, bank, tokenizer)
+
+
+def das_metrics_from_logits(logits: torch.Tensor, bank: MCQAPairBank, tokenizer=None) -> dict[str, object]:
+    """Compute the same normalized full-vocabulary IIA used by every MCQA method."""
+    return full_vocab_iia_metrics(logits, bank, tokenizer)
+
+
+def prediction_details_from_logits(
+    logits: torch.Tensor,
+    bank: MCQAPairBank,
+    tokenizer=None,
+) -> dict[str, object]:
+    """Return per-example details for normalized full-vocabulary IIA."""
+
+    state = _normalized_iia_state(logits, bank, tokenizer)
+    predicted_token_ids = state["predicted_token_ids"]
+    correct = state["correct"]
+    prediction_valid = state["prediction_valid"]
+    expected_valid = state["expected_valid"]
+    assert isinstance(predicted_token_ids, torch.Tensor)
+    assert isinstance(correct, torch.Tensor)
+    assert isinstance(prediction_valid, torch.Tensor)
+    assert isinstance(expected_valid, torch.Tensor)
     details: dict[str, object] = {
-        "labels": labels.detach().cpu().tolist(),
-        "predictions": predictions.detach().cpu().tolist(),
-        "correct": (predictions == labels).detach().cpu().to(torch.int64).tolist(),
-        "target_logits": target_logits.detach().cpu().tolist(),
-        "base_raw_inputs": [str(item["raw_input"]) for item in bank.base_inputs],
-        "source_raw_inputs": [str(item["raw_input"]) for item in bank.source_inputs],
-        "expected_answer_texts": list(bank.expected_answer_texts),
+        "metric_name": IIA_METRIC_NAME,
+        "predictions": predicted_token_ids.tolist(),
+        "predicted_token_ids": predicted_token_ids.tolist(),
+        "correct": correct.to(torch.int64).tolist(),
+        "predicted_text": list(state["predicted_texts"]),
+        "normalized_predicted_text": list(state["normalized_predictions"]),
+        "expected_answer_texts": list(state["expected_texts"]),
+        "normalized_expected_answer_texts": list(state["normalized_expected"]),
+        "prediction_valid": prediction_valid.to(torch.int64).tolist(),
+        "expected_valid": expected_valid.to(torch.int64).tolist(),
+        "base_raw_inputs": [str(item.get("raw_input", "")) for item in getattr(bank, "base_inputs", [])],
+        "source_raw_inputs": [str(item.get("raw_input", "")) for item in getattr(bank, "source_inputs", [])],
     }
-    canonical_target_var = canonicalize_target_var(bank.target_var) if hasattr(bank, "target_var") else "answer_token"
-    if hasattr(bank, "symbol_token_ids") and hasattr(bank, "alphabet_token_ids"):
-        token_bank = bank.symbol_token_ids if canonical_target_var == "answer_pointer" else bank.alphabet_token_ids
-        predicted_token_ids = torch.gather(
-            token_bank.to(logits.device),
-            dim=1,
-            index=predictions.view(-1, 1),
-        ).view(-1)
-    else:
-        predicted_token_ids = predictions
-    details["predicted_token_ids"] = predicted_token_ids.detach().cpu().tolist()
-    if canonical_target_var == "answer_pointer" and hasattr(bank, "symbol_token_ids"):
-        target_token_ids = bank.symbol_token_ids.gather(1, labels.view(-1, 1).cpu()).view(-1)
-    else:
-        target_token_ids = bank.answer_token_ids.cpu()
-    details["target_token_ids"] = target_token_ids.detach().cpu().tolist()
-    if tokenizer is not None:
-        details["predicted_text"] = [
-            tokenizer.decode([int(token_id)]) for token_id in predicted_token_ids.detach().cpu().tolist()
-        ]
+    if hasattr(bank, "answer_token_ids"):
+        target_token_ids = bank.answer_token_ids.detach().cpu().to(torch.long)
+        details["labels"] = target_token_ids.tolist()
+        details["target_token_ids"] = target_token_ids.tolist()
+        details["diagnostic_raw_token_correct"] = (
+            predicted_token_ids == target_token_ids
+        ).to(torch.int64).tolist()
+    if hasattr(bank, "alphabet_variant_token_ids"):
+        diagnostic = _diagnostic_alphabet_metrics(
+            logits, bank, state["normalized_expected"]
+        )
+        details.update(diagnostic)
+    # Preserve projected task logits only as a named diagnostic.
+    details["diagnostic_projected_target_logits"] = (
+        gather_variable_logits(logits, bank).detach().cpu().tolist()
+    )
     return details
 
 
-def das_prediction_details_from_logits(logits: torch.Tensor, bank: MCQAPairBank, tokenizer=None) -> dict[str, object]:
-    """Return parse-friendly DAS prediction details from full-vocab logits."""
-    predictions = logits.argmax(dim=-1)
-    labels = bank.answer_token_ids.to(predictions.device)
-    details: dict[str, object] = {
-        "labels": labels.detach().cpu().tolist(),
-        "predictions": predictions.detach().cpu().tolist(),
-        "correct": (predictions == labels).detach().cpu().to(torch.int64).tolist(),
-        "base_raw_inputs": [str(item["raw_input"]) for item in bank.base_inputs],
-        "source_raw_inputs": [str(item["raw_input"]) for item in bank.source_inputs],
-        "expected_answer_texts": list(bank.expected_answer_texts),
-        "target_token_ids": bank.answer_token_ids.detach().cpu().tolist(),
-    }
-    if tokenizer is not None:
-        details["predicted_text"] = [
-            tokenizer.decode([int(token_id)]) for token_id in predictions.detach().cpu().tolist()
-        ]
-    return details
+def das_prediction_details_from_logits(
+    logits: torch.Tensor,
+    bank: MCQAPairBank,
+    tokenizer=None,
+) -> dict[str, object]:
+    """Return the shared normalized full-vocabulary IIA details for DAS-like methods."""
+    return prediction_details_from_logits(logits, bank, tokenizer=tokenizer)
 
 
 def build_variable_signature(bank: MCQAPairBank, signature_mode: str) -> torch.Tensor:

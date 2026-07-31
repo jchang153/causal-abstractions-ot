@@ -162,7 +162,7 @@ def extract_selected_site_support(
             payloads,
             key=lambda payload: (
                 float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
-                float(payload.get("results", [{}])[0].get("exact_acc", 0.0)),
+                float(payload.get("results", [{}])[0].get("iia_acc", 0.0)),
             ),
         )
         selected_candidate = _selected_mask_candidate_from_payload(best_payload, sites=sites)
@@ -180,7 +180,7 @@ def extract_selected_site_support(
             "kept_trial_count": 1,
             "selected_trial": {
                 "selection_score": float(best_result.get("selection_score", 0.0)),
-                "exact_acc": float(best_result.get("exact_acc", 0.0)),
+                "iia_acc": float(best_result.get("iia_acc", 0.0)),
                 "epsilon": float(
                     best_payload.get("transport_meta", {}).get(
                         "epsilon_config",
@@ -194,7 +194,7 @@ def extract_selected_site_support(
             "kept_trials": [
                 {
                     "selection_score": float(best_result.get("selection_score", 0.0)),
-                    "exact_acc": float(best_result.get("exact_acc", 0.0)),
+                    "iia_acc": float(best_result.get("iia_acc", 0.0)),
                     "epsilon": float(
                         best_payload.get("transport_meta", {}).get(
                             "epsilon_config",
@@ -238,7 +238,7 @@ def extract_ordered_site_support(
             payloads,
             key=lambda payload: (
                 float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
-                float(payload.get("results", [{}])[0].get("exact_acc", 0.0)),
+                float(payload.get("results", [{}])[0].get("iia_acc", 0.0)),
             ),
         )
         transport = np.asarray(best_payload.get("normalized_transport", best_payload.get("transport", [])), dtype=float)
@@ -379,7 +379,7 @@ def extract_layer_position_support(
             "kept_trials": [
                 {
                     "selection_score": float(payload.get("results", [{}])[0].get("selection_score", 0.0)),
-                    "exact_acc": float(payload.get("results", [{}])[0].get("exact_acc", 0.0)),
+                    "iia_acc": float(payload.get("results", [{}])[0].get("iia_acc", 0.0)),
                     "epsilon": float(payload.get("transport_meta", {}).get("epsilon_config", payload.get("results", [{}])[0].get("epsilon", 0.0))),
                 }
                 for payload in kept_payloads

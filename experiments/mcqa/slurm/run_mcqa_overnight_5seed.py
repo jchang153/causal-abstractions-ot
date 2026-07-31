@@ -87,7 +87,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="0.5,1,2,4",
         help="Downstream Stage B OT lambdas.",
     )
-    parser.add_argument("--calibration-metric", default="family_weighted_macro_exact_acc")
+    parser.add_argument("--calibration-metric", default="family_weighted_macro_iia_acc")
     parser.add_argument("--calibration-family-weights", default="1,1.5,2")
     parser.add_argument("--stage-b-top-layers-per-var", type=int, default=3)
     parser.add_argument("--stage-b-neighbor-radius", type=int, default=0)

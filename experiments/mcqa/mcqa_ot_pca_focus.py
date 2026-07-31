@@ -10,6 +10,7 @@ from time import perf_counter
 
 import mcqa_run as base_run
 import torch
+from mcqa_experiment.checking import payload_uses_unified_iia
 from mcqa_experiment.das import DASConfig, run_das_pipeline
 from mcqa_experiment.data import COUNTERFACTUAL_FAMILIES, canonicalize_target_var
 from mcqa_experiment.ot import (
@@ -47,7 +48,7 @@ DEFAULT_TOKEN_POSITION_ID = "last_token"
 DEFAULT_NUM_BANDS = 8
 DEFAULT_SITE_MENU = "partition"
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
-DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
+DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_iia_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 3, 4, 5)
@@ -268,9 +269,10 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    return payload if isinstance(payload, dict) and payload_uses_unified_iia(payload) else None
 
 
 def _compare_payload_matches_target_vars(
@@ -552,7 +554,7 @@ def _best_ot_records(
                 selected_hyperparameters = {}
             target_var = str(payload.get("target_var"))
             record = {
-                "exact_acc": float(result.get("exact_acc", 0.0)),
+                "iia_acc": float(result.get("iia_acc", 0.0)),
                 "selection_score": float(result.get("selection_score", 0.0)),
                 "site_label": str(result.get("site_label")),
                 "method": method,
@@ -566,10 +568,10 @@ def _best_ot_records(
             previous = best_by_var.get(target_var)
             if previous is None or (
                 float(record["selection_score"]),
-                float(record["exact_acc"]),
+                float(record["iia_acc"]),
             ) > (
                 float(previous["selection_score"]),
-                float(previous["exact_acc"]),
+                float(previous["iia_acc"]),
             ):
                 best_by_var[target_var] = record
     return best_by_var
@@ -687,8 +689,8 @@ def _write_das_text_report(path: Path, *, title: str, payload: dict[str, object]
     lines = [
         title,
         f"site: {result.get('site_label')}",
-        f"exact_acc: {float(result.get('exact_acc', 0.0)):.4f}",
-        f"calibration_exact_acc: {float(result.get('selection_exact_acc', result.get('calibration_exact_acc', 0.0))):.4f}",
+        f"iia_acc: {float(result.get('iia_acc', 0.0)):.4f}",
+        f"calibration_iia_acc: {float(result.get('selection_iia_acc', result.get('calibration_iia_acc', 0.0))):.4f}",
         f"subspace_dim: {result.get('subspace_dim')}",
     ]
     if extra_lines:
@@ -867,7 +869,7 @@ def _format_layer_summary(
             else ""
         )
         lines.append(
-            f"{str(alignment_method).upper()}[{target_var}] exact={float(record['exact_acc']):.4f} "
+            f"{str(alignment_method).upper()}[{target_var}] iia={float(record['iia_acc']):.4f} "
             f"cal={float(record['selection_score']):.4f} "
             f"{eps_fragment}site={record['site_label']}"
         )
@@ -890,8 +892,8 @@ def _format_layer_summary(
                 continue
             result = payload.get("results", [{}])[0]
             lines.append(
-                f"DAS_SCREEN[{target_var}] exact={float(result.get('exact_acc', 0.0)):.4f} "
-                f"cal={float(result.get('selection_exact_acc', result.get('calibration_exact_acc', 0.0))):.4f} "
+                f"DAS_SCREEN[{target_var}] iia={float(result.get('iia_acc', 0.0)):.4f} "
+                f"cal={float(result.get('selection_iia_acc', result.get('calibration_iia_acc', 0.0))):.4f} "
                 f"site={result.get('site_label')} dim={result.get('subspace_dim')}"
             )
     if guided_payloads:
@@ -903,8 +905,8 @@ def _format_layer_summary(
                 continue
             result = payload.get("results", [{}])[0]
             lines.append(
-                f"DAS_GUIDED[{target_var}] exact={float(result.get('exact_acc', 0.0)):.4f} "
-                f"cal={float(result.get('selection_exact_acc', result.get('calibration_exact_acc', 0.0))):.4f} "
+                f"DAS_GUIDED[{target_var}] iia={float(result.get('iia_acc', 0.0)):.4f} "
+                f"cal={float(result.get('selection_iia_acc', result.get('calibration_iia_acc', 0.0))):.4f} "
                 f"site={result.get('site_label')} dim={result.get('subspace_dim')}"
             )
     return "\n".join(lines)
@@ -929,7 +931,7 @@ def _write_epsilon_summary(path: Path, *, payload: dict[str, object], alignment_
     for result_payload in payload.get("method_payloads", {}).get(_canonical_alignment_method(alignment_method), []):
         result = result_payload.get("results", [{}])[0]
         lines.append(
-            f"{str(alignment_method).upper()}[{result_payload.get('target_var')}] exact={float(result.get('exact_acc', 0.0)):.4f} "
+            f"{str(alignment_method).upper()}[{result_payload.get('target_var')}] iia={float(result.get('iia_acc', 0.0)):.4f} "
             f"cal={float(result.get('selection_score', 0.0)):.4f} "
             f"site={result.get('site_label')}"
         )
@@ -1615,7 +1617,7 @@ def main() -> None:
                         "variable": target_var,
                         "epsilon": epsilon,
                         "calibration_score": float(
-                            result.get("selection_score", result.get("calibration_exact_acc", 0.0))
+                            result.get("selection_score", result.get("calibration_iia_acc", 0.0))
                         ),
                         "layer": int(run["spec"]["layer"]),
                         "num_bands": int(run["spec"]["num_bands"]),

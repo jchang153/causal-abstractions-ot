@@ -16,8 +16,8 @@ def summarize_method_records(records: list[dict[str, object]]) -> list[dict[str,
         grouped[str(record["method"])].append(record)
     summaries = []
     for method, method_records in sorted(grouped.items()):
-        exact_acc = sum(float(record["exact_acc"]) for record in method_records) / len(method_records)
-        summaries.append({"method": method, "exact_acc": exact_acc})
+        iia_acc = sum(float(record["iia_acc"]) for record in method_records) / len(method_records)
+        summaries.append({"method": method, "iia_acc": iia_acc})
     return summaries
 
 
@@ -67,7 +67,7 @@ def format_summary(
     lines.append("")
     lines.append("method summary:")
     for record in summary_records:
-        lines.append(f"{str(record['method']).upper()}: exact={float(record['exact_acc']):.4f}")
+        lines.append(f"{str(record['method']).upper()}: iia={float(record['iia_acc']):.4f}")
     lines.append("")
     lines.append("best selections:")
     for method, payload_list in sorted(method_payloads.items()):
@@ -75,7 +75,7 @@ def format_summary(
             for record in payload.get("results", []):
                 bits = [
                     f"{method.upper()}[{record['variable']}]",
-                    f"exact={float(record['exact_acc']):.4f}",
+                    f"iia={float(record['iia_acc']):.4f}",
                     f"site={record.get('site_label')}",
                 ]
                 if "token_position_id" in record:
@@ -97,7 +97,7 @@ def print_results_table(records: list[dict[str, object]], title: str) -> None:
     if not records:
         print("(no records)")
         return
-    header = f"{'method':<8} {'variable':<16} {'exact':>8} {'select/cal':>10} {'site/config':<32}"
+    header = f"{'method':<8} {'variable':<16} {'IIA':>8} {'select/cal':>10} {'site/config':<32}"
     print(header)
     print("-" * len(header))
     for record in records:
@@ -113,7 +113,7 @@ def print_results_table(records: list[dict[str, object]], title: str) -> None:
         print(
             f"{str(record['method']):<8} "
             f"{str(record.get('variable', 'average')):<16} "
-            f"{float(record['exact_acc']):>8.4f} "
-            f"{float(record.get('selection_exact_acc', record.get('calibration_exact_acc', 0.0))):>10.4f} "
+            f"{float(record['iia_acc']):>8.4f} "
+            f"{float(record.get('selection_iia_acc', record.get('calibration_iia_acc', 0.0))):>10.4f} "
             f"{' '.join(site_bits):<32}"
         )

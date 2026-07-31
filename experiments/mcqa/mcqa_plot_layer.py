@@ -8,6 +8,7 @@ from time import perf_counter
 
 import mcqa_run as base_run
 import torch
+from mcqa_experiment.checking import payload_uses_unified_iia
 from mcqa_experiment.data import canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
@@ -34,7 +35,7 @@ DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
 DEFAULT_TOKEN_POSITION_ID = "last_token"
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
-DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
+DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_iia_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_UOT_BETA_NEURALS = (0.1, 0.3, 1.0, 3.0)
@@ -171,9 +172,10 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    return payload if isinstance(payload, dict) and payload_uses_unified_iia(payload) else None
 
 
 def _target_row_ranking(payload: dict[str, object], *, sites) -> list[dict[str, object]]:
@@ -341,18 +343,18 @@ def _stage_a_calibration_score(
     result: dict[str, object],
     calibration_family_weights: tuple[float, ...],
 ) -> float:
-    exact_acc = float(result.get("exact_acc", 0.0))
-    family_exact_accs = result.get("family_exact_accs", {})
-    if not isinstance(family_exact_accs, dict):
-        return exact_acc
+    iia_acc = float(result.get("iia_acc", 0.0))
+    family_iia_accs = result.get("family_iia_accs", {})
+    if not isinstance(family_iia_accs, dict):
+        return iia_acc
     weighted_sum = 0.0
     total_weight = 0.0
     for family_name, weight in zip(DEFAULT_COUNTERFACTUAL_NAMES, calibration_family_weights):
-        if family_name not in family_exact_accs:
+        if family_name not in family_iia_accs:
             continue
-        weighted_sum += float(weight) * float(family_exact_accs[family_name])
+        weighted_sum += float(weight) * float(family_iia_accs[family_name])
         total_weight += float(weight)
-    return exact_acc if total_weight <= 0.0 else float(weighted_sum / total_weight)
+    return iia_acc if total_weight <= 0.0 else float(weighted_sum / total_weight)
 
 
 def _evaluate_fixed_single_layer_calibration_only(
@@ -408,7 +410,7 @@ def _evaluate_fixed_single_layer_holdout_only(
     batch_size: int,
     strength: float,
     calibration_score: float,
-    calibration_exact_acc: float,
+    calibration_iia_acc: float,
 ) -> dict[str, object]:
     eval_start = perf_counter()
     holdout_result, holdout_ranking = _evaluate_single_site_intervention(
@@ -426,8 +428,8 @@ def _evaluate_fixed_single_layer_holdout_only(
     runtime_seconds = float(perf_counter() - eval_start)
     holdout_result["method"] = "single_layer_full_swap"
     holdout_result["selection_score"] = float(calibration_score)
-    holdout_result["selection_exact_acc"] = float(calibration_exact_acc)
-    holdout_result["calibration_exact_acc"] = float(calibration_exact_acc)
+    holdout_result["selection_iia_acc"] = float(calibration_iia_acc)
+    holdout_result["calibration_iia_acc"] = float(calibration_iia_acc)
     holdout_result["lambda"] = float(strength)
     return {
         "target_var": str(holdout_bank.target_var),
@@ -527,7 +529,7 @@ def _evaluate_stage_a_config(
             calibration_score = float(
                 calibration_eval_payload.get(
                     "calibration_score",
-                    calibration_result.get("selection_score", calibration_result.get("exact_acc", 0.0)),
+                    calibration_result.get("selection_score", calibration_result.get("iia_acc", 0.0)),
                 )
             )
             candidate_records.append(
@@ -540,7 +542,7 @@ def _evaluate_stage_a_config(
                     "transport_mass": float(shortlisted_entry["transport_mass"]),
                     "runtime_seconds": float(calibration_eval_payload.get("runtime_seconds", 0.0)),
                     "calibration_score": float(calibration_score),
-                    "calibration_exact_acc": float(calibration_result.get("exact_acc", 0.0)),
+                    "calibration_iia_acc": float(calibration_result.get("iia_acc", 0.0)),
                     "calibration_payload": calibration_eval_payload,
                 }
             )
@@ -548,7 +550,7 @@ def _evaluate_stage_a_config(
             candidate_records,
             key=lambda record: (
                 float(record.get("calibration_score", 0.0)),
-                float(record.get("calibration_exact_acc", 0.0)),
+                float(record.get("calibration_iia_acc", 0.0)),
                 float(record.get("transport_mass", 0.0)),
                 -int(record.get("rank_index", 10**9)),
             ),
@@ -557,10 +559,10 @@ def _evaluate_stage_a_config(
         record = {
             "method": str(payload.get("method", row_info["method_name"])),
             "variable": str(target_var),
-            "exact_acc": None,
+            "iia_acc": None,
             "selection_score": float(calibration_score),
-            "selection_exact_acc": float(best_candidate["calibration_exact_acc"]),
-            "calibration_exact_acc": float(best_candidate["calibration_exact_acc"]),
+            "selection_iia_acc": float(best_candidate["calibration_iia_acc"]),
+            "calibration_iia_acc": float(best_candidate["calibration_iia_acc"]),
             "site_label": str(best_candidate["site_label"]),
             "layer": int(best_candidate["layer"]),
             "uot_beta_neural": None
@@ -584,7 +586,7 @@ def _evaluate_stage_a_config(
                     "layer": int(candidate["layer"]),
                     "transport_mass": float(candidate["transport_mass"]),
                     "calibration_score": float(candidate["calibration_score"]),
-                    "calibration_exact_acc": float(candidate["calibration_exact_acc"]),
+                    "calibration_iia_acc": float(candidate["calibration_iia_acc"]),
                     "runtime_seconds": float(candidate["runtime_seconds"]),
                 }
                 for candidate in candidate_records
@@ -606,7 +608,7 @@ def _evaluate_stage_a_config(
         if isinstance(record, dict)
     ]
     calibration_exact_scores = [
-        float(record.get("selection_exact_acc", record.get("calibration_exact_acc", 0.0)))
+        float(record.get("selection_iia_acc", record.get("calibration_iia_acc", 0.0)))
         for target_var in target_vars
         for record in [per_var_records.get(str(target_var))]
         if isinstance(record, dict)
@@ -619,7 +621,7 @@ def _evaluate_stage_a_config(
             "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
             "per_var_records": {},
             "mean_calibration_score": 0.0,
-            "mean_calibration_exact_acc": 0.0,
+            "mean_calibration_iia_acc": 0.0,
             "calibration_sweep_runtime_seconds": 0.0,
             "row_top_k": int(row_top_k),
         }
@@ -635,10 +637,10 @@ def _evaluate_stage_a_config(
         payload["results"] = [
             {
                 "selection_score": float(record["selection_score"]),
-                "exact_acc": float(
+                "iia_acc": float(
                     record.get(
-                        "selection_exact_acc",
-                        record.get("calibration_exact_acc", 0.0),
+                        "selection_iia_acc",
+                        record.get("calibration_iia_acc", 0.0),
                     )
                 ),
                 "site_label": str(record["site_label"]),
@@ -654,7 +656,7 @@ def _evaluate_stage_a_config(
         "intervention_strength": float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
         "per_var_records": per_var_records,
         "mean_calibration_score": float(sum(calibration_scores) / len(calibration_scores)) if calibration_scores else 0.0,
-        "mean_calibration_exact_acc": (
+        "mean_calibration_iia_acc": (
             float(sum(calibration_exact_scores) / len(calibration_exact_scores))
             if calibration_exact_scores else 0.0
         ),
@@ -686,7 +688,7 @@ def _format_stage_a_config_line(
         if isinstance(record, dict)
     }
     calibration_exact_scores = {
-        str(target_var): float(record.get("selection_exact_acc", record.get("calibration_exact_acc", 0.0)))
+        str(target_var): float(record.get("selection_iia_acc", record.get("calibration_iia_acc", 0.0)))
         for target_var in target_vars
         for record in [per_var_records.get(str(target_var))]
         if isinstance(record, dict)
@@ -705,9 +707,9 @@ def _format_stage_a_config_line(
         + f"row_top_k={int(candidate_config.get('row_top_k', DEFAULT_STAGE_A_ROW_TOP_K))} "
         + f"layers={chosen_layers} "
         + f"cal={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in calibration_scores.items())}}} "
-        + f"cal_exact={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in calibration_exact_scores.items())}}} "
+        + f"cal_iia={{{', '.join(f'{target_var}: {score:.4f}' for target_var, score in calibration_exact_scores.items())}}} "
         + f"avg_cal={float(candidate_config.get('mean_calibration_score', 0.0)):.4f} "
-        + f"avg_cal_exact={float(candidate_config.get('mean_calibration_exact_acc', 0.0)):.4f} "
+        + f"avg_cal_iia={float(candidate_config.get('mean_calibration_iia_acc', 0.0)):.4f} "
         + f"runtime_with_signatures={float(runtime_with_signatures_seconds):.2f}s"
     )
 
@@ -770,18 +772,18 @@ def _select_joint_layer_config(
         method_best = best_config_by_method.get(candidate_method)
         if method_best is None or (
             float(candidate_config["mean_calibration_score"]),
-            float(candidate_config.get("mean_calibration_exact_acc", 0.0)),
+            float(candidate_config.get("mean_calibration_iia_acc", 0.0)),
         ) > (
             float(method_best["mean_calibration_score"]),
-            float(method_best.get("mean_calibration_exact_acc", 0.0)),
+            float(method_best.get("mean_calibration_iia_acc", 0.0)),
         ):
             best_config_by_method[candidate_method] = dict(candidate_config)
         if best_config is None or (
             float(candidate_config["mean_calibration_score"]),
-            float(candidate_config.get("mean_calibration_exact_acc", 0.0)),
+            float(candidate_config.get("mean_calibration_iia_acc", 0.0)),
         ) > (
             float(best_config["mean_calibration_score"]),
-            float(best_config.get("mean_calibration_exact_acc", 0.0)),
+            float(best_config.get("mean_calibration_iia_acc", 0.0)),
         ):
             best_config = candidate_config
     if best_config is None:
@@ -836,19 +838,19 @@ def _evaluate_selected_stage_a_holdout(
             batch_size=int(batch_size),
             strength=float(record.get("intervention_strength", DEFAULT_STAGE_A_INTERVENTION_STRENGTH)),
             calibration_score=float(record.get("selection_score", 0.0)),
-            calibration_exact_acc=float(record.get("selection_exact_acc", record.get("calibration_exact_acc", 0.0))),
+            calibration_iia_acc=float(record.get("selection_iia_acc", record.get("calibration_iia_acc", 0.0))),
         )
         holdout_result = holdout_eval_payload.get("results", [{}])[0]
         updated_record = dict(record)
-        updated_record["exact_acc"] = float(holdout_result.get("exact_acc", 0.0))
+        updated_record["iia_acc"] = float(holdout_result.get("iia_acc", 0.0))
         updated_record["holdout_runtime_seconds"] = float(holdout_eval_payload.get("runtime_seconds", 0.0))
         updated_record["payload"] = holdout_eval_payload
         updated_record["ranking"] = holdout_eval_payload.get("ranking", [])
         updated_records[str(target_var)] = updated_record
-        holdout_exact_scores.append(float(updated_record["exact_acc"]))
+        holdout_exact_scores.append(float(updated_record["iia_acc"]))
         total_holdout_runtime_seconds += float(updated_record["holdout_runtime_seconds"])
     updated["per_var_records"] = updated_records
-    updated["mean_exact_acc"] = (
+    updated["mean_iia_acc"] = (
         float(sum(holdout_exact_scores) / len(holdout_exact_scores))
         if holdout_exact_scores else 0.0
     )
@@ -871,8 +873,8 @@ def _rank_layers_from_target_row(
             "layer": int(selected_layer),
             "selection_score": float(selected.get("selection_score", 0.0)),
             "target_row_transport_mass": float(selected_transport_mass),
-            "exact_acc": float(selected.get("exact_acc", 0.0)),
-            "selection_exact_acc": float(selected.get("selection_exact_acc", 0.0)),
+            "iia_acc": float(selected.get("iia_acc", 0.0)),
+            "selection_iia_acc": float(selected.get("selection_iia_acc", 0.0)),
             "method_selection_score": float(selected.get("selection_score", 0.0)),
             "method": selected.get("method"),
             "epsilon": float(selected.get("epsilon", 0.0)),
@@ -894,8 +896,8 @@ def _rank_layers_from_target_row(
                     "layer": int(layer),
                     "selection_score": float(entry.get("transport_mass", 0.0)),
                     "target_row_transport_mass": float(entry.get("transport_mass", 0.0)),
-                    "exact_acc": float(selected.get("exact_acc", 0.0)),
-                    "selection_exact_acc": float(selected.get("selection_exact_acc", 0.0)),
+                    "iia_acc": float(selected.get("iia_acc", 0.0)),
+                    "selection_iia_acc": float(selected.get("selection_iia_acc", 0.0)),
                     "method_selection_score": float(selected.get("selection_score", 0.0)),
                     "method": selected.get("method"),
                     "epsilon": float(selected.get("epsilon", 0.0)),
@@ -937,7 +939,7 @@ def _format_summary(
             if isinstance(record, dict)
         }
         exact_scores = {
-            str(target_var): float(record.get("exact_acc", 0.0))
+            str(target_var): float(record.get("iia_acc", 0.0))
             for target_var, record in per_var_records.items()
             if isinstance(record, dict)
         }
@@ -961,7 +963,7 @@ def _format_summary(
                 f"calibration_by_var={calibration_scores}",
                 f"test_by_var={exact_scores}",
                 f"avg_cal={float(selected_config.get('mean_calibration_score', 0.0)):.4f}",
-                f"avg_test={float(selected_config.get('mean_exact_acc', 0.0)):.4f}",
+                f"avg_test={float(selected_config.get('mean_iia_acc', 0.0)):.4f}",
                 f"runtime_with_signatures={float(selected_config.get('runtime_with_signatures_seconds', 0.0)):.2f}s",
                 "",
             ]
@@ -981,7 +983,7 @@ def _format_summary(
                     if isinstance(record, dict)
                 }
                 method_tests = {
-                    str(target_var): float(record.get("exact_acc", 0.0))
+                    str(target_var): float(record.get("iia_acc", 0.0))
                     for target_var, record in method_records.items()
                     if isinstance(record, dict)
                 }
@@ -996,7 +998,7 @@ def _format_summary(
                         if _method_uses_epsilon(str(method)) and method_config.get("uot_beta_neural") is not None else ""
                     )
                     + f"layers={method_layers} test_by_var={method_tests} "
-                    + f"avg_test={float(method_config.get('mean_exact_acc', 0.0)):.4f}"
+                    + f"avg_test={float(method_config.get('mean_iia_acc', 0.0)):.4f}"
                 )
             lines.append("")
     for target_var in DEFAULT_TARGET_VARS:

@@ -39,7 +39,7 @@ export SIGNATURE_MODE="${SIGNATURE_MODE:-family_label_delta_norm}"
 export OT_EPSILONS="${OT_EPSILONS:-0.5,1,2,4}"
 export OT_TOP_K_VALUES="${OT_TOP_K_VALUES:-1,2,4}"
 export OT_LAMBDAS="${OT_LAMBDAS:-0.5,1,2,4}"
-export CALIBRATION_METRIC="${CALIBRATION_METRIC:-family_weighted_macro_exact_acc}"
+export CALIBRATION_METRIC="${CALIBRATION_METRIC:-family_weighted_macro_iia_acc}"
 export CALIBRATION_FAMILY_WEIGHTS="${CALIBRATION_FAMILY_WEIGHTS:-1,1,1}"
 export SPLIT_SEED="${SPLIT_SEED:-0}"
 
