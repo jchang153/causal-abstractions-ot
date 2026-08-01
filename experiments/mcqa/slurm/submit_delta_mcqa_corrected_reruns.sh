@@ -9,7 +9,7 @@ DELTA_PARTITION="${DELTA_PARTITION:-gpuA40x4}"
 
 export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN before submitting the corrected MCQA reruns.}"
 
-PLOT_ALL_STAGES="stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_layer,stage_c_plot_das_native_support,stage_c_plot_das_dimension,stage_c_plot_das_pca_support"
+PLOT_ALL_STAGES="stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_layer,stage_c_plot_das_dimension,stage_c_plot_das_pca_support"
 PLOT_ONLY_STAGES="stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support"
 
 echo "[submit-mcqa-corrected] timestamp=${TIMESTAMP}"

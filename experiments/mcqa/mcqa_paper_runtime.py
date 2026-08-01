@@ -370,6 +370,41 @@ def _matching_native_stage_b_entries(
     return matched
 
 
+def _matching_pca_stage_b_entries(
+    *,
+    pca_rankings: dict[str, object],
+    guided_entries_by_var: dict[str, dict[str, object] | None],
+) -> dict[str, dict[str, object] | None]:
+    """Recover Stage B PCA records, including epsilon, for guided DAS entries."""
+
+    matched: dict[str, dict[str, object] | None] = {}
+    for target_var, guided_entry in guided_entries_by_var.items():
+        matched[target_var] = None
+        if not guided_entry:
+            continue
+        selected_layer = int(guided_entry.get("layer", -1))
+        selected_basis = str(guided_entry.get("basis_source_mode"))
+        selected_menu = str(guided_entry.get("site_menu"))
+        selected_bands = int(guided_entry.get("num_bands", -1))
+        entries = pca_rankings.get(target_var)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if int(entry.get("layer", -1)) != selected_layer:
+                continue
+            if str(entry.get("basis_source_mode")) != selected_basis:
+                continue
+            if str(entry.get("site_menu")) != selected_menu:
+                continue
+            if int(entry.get("num_bands", -1)) != selected_bands:
+                continue
+            matched[target_var] = entry
+            break
+    return matched
+
+
 def _pca_selected_config_epsilon_runtime(
     *,
     rankings: dict[str, object],
@@ -857,18 +892,9 @@ def build_paper_runtime_summary(
             native_guided_downstream[var] = 0.0
     native_guided_serial = sum(_as_float(native_guided_downstream.get(var)) for var in TARGET_VARS)
     native_guided_parallel = float(max((_as_float(native_guided_downstream.get(var)) for var in TARGET_VARS), default=0.0))
-    records.append(
-        _method_record(
-            method="PLOT-DAS (native support)",
-            stage_a_seconds=stage_a_seconds,
-            downstream_by_var=native_guided_downstream,
-            entries_by_var=native_guided_entries,
-            serial_downstream_seconds=native_guided_serial,
-            parallel_downstream_seconds=native_guided_parallel,
-            shared_runtime_seconds_by_layer=native_guided_stage_b_by_layer,
-            notes="Stage A plus the full native-resolution sweep at the globally selected epsilon for the selected layer, then DAS over the selected native support.",
-        )
-    )
+    # The former support-restricted variant is intentionally not reported: the
+    # paper defines PLOT-native-DAS as a full-layer DAS fit using PLOT's support
+    # width only as a dimension hint.
 
     dimension_entries = {var: _first_entry(dimension_das_rankings, var) for var in TARGET_VARS}
     dimension_stage_b_entries = _matching_native_stage_b_entries(
@@ -907,7 +933,7 @@ def build_paper_runtime_summary(
     dimension_parallel = float(max((_as_float(dimension_downstream.get(var)) for var in TARGET_VARS), default=0.0))
     records.append(
         _method_record(
-            method="PLOT-DAS (dimension)",
+            method="PLOT-native-DAS",
             stage_a_seconds=stage_a_seconds,
             downstream_by_var=dimension_downstream,
             entries_by_var=dimension_entries,
@@ -919,13 +945,17 @@ def build_paper_runtime_summary(
     )
 
     pca_guided_entries = {var: _first_entry(pca_guided_rankings, var) for var in TARGET_VARS}
+    pca_guided_stage_b_entries = _matching_pca_stage_b_entries(
+        pca_rankings=pca_rankings,
+        guided_entries_by_var=pca_guided_entries,
+    )
     (
         pca_guided_stage_b_downstream,
         pca_guided_stage_b_parallel_by_var,
         pca_guided_stage_b_runtime_by_layer_by_var,
     ) = _pca_selected_config_epsilon_runtime(
         rankings=pca_rankings,
-        entries_by_var=pca_guided_entries,
+        entries_by_var=pca_guided_stage_b_entries,
         restrict_to_selected_layer=True,
         restrict_to_selected_config=False,
         restrict_to_selected_epsilon=True,
@@ -951,14 +981,14 @@ def build_paper_runtime_summary(
     pca_guided_parallel = max(_as_float(pca_guided_downstream.get(var)) for var in TARGET_VARS)
     records.append(
         _method_record(
-            method="PLOT-DAS (PCA support)",
+            method="PLOT-PCA-DAS",
             stage_a_seconds=stage_a_seconds,
             downstream_by_var=pca_guided_downstream,
             entries_by_var=pca_guided_entries,
             serial_downstream_seconds=pca_guided_serial,
             parallel_downstream_seconds=pca_guided_parallel,
             shared_runtime_seconds_by_layer=pca_guided_stage_b_by_layer,
-            notes="Stage A plus the full PCA-support config sweep at the globally selected epsilon for the selected layer, then DAS over the selected PCA supports.",
+            notes="Stage A plus the full PCA-support config sweep at the globally selected epsilon for the selected layer, then DAS over the full retained PCA basis using PLOT's selected band count and top-K only as a dimension hint.",
         )
     )
 

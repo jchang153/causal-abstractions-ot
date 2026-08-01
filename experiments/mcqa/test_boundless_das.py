@@ -17,6 +17,9 @@ def test_recommended_boundless_das_defaults_match_binary_baseline() -> None:
     config = BoundlessDASConfig()
     assert config.batch_size == 64
     assert config.epochs == 12
+    assert config.min_epochs == 5
+    assert config.plateau_patience == 1
+    assert config.plateau_rel_delta == 1e-3
     assert config.rotation_learning_rate == 1e-2
     assert config.boundary_learning_rate == 1e-4
     assert config.temperature_start == 1.0

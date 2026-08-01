@@ -51,6 +51,9 @@ srun --unbuffered python experiments/mcqa/mcqa_boundless_das.py \
   --token-position-id last_token \
   --target-vars answer_pointer,answer_token \
   --epochs 12 \
+  --min-epochs 5 \
+  --plateau-patience 1 \
+  --plateau-rel-delta 0.001 \
   --rotation-learning-rate 0.01 \
   --boundary-learning-rate 0.0001 \
   --boundary-init 0.5 \

@@ -55,7 +55,7 @@ DEFAULT_PCA_NUM_BANDS_VALUES = (8, 16)
 DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
 DEFAULT_GUIDED_SUPPORT_DIM_COUNT = 10
-DEFAULT_DIM_HINT_SCALE_FACTORS = (0.5, 0.75, 1.0, 1.25, 1.5)
+DEFAULT_DIM_HINT_SCALE_FACTORS = (0.5, 0.75, 1.0, 1.5, 2.0)
 DEFAULT_NATIVE_RESOLUTIONS = [128, 144, 192, 256, 288, 384, 576, 768]
 DEFAULT_DAS_SUBSPACE_DIMS = (
     32,
@@ -350,7 +350,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
     parser.add_argument(
         "--stages",
-        default="stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_layer,stage_c_plot_das_native_support,stage_c_plot_das_dimension,stage_c_plot_das_pca_support",
+        default="stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_layer,stage_c_plot_das_dimension,stage_c_plot_das_pca_support",
     )
     parser.add_argument("--stage-a-token-position-ids", default="last_token")
     parser.add_argument("--stage-a-layer-indices", default=None, help="Comma-separated layer indices. Default: all layers.")
@@ -440,7 +440,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
     parser.add_argument("--screen-restarts", type=int, default=1)
-    parser.add_argument("--guided-restarts", type=int, default=2)
+    parser.add_argument("--guided-restarts", type=int, default=1)
     parser.add_argument("--guided-support-dim-count", type=int, default=DEFAULT_GUIDED_SUPPORT_DIM_COUNT)
     parser.add_argument(
         "--guided-subspace-dims",
@@ -449,7 +449,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stage-c-dim-hint-scale-factors",
-        default="0.5,0.75,1,1.25,1.5",
+        default="0.5,0.75,1,1.5,2",
         help="Comma-separated multiplicative full-layer DAS dimension factors around the selected native support width.",
     )
     parser.add_argument("--full-das-output", type=Path, action="append", default=[], help=argparse.SUPPRESS)
@@ -1488,6 +1488,13 @@ def _das_payload_matches_target_vars(*, payload_path: Path, expected_target_vars
             return False
         return tuple(str(target_var) for target_var in guided_output_paths.keys()) == expected
     if kind == "mcqa_plot_das_layer":
+        das_config = payload.get("das_config", {})
+        if (
+            not isinstance(das_config, dict)
+            or das_config.get("das_plateau_patience") != 1
+            or das_config.get("das_restarts") != 1
+        ):
+            return False
         method_payloads = payload.get("method_payloads", {}).get("das", [])
         actual_target_vars: list[str] = []
         for method_payload in method_payloads:
@@ -1502,6 +1509,32 @@ def _das_payload_matches_target_vars(*, payload_path: Path, expected_target_vars
                 actual_target_vars.append(str(target_var))
         return tuple(dict.fromkeys(actual_target_vars)) == expected
     return False
+
+
+def _pca_dimension_das_outputs_match(
+    *,
+    summary_path: Path,
+    guided_path: Path,
+    expected_target_vars: tuple[str, ...],
+) -> bool:
+    if not _das_payload_matches_target_vars(
+        payload_path=summary_path,
+        expected_target_vars=expected_target_vars,
+    ) or not _stage_output_is_valid(guided_path):
+        return False
+    summary = _load_json(summary_path)
+    guided = _load_json(guided_path)
+    if not isinstance(summary, dict) or summary.get("das_search_space") != "full_pca_basis":
+        return False
+    if not isinstance(guided, dict):
+        return False
+    dimension_hint = guided.get("dimension_hint", {})
+    return (
+        isinstance(dimension_hint, dict)
+        and dimension_hint.get("source") == "plot_pca"
+        and dimension_hint.get("restarts") == 1
+        and dimension_hint.get("plateau_patience") == 1
+    )
 
 
 def _expected_stage_b_native_payload_paths(
@@ -2020,7 +2053,7 @@ def _select_stage_c_native_support_entries(
 def _dim_hint_subspace_dims(
     effective_dim: int,
     *,
-    min_dim: int = 32,
+    min_dim: int = 1,
     max_dim: int = 2304,
     scale_factors: Iterable[float] = DEFAULT_DIM_HINT_SCALE_FACTORS,
 ) -> tuple[int, ...]:
@@ -2667,14 +2700,15 @@ def main() -> None:
             target_var = str(entry.get("variable"))
             if target_var not in DEFAULT_TARGET_VARS:
                 continue
-            effective_dim = int(entry.get("selected_site_total_dim") or 0)
+            native_resolution = int(entry.get("native_resolution", entry.get("atomic_width", -1)))
+            selected_top_k = int(entry.get("selected_top_k") or 0)
+            effective_dim = native_resolution * selected_top_k
             if effective_dim <= 0:
                 continue
             native_support_path = entry.get("payload_path")
             if native_support_path is None or not _stage_output_is_valid(Path(str(native_support_path))):
                 continue
             layer = int(entry["layer"])
-            native_resolution = int(entry.get("native_resolution", entry.get("atomic_width", -1)))
             das_subspace_dims = _dim_hint_subspace_dims(
                 effective_dim,
                 scale_factors=normalized["dim_hint_scale_factors"],
@@ -2935,7 +2969,11 @@ def main() -> None:
                 )
             )
             expected_outputs = [str(summary_payload_path), str(guided_payload_path)]
-            if all(_stage_output_is_valid(Path(path)) for path in expected_outputs):
+            if _pca_dimension_das_outputs_match(
+                summary_path=summary_payload_path,
+                guided_path=guided_payload_path,
+                expected_target_vars=(target_var,),
+            ):
                 stage_c_payload_paths.append(summary_payload_path)
                 _mark_stage(
                     manifest_path=manifest_path,
@@ -2985,9 +3023,12 @@ def main() -> None:
                 },
             )
             stage_runtime_seconds = _run_stage_command(stage=stage, repo_root=repo_root)
-            missing_outputs = [path for path in expected_outputs if not _stage_output_is_valid(Path(path))]
-            if missing_outputs:
-                raise RuntimeError(f"Stage {stage_name} missing outputs: {missing_outputs}")
+            if not _pca_dimension_das_outputs_match(
+                summary_path=summary_payload_path,
+                guided_path=guided_payload_path,
+                expected_target_vars=(target_var,),
+            ):
+                raise RuntimeError(f"Stage {stage_name} produced invalid PCA dimension-hint DAS outputs")
             stage_c_payload_paths.append(summary_payload_path)
             _mark_stage(
                 manifest_path=manifest_path,

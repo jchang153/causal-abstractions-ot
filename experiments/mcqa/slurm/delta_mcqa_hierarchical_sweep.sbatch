@@ -31,7 +31,7 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export RESULTS_ROOT="${RESULTS_ROOT:-results/delta}"
 export RESULTS_TIMESTAMP="${RESULTS_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-export STAGES="${STAGES:-stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_layer,stage_c_plot_das_native_support,stage_c_plot_das_dimension,stage_c_plot_das_pca_support}"
+export STAGES="${STAGES:-stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_layer,stage_c_plot_das_dimension,stage_c_plot_das_pca_support}"
 export DATASET_SIZE="${DATASET_SIZE:-2000}"
 export SPLIT_SEED="${SPLIT_SEED:-0}"
 export TRAIN_POOL_SIZE="${TRAIN_POOL_SIZE:-200}"
@@ -60,7 +60,7 @@ export GUIDED_MASK_NAMES="${GUIDED_MASK_NAMES:-Selected}"
 export GUIDED_MAX_EPOCHS="${GUIDED_MAX_EPOCHS:-100}"
 export GUIDED_MIN_EPOCHS="${GUIDED_MIN_EPOCHS:-5}"
 export SCREEN_RESTARTS="${SCREEN_RESTARTS:-1}"
-export GUIDED_RESTARTS="${GUIDED_RESTARTS:-2}"
+export GUIDED_RESTARTS="${GUIDED_RESTARTS:-1}"
 export GUIDED_SUBSPACE_DIMS="${GUIDED_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
 export REGULAR_DAS_SUBSPACE_DIMS="${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
 

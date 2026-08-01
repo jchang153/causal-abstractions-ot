@@ -18,8 +18,8 @@ Method families:
 - `PLOT-native`: Stage A plus native-coordinate Stage B handles.
 - `PLOT-PCA`: Stage A plus PCA-basis Stage B handles.
 - `PLOT-DAS`: DAS restricted to the Stage A layer.
-- `PLOT-native-DAS`: DAS guided by the native Stage B support.
-- `PLOT-PCA-DAS`: DAS guided by the PCA Stage B support.
+- `PLOT-native-DAS`: full-layer DAS with its dimension grid centered on the native Stage B effective dimension.
+- `PLOT-PCA-DAS`: DAS over the full retained PCA basis with its dimension grid centered on the PCA Stage B effective dimension.
 - `Full DAS`: DAS over all layers and the full subspace grid.
 - `bDAS`: Boundless DAS over all layers with a learned rotated-prefix boundary.
 - `DBM`: MIB-style desiderata-based masking in the canonical, PCA, or Gemma Scope SAE basis.
@@ -52,7 +52,8 @@ retrospective winning resolution, nor the sweep over unselected epsilons.
   PLOT-bDAS on the per-variable UOT-selected layers.
 
 MCQA bDAS uses the recommended binary-addition settings: batch size 64,
-no gradient accumulation, 12 epochs, one restart, rotation learning rate
+no gradient accumulation, 12 maximum epochs, 5 minimum epochs, training-loss
+plateau patience 1, one restart, rotation learning rate
 `1e-2`, boundary learning rate `1e-4`, boundary penalty `1.0`, and temperature
 annealing from `1.0` to `0.1`.  It calibrates every last-token layer, selects
 one layer independently for each abstract variable, and evaluates only those

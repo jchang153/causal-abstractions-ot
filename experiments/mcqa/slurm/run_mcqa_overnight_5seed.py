@@ -15,7 +15,6 @@ DEFAULT_STAGES = (
     "stage_b_plot_native_support",
     "stage_b_plot_pca_support",
     "stage_c_plot_das_layer",
-    "stage_c_plot_das_native_support",
     "stage_c_plot_das_dimension",
     "stage_c_plot_das_pca_support",
 )
@@ -100,14 +99,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guided-mask-names", default="Selected")
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
-    parser.add_argument("--guided-restarts", type=int, default=2)
+    parser.add_argument("--guided-restarts", type=int, default=1)
     parser.add_argument(
         "--regular-das-subspace-dims",
         default="32,64,96,128,256,512,768,1024,1536,2048,2304",
     )
     parser.add_argument("--full-das-max-epochs", type=int, default=100)
     parser.add_argument("--full-das-min-epochs", type=int, default=5)
-    parser.add_argument("--full-das-restarts", type=int, default=2)
+    parser.add_argument("--full-das-restarts", type=int, default=1)
     parser.add_argument("--prompt-hf-login", action="store_true")
     return parser
 

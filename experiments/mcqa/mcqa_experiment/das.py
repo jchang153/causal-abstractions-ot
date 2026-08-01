@@ -27,7 +27,7 @@ class DASConfig:
     batch_size: int = 16
     max_epochs: int = 5
     min_epochs: int = 1
-    plateau_patience: int = 2
+    plateau_patience: int = 1
     plateau_rel_delta: float = 5e-3
     learning_rate: float = 1e-3
     subspace_dims: tuple[int, ...] | None = None

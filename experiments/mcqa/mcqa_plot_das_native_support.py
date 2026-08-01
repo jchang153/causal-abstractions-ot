@@ -60,7 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
-    parser.add_argument("--guided-restarts", type=int, default=2)
+    parser.add_argument("--guided-restarts", type=int, default=1)
     parser.add_argument("--results-root", default="results/delta")
     parser.add_argument("--results-timestamp")
     parser.add_argument("--signatures-dir", default="signatures")

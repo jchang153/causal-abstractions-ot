@@ -62,7 +62,7 @@ COMMON_ARGS=(
   --guided-max-epochs "${GUIDED_MAX_EPOCHS:-100}"
   --guided-min-epochs "${GUIDED_MIN_EPOCHS:-5}"
   --screen-restarts "${SCREEN_RESTARTS:-1}"
-  --guided-restarts "${GUIDED_RESTARTS:-2}"
+  --guided-restarts "${GUIDED_RESTARTS:-1}"
   --regular-das-subspace-dims "${REGULAR_DAS_SUBSPACE_DIMS:-32,64,96,128,256,512,768,1024,1536,2048,2304}"
 )
 

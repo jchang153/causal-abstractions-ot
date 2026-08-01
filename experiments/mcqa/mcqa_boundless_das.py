@@ -61,12 +61,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-position-id", default="last_token")
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
     parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--min-epochs", type=int, default=5)
+    parser.add_argument("--plateau-patience", type=int, default=1)
+    parser.add_argument("--plateau-rel-delta", type=float, default=1e-3)
     parser.add_argument("--rotation-learning-rate", type=float, default=1e-2)
     parser.add_argument("--boundary-learning-rate", type=float, default=1e-4)
     parser.add_argument("--boundary-init", type=float, default=0.5)
     parser.add_argument("--boundary-penalty", type=float, default=1.0)
+    parser.add_argument("--boundary-penalty-power", type=float, default=1.0)
     parser.add_argument("--temperature-start", type=float, default=1.0)
     parser.add_argument("--temperature-end", type=float, default=0.1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--warmup-fraction", type=float, default=0.1)
+    parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--restarts", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--method-name", default="boundless_das")
@@ -120,6 +127,30 @@ def main() -> None:
         if existing_result and not payload_uses_unified_iia(existing_result):
             print(f"[rebuild] {output_path} predates normalized full-vocabulary IIA")
             existing_result = {}
+        existing_config = existing_result.get("config", {}) if isinstance(existing_result, dict) else {}
+        algorithm_config_matches = all(
+            existing_config.get(name) == expected
+            for name, expected in (
+                ("epochs", int(args.epochs)),
+                ("min_epochs", int(args.min_epochs)),
+                ("plateau_patience", int(args.plateau_patience)),
+                ("plateau_rel_delta", float(args.plateau_rel_delta)),
+                ("rotation_learning_rate", float(args.rotation_learning_rate)),
+                ("boundary_learning_rate", float(args.boundary_learning_rate)),
+                ("boundary_init", float(args.boundary_init)),
+                ("boundary_penalty", float(args.boundary_penalty)),
+                ("boundary_penalty_power", float(args.boundary_penalty_power)),
+                ("temperature_start", float(args.temperature_start)),
+                ("temperature_end", float(args.temperature_end)),
+                ("gradient_accumulation_steps", int(args.gradient_accumulation_steps)),
+                ("warmup_fraction", float(args.warmup_fraction)),
+                ("shuffle", bool(args.shuffle)),
+                ("restarts", max(1, int(args.restarts))),
+            )
+        )
+        if existing_result and not algorithm_config_matches:
+            print(f"[rebuild] {output_path} uses different or legacy bDAS settings")
+            existing_result = {}
     _configure(args, run_dir, timestamp)
     context = base_run.build_run_context()
     model = context["model"]
@@ -170,14 +201,21 @@ def main() -> None:
                 method_name=str(args.method_name),
                 batch_size=int(args.batch_size),
                 epochs=int(args.epochs),
+                min_epochs=int(args.min_epochs),
+                plateau_patience=int(args.plateau_patience),
+                plateau_rel_delta=float(args.plateau_rel_delta),
                 rotation_learning_rate=float(args.rotation_learning_rate),
                 boundary_learning_rate=float(args.boundary_learning_rate),
                 boundary_init=float(args.boundary_init),
                 boundary_penalty=float(args.boundary_penalty),
+                boundary_penalty_power=float(args.boundary_penalty_power),
                 temperature_start=float(args.temperature_start),
                 temperature_end=float(args.temperature_end),
+                gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+                warmup_fraction=float(args.warmup_fraction),
                 restarts=max(1, int(args.restarts)),
                 seed=int(args.seed) + 104729 * offset,
+                shuffle=bool(args.shuffle),
             ),
         )
         write_json(output_path, {

@@ -115,7 +115,7 @@ python experiments/mcqa/mcqa_delta_hierarchical_sweep.py \
   --results-root "${RESULTS_ROOT}" \
   --results-timestamp "${HIER_TIMESTAMP}" \
   --signatures-dir signatures \
-  --stages stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_native_support,stage_c_plot_das_pca_support \
+  --stages stage_a_plot_layer,stage_b_plot_native_support,stage_b_plot_pca_support,stage_c_plot_das_dimension,stage_c_plot_das_pca_support \
   --stage-a-token-position-ids last_token \
   --stage-a-transport-methods uot \
   --stage-a-uot-beta-neurals 0.1,0.3,1,3 \
@@ -139,7 +139,7 @@ python experiments/mcqa/mcqa_delta_hierarchical_sweep.py \
   --guided-max-epochs 100 \
   --guided-min-epochs 5 \
   --screen-restarts 1 \
-  --guided-restarts 2
+  --guided-restarts 1
 
 if [[ ! -f "${STAGE_A_RANKINGS}" || ! -f "${PAPER_RUNTIME}" ]]; then
   echo "Missing Stage A rankings or runtime summary under ${HIER_ROOT}" >&2
@@ -153,7 +153,9 @@ echo "[one-seed] cached Stage A layers: answer_pointer=${AP_LAYER} answer_token=
 
 # Full DAS is independent of PLOT and searches every layer/dimension pair.
 if [[ ! -f "${FULL_DAS_OUTPUT}" ]] || ! jq -e \
-  '.. | objects | select(.metric_name? == "normalized_full_vocab_top1_v1")' \
+  '(.runs // []) | length > 0 and all(.[];
+    .metric_name == "normalized_full_vocab_top1_v1" and
+    .config.das_plateau_patience == 1 and .config.das_restarts == 1)' \
   "${FULL_DAS_OUTPUT}" >/dev/null; then
   python experiments/mcqa/mcqa_run_cloud.py \
     --preset full \
@@ -175,10 +177,10 @@ if [[ ! -f "${FULL_DAS_OUTPUT}" ]] || ! jq -e \
     --calibration-family-weights 1,1,1 \
     --das-max-epochs 100 \
     --das-min-epochs 5 \
-    --das-plateau-patience 2 \
+    --das-plateau-patience 1 \
     --das-plateau-rel-delta 0.001 \
     --das-learning-rate 0.001 \
-    --das-restarts 2 \
+    --das-restarts 1 \
     --das-subspace-dims 32,64,96,128,256,512,768,1024,1536,2048,2304 \
     --results-root "${RESULTS_ROOT}" \
     --results-timestamp "${FULL_DAS_TIMESTAMP}" \
@@ -203,6 +205,9 @@ python experiments/mcqa/mcqa_boundless_das.py \
   --token-position-id last_token \
   --target-vars answer_pointer,answer_token \
   --epochs 12 \
+  --min-epochs 5 \
+  --plateau-patience 1 \
+  --plateau-rel-delta 0.001 \
   --rotation-learning-rate 0.01 \
   --boundary-learning-rate 0.0001 \
   --boundary-init 0.5 \
@@ -231,6 +236,9 @@ python experiments/mcqa/mcqa_boundless_das.py \
   --token-position-id last_token \
   --target-vars answer_pointer,answer_token \
   --epochs 12 \
+  --min-epochs 5 \
+  --plateau-patience 1 \
+  --plateau-rel-delta 0.001 \
   --rotation-learning-rate 0.01 \
   --boundary-learning-rate 0.0001 \
   --boundary-init 0.5 \

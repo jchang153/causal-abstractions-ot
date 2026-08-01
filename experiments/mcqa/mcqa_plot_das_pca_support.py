@@ -15,6 +15,7 @@ from mcqa_experiment.runtime import write_json
 from mcqa_ot_pca_focus import (
     _enumerate_pca_sites,
     _guided_subspace_dims,
+    _pca_effective_dims,
     _run_pca_das_from_support,
     _site_catalog_tag,
 )
@@ -47,7 +48,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--guided-subspace-dims", default=None)
     parser.add_argument("--guided-max-epochs", type=int, default=100)
     parser.add_argument("--guided-min-epochs", type=int, default=5)
-    parser.add_argument("--guided-restarts", type=int, default=2)
+    parser.add_argument("--guided-restarts", type=int, default=1)
     parser.add_argument("--results-root", type=Path, default=Path("results/delta"))
     parser.add_argument("--results-timestamp", default=None)
     parser.add_argument("--signatures-dir", type=Path, default=Path("signatures"))
@@ -100,6 +101,11 @@ def main() -> None:
         band_scheme=band_scheme,
     )
     pca_bases_by_id = {str(basis.basis_id): basis}
+    effective_dim_by_var = _pca_effective_dims(
+        support_by_var,
+        rank=int(basis.rank),
+        num_bands=int(num_bands),
+    )
 
     timestamp = args.results_timestamp or os.environ.get("RESULTS_TIMESTAMP") or "mcqa_plot_das_pca_support"
     run_root = args.results_root / f"{timestamp}_mcqa_plot_das_pca_support"
@@ -172,6 +178,8 @@ def main() -> None:
         explicit_subspace_dims=explicit_dims,
         subspace_dim_resolver=_guided_subspace_dims,
         restarts=max(1, int(args.guided_restarts)),
+        full_pca_basis=True,
+        effective_dim_by_var=effective_dim_by_var,
     )
     guided_output_paths = {
         target_var: str(
@@ -194,6 +202,9 @@ def main() -> None:
         "target_vars": list(target_vars),
         "pca_support_path": str(args.pca_support_path),
         "basis_path": str(basis_path),
+        "pca_rank": int(basis.rank),
+        "effective_dim_by_var": effective_dim_by_var,
+        "das_search_space": "full_pca_basis",
         "localization_recomputed": False,
         "guided_output_paths": guided_output_paths,
         "runtime_seconds": float(perf_counter() - stage_start),

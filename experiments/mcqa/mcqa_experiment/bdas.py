@@ -26,6 +26,9 @@ class BoundlessDASConfig:
     method_name: str = "boundless_das"
     batch_size: int = 64
     epochs: int = 12
+    min_epochs: int = 5
+    plateau_patience: int = 1
+    plateau_rel_delta: float = 1e-3
     rotation_learning_rate: float = 1e-2
     boundary_learning_rate: float = 1e-4
     boundary_init: float = 0.5
@@ -43,6 +46,10 @@ class BoundlessDASConfig:
     def __post_init__(self) -> None:
         if self.batch_size <= 0 or self.epochs <= 0:
             raise ValueError("batch_size and epochs must be positive")
+        if self.min_epochs <= 0 or self.min_epochs > self.epochs:
+            raise ValueError("min_epochs must be positive and no greater than epochs")
+        if self.plateau_patience <= 0 or self.plateau_rel_delta < 0:
+            raise ValueError("plateau patience must be positive and relative delta nonnegative")
         if self.rotation_learning_rate <= 0 or self.boundary_learning_rate <= 0:
             raise ValueError("learning rates must be positive")
         if not 0 < self.boundary_init <= 1:
@@ -203,6 +210,9 @@ def _train_candidate(
     microstep = 0
     optimizer_step = 0
     optimizer.zero_grad(set_to_none=True)
+    previous_loss: float | None = None
+    plateau_steps = 0
+    stopped_early = False
     for epoch in range(int(config.epochs)):
         loader = DataLoader(
             MCQAPairDataset(train_bank),
@@ -243,18 +253,36 @@ def _train_candidate(
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_step += 1
             microstep += 1
+        epoch_loss = float(loss_sum / max(1, example_count))
         history.append(
             {
                 "epoch": float(epoch + 1),
-                "prediction_loss": float(loss_sum / max(1, example_count)),
+                "prediction_loss": epoch_loss,
                 "boundary_fraction": float(intervention.clamped_boundary().detach().cpu().item()),
                 "hard_dimension": float(intervention.hard_dimension()),
                 "temperature": float(intervention.temperature.detach().cpu().item()),
             }
         )
+        if config.verbose:
+            print(
+                f"[BDAS] epoch {epoch + 1}/{int(config.epochs)} "
+                f"variable={train_bank.target_var} site={site.label} "
+                f"loss={epoch_loss:.6f} dim={intervention.hard_dimension()}"
+            )
+        if previous_loss is None or epoch_loss < previous_loss * (1.0 - float(config.plateau_rel_delta)):
+            plateau_steps = 0
+        else:
+            plateau_steps += 1
+        previous_loss = epoch_loss
+        if epoch + 1 >= int(config.min_epochs) and plateau_steps >= int(config.plateau_patience):
+            stopped_early = True
+            break
     return intervention, {
         "candidate_seed": int(candidate_seed),
         "optimizer_steps": int(optimizer_step),
+        "epochs_ran": len(history),
+        "stopped_early": bool(stopped_early),
+        "stopping_rule": "training_prediction_loss_plateau",
         "history": history,
     }
 

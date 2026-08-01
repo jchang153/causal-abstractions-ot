@@ -721,14 +721,15 @@ def plan_stage_c_tasks(args: argparse.Namespace) -> None:
             target_var = str(entry.get("variable"))
             if target_var not in DEFAULT_TARGET_VARS:
                 continue
-            effective_dim = int(entry.get("selected_site_total_dim") or 0)
+            native_resolution = int(entry.get("native_resolution", entry.get("atomic_width", -1)))
+            selected_top_k = int(entry.get("selected_top_k") or 0)
+            effective_dim = native_resolution * selected_top_k
             if effective_dim <= 0:
                 continue
             native_support_path = entry.get("payload_path")
             if native_support_path is None or not _stage_output_is_valid(Path(str(native_support_path))):
                 continue
             layer = int(entry["layer"])
-            native_resolution = int(entry.get("native_resolution", entry.get("atomic_width", -1)))
             das_subspace_dims = _dim_hint_subspace_dims(
                 effective_dim,
                 scale_factors=normalized["dim_hint_scale_factors"],
@@ -990,7 +991,33 @@ def run_task(task_file: Path, task_index: int) -> None:
         raise ValueError(f"Task {task.get('task_id')} has empty command")
 
     expected_outputs = [Path(str(path)) for path in task.get("expected_outputs", [])]
-    if expected_outputs and all(_stage_output_is_valid(path) for path in expected_outputs):
+    outputs_are_current = bool(expected_outputs) and all(
+        _stage_output_is_valid(path) for path in expected_outputs
+    )
+    if outputs_are_current and str(task.get("category")) == "stage_c_pca_support_das":
+        guided_paths = [path for path in expected_outputs if path.name.endswith("_das_guided.json")]
+        guided_payloads = [_load_json(path) for path in guided_paths]
+        outputs_are_current = bool(guided_payloads) and all(
+            isinstance(payload, dict)
+            and isinstance(payload.get("dimension_hint"), dict)
+            and payload["dimension_hint"].get("source") == "plot_pca"
+            and payload["dimension_hint"].get("restarts") == 1
+            and payload["dimension_hint"].get("plateau_patience") == 1
+            for payload in guided_payloads
+        )
+    if outputs_are_current and str(task.get("category")) in {
+        "stage_c_plot_das_layer",
+        "stage_c_plot_das_dimension",
+    }:
+        output_payloads = [_load_json(path) for path in expected_outputs]
+        outputs_are_current = all(
+            isinstance(payload, dict)
+            and isinstance(payload.get("das_config"), dict)
+            and payload["das_config"].get("das_restarts") == 1
+            and payload["das_config"].get("das_plateau_patience") == 1
+            for payload in output_payloads
+        )
+    if outputs_are_current:
         _mark_task(sweep_root=sweep_root, task=task, state="skipped_existing", extra={"completed_at": datetime.now().isoformat()})
         print(f"[parallel-task] skipped_existing task_id={task.get('task_id')}")
         return
@@ -1018,6 +1045,28 @@ def run_task(task_file: Path, task_index: int) -> None:
             extra={"failed_at": datetime.now().isoformat(), "missing_outputs": missing_outputs},
         )
         raise RuntimeError(f"Task {task.get('task_id')} missing outputs: {missing_outputs}")
+    if str(task.get("category")) == "stage_c_pca_support_das":
+        guided_paths = [path for path in expected_outputs if path.name.endswith("_das_guided.json")]
+        guided_payloads = [_load_json(path) for path in guided_paths]
+        if not guided_payloads or not all(
+            isinstance(payload, dict)
+            and isinstance(payload.get("dimension_hint"), dict)
+            and payload["dimension_hint"].get("source") == "plot_pca"
+            and payload["dimension_hint"].get("restarts") == 1
+            and payload["dimension_hint"].get("plateau_patience") == 1
+            for payload in guided_payloads
+        ):
+            raise RuntimeError(f"Task {task.get('task_id')} produced legacy PCA support-restricted DAS")
+    if str(task.get("category")) in {"stage_c_plot_das_layer", "stage_c_plot_das_dimension"}:
+        output_payloads = [_load_json(path) for path in expected_outputs]
+        if not all(
+            isinstance(payload, dict)
+            and isinstance(payload.get("das_config"), dict)
+            and payload["das_config"].get("das_restarts") == 1
+            and payload["das_config"].get("das_plateau_patience") == 1
+            for payload in output_payloads
+        ):
+            raise RuntimeError(f"Task {task.get('task_id')} produced legacy DAS settings")
     _mark_task(
         sweep_root=sweep_root,
         task=task,

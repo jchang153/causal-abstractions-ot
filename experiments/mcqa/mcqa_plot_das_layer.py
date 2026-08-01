@@ -68,7 +68,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--das-plateau-patience", type=int, default=1)
     parser.add_argument("--das-plateau-rel-delta", type=float, default=1e-3)
     parser.add_argument("--das-learning-rate", type=float, default=1e-3)
-    parser.add_argument("--das-restarts", type=int, default=2)
+    parser.add_argument("--das-restarts", type=int, default=1)
     parser.add_argument("--results-root", default="results/delta")
     parser.add_argument("--results-timestamp")
     parser.add_argument("--signatures-dir", default="signatures")
@@ -132,6 +132,20 @@ def main() -> None:
     compare_output_path = layer_dir / f"mcqa_plot_das_layer_layer-{int(args.layer)}_pos-{str(args.token_position_id)}.json"
     compare_summary_path = layer_dir / f"mcqa_plot_das_layer_layer-{int(args.layer)}_pos-{str(args.token_position_id)}.txt"
     compare_payload = _load_existing_payload(compare_output_path)
+    expected_das_config = {
+        "das_max_epochs": int(args.das_max_epochs),
+        "das_min_epochs": int(args.das_min_epochs),
+        "das_plateau_patience": int(args.das_plateau_patience),
+        "das_restarts": max(1, int(args.das_restarts)),
+        "das_subspace_dims": [int(dim) for dim in das_subspace_dims],
+    }
+    if compare_payload is not None:
+        recorded_config = compare_payload.get("config", {})
+        if not isinstance(recorded_config, dict) or any(
+            recorded_config.get(key) != value for key, value in expected_das_config.items()
+        ):
+            print(f"[rebuild] {compare_output_path} uses legacy or mismatched DAS settings")
+            compare_payload = None
     if compare_payload is None:
         compare_payload = run_comparison(
             model=model,
@@ -167,6 +181,7 @@ def main() -> None:
         "target_vars": [str(target_var) for target_var in target_vars],
         "signature_mode": str(args.signature_mode),
         "das_subspace_dims": [int(dim) for dim in das_subspace_dims],
+        "das_config": expected_das_config,
         "compare_output_path": str(compare_output_path),
         "method_payloads": compare_payload.get("method_payloads", {}),
         "results": compare_payload.get("results", []),

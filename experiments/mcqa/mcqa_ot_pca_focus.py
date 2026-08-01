@@ -236,7 +236,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--guided-max-epochs", type=int, default=DEFAULT_GUIDED_DAS_MAX_EPOCHS)
     parser.add_argument("--guided-min-epochs", type=int, default=DEFAULT_GUIDED_DAS_MIN_EPOCHS)
-    parser.add_argument("--guided-restarts", type=int, default=2)
+    parser.add_argument("--guided-restarts", type=int, default=1)
     parser.add_argument("--results-root", default="results/anvil")
     parser.add_argument("--results-timestamp")
     parser.add_argument("--signatures-dir", default="signatures")
@@ -684,6 +684,36 @@ def _guided_subspace_dims(max_width: int) -> tuple[int, ...]:
     return dims or (resolved_width,)
 
 
+def _dimension_hint_subspace_dims(effective_dim: int, *, max_width: int) -> tuple[int, ...]:
+    """Paper PLOT-DAS grid centered on an effective localized dimension."""
+
+    return tuple(
+        sorted(
+            {
+                max(1, min(int(max_width), int(round(int(effective_dim) * factor))))
+                for factor in (0.5, 0.75, 1.0, 1.5, 2.0)
+            }
+        )
+    )
+
+
+def _pca_effective_dims(
+    support_by_var: dict[str, dict[str, object]],
+    *,
+    rank: int,
+    num_bands: int,
+) -> dict[str, int]:
+    effective_dims: dict[str, int] = {}
+    for target_var, support_summary in support_by_var.items():
+        selected_trial = support_summary.get("selected_trial", {})
+        if not isinstance(selected_trial, dict) or selected_trial.get("top_k") is None:
+            raise ValueError(f"PLOT-PCA support lacks selected top_k for {target_var}")
+        effective_dims[str(target_var)] = (
+            int(rank) // max(1, int(num_bands))
+        ) * int(selected_trial["top_k"])
+    return effective_dims
+
+
 def _write_das_text_report(path: Path, *, title: str, payload: dict[str, object], extra_lines: list[str] | None = None) -> None:
     result = payload.get("results", [{}])[0]
     lines = [
@@ -729,6 +759,8 @@ def _run_pca_das_from_support(
     explicit_subspace_dims: tuple[int, ...] | None,
     subspace_dim_resolver,
     restarts: int,
+    full_pca_basis: bool = False,
+    effective_dim_by_var: dict[str, int] | None = None,
 ) -> dict[str, dict[str, object]]:
     payloads: dict[str, dict[str, object]] = {}
     if not enabled:
@@ -741,24 +773,38 @@ def _run_pca_das_from_support(
             support_summary=support_summary,
             mask_names=mask_names,
         )
-        span_sites = build_rotated_span_sites_from_support(
-            support_summary=filtered_summary,
-            sites=pca_sites,
-        )
+        if full_pca_basis:
+            if not pca_sites:
+                continue
+            first_site = pca_sites[0]
+            span_sites = [
+                RotatedBandSite(
+                    layer=int(layer),
+                    token_position_id=str(token_position_id),
+                    basis_id=str(first_site.basis_id),
+                    component_start=0,
+                    component_end=max(int(site.component_end) for site in pca_sites),
+                )
+            ]
+        else:
+            span_sites = build_rotated_span_sites_from_support(
+                support_summary=filtered_summary,
+                sites=pca_sites,
+            )
         if not span_sites:
             continue
-        if explicit_subspace_dims is None:
+        max_width = max(
+            int(site_total_width(site, model_hidden_size=int(model_hidden_size)))
+            for site in span_sites
+        )
+        if explicit_subspace_dims is None and effective_dim_by_var is not None:
+            effective_dim = int(effective_dim_by_var[str(target_var)])
+            subspace_dims = _dimension_hint_subspace_dims(effective_dim, max_width=max_width)
+        elif explicit_subspace_dims is None:
             subspace_dims = subspace_dim_resolver(
-                max(
-                    int(site_total_width(site, model_hidden_size=int(model_hidden_size)))
-                    for site in span_sites
-                )
+                max_width
             )
         else:
-            max_width = max(
-                int(site_total_width(site, model_hidden_size=int(model_hidden_size)))
-                for site in span_sites
-            )
             filtered_dims = tuple(
                 int(dim) for dim in explicit_subspace_dims if 0 < int(dim) <= int(max_width)
             )
@@ -772,6 +818,22 @@ def _run_pca_das_from_support(
             f"_basis-{str(basis_source_mode)}_sig-{str(signature_mode)}_{str(target_var)}_{method_suffix}.txt"
         )
         payload = _load_existing_payload(output_path)
+        if payload is not None and full_pca_basis:
+            dimension_hint = payload.get("dimension_hint", {})
+            expected_effective_dim = (
+                None if effective_dim_by_var is None else int(effective_dim_by_var[str(target_var)])
+            )
+            if (
+                not isinstance(dimension_hint, dict)
+                or dimension_hint.get("source") != "plot_pca"
+                or dimension_hint.get("effective_dim") != expected_effective_dim
+                or dimension_hint.get("subspace_dims") != [int(dim) for dim in subspace_dims]
+                or dimension_hint.get("das_search_width") != int(max_width)
+                or dimension_hint.get("restarts") != max(1, int(restarts))
+                or dimension_hint.get("plateau_patience") != int(plateau_patience)
+            ):
+                print(f"[rebuild] {output_path} uses legacy or mismatched PCA dimension-hint DAS")
+                payload = None
         if payload is None:
             payload = run_das_pipeline(
                 model=model,
@@ -798,6 +860,14 @@ def _run_pca_das_from_support(
             )
             payload["support_summary"] = filtered_summary
             payload["mask_names"] = list(str(mask_name) for mask_name in mask_names)
+            payload["dimension_hint"] = {
+                "source": "plot_pca" if full_pca_basis else "selected_pca_support",
+                "effective_dim": None if effective_dim_by_var is None else int(effective_dim_by_var[str(target_var)]),
+                "subspace_dims": [int(dim) for dim in subspace_dims],
+                "das_search_width": int(max_width),
+                "restarts": max(1, int(restarts)),
+                "plateau_patience": int(plateau_patience),
+            }
             write_json(output_path, payload)
             _write_das_text_report(
                 summary_path,
@@ -1179,6 +1249,11 @@ def _run_pca_band(
         write_json(support_path, support_by_var)
     support_extract_seconds = float(perf_counter() - support_start)
     best_ot_by_var = _best_ot_records(ot_compare_payloads, method=alignment_method)
+    effective_dim_by_var = _pca_effective_dims(
+        support_by_var,
+        rank=int(basis.rank),
+        num_bands=int(num_bands),
+    )
 
     das_screen_start = perf_counter()
     screen_payloads = _run_pca_das_from_support(
@@ -1245,6 +1320,8 @@ def _run_pca_band(
         explicit_subspace_dims=guided_subspace_dims,
         subspace_dim_resolver=_guided_subspace_dims,
         restarts=int(args.guided_restarts),
+        full_pca_basis=True,
+        effective_dim_by_var=effective_dim_by_var,
     )
     _synchronize_if_cuda(device)
     das_guided_seconds = float(perf_counter() - das_guided_start)

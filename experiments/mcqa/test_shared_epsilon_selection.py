@@ -5,7 +5,10 @@ from pathlib import Path
 import sys
 
 from experiments.mcqa.mcqa_experiment.selection import select_shared_epsilon
-from experiments.mcqa.mcqa_paper_runtime import _native_selected_width_epsilon_runtime
+from experiments.mcqa.mcqa_paper_runtime import (
+    _matching_pca_stage_b_entries,
+    _native_selected_width_epsilon_runtime,
+)
 
 MCQA_DIR = Path(__file__).resolve().parent
 if str(MCQA_DIR) not in sys.path:
@@ -225,3 +228,29 @@ def test_pca_rankings_use_one_macro_selected_epsilon(tmp_path: Path) -> None:
 
     assert rankings["answer_pointer"][0]["epsilon"] == 1.0
     assert rankings["answer_token"][0]["epsilon"] == 1.0
+
+
+def test_pca_guided_runtime_recovers_epsilon_from_stage_b_ranking() -> None:
+    stage_b_entry = {
+        "variable": "answer_pointer",
+        "layer": 18,
+        "basis_source_mode": "all_variants",
+        "site_menu": "partition",
+        "num_bands": 16,
+        "epsilon": 0.5,
+    }
+    guided_entry = {
+        "variable": "answer_pointer",
+        "layer": 18,
+        "basis_source_mode": "all_variants",
+        "site_menu": "partition",
+        "num_bands": 16,
+    }
+
+    matched = _matching_pca_stage_b_entries(
+        pca_rankings={"answer_pointer": [stage_b_entry]},
+        guided_entries_by_var={"answer_pointer": guided_entry},
+    )
+
+    assert matched["answer_pointer"] == stage_b_entry
+    assert matched["answer_pointer"]["epsilon"] == 0.5

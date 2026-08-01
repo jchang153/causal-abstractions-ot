@@ -40,7 +40,7 @@ class CompareExperimentConfig:
     bruteforce_temperature: float = 1.0
     das_max_epochs: int = 5
     das_min_epochs: int = 1
-    das_plateau_patience: int = 2
+    das_plateau_patience: int = 1
     das_plateau_rel_delta: float = 5e-3
     das_learning_rate: float = 1e-3
     das_subspace_dims: tuple[int, ...] | None = None
