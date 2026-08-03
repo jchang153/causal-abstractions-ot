@@ -128,6 +128,22 @@ def build_cost_matrix(
     return costs, {"family_costs": by_family, "cost_matrix": costs.tolist()}
 
 
+def bruteforce_coupling_from_cost(cost: np.ndarray) -> np.ndarray:
+    """Convert per-variable head MSEs into deterministic coupling scores.
+
+    Negation is parameter-free and makes the existing descending coupling
+    ranking exactly equivalent to ranking heads by ascending macro MSE.
+    """
+
+    values = np.asarray(cost, dtype=np.float64)
+    if values.ndim != 2 or not np.isfinite(values).all():
+        raise ValueError("cost must be a finite rank-2 matrix")
+    coupling = -values
+    if not np.isfinite(coupling).all():
+        raise ValueError("Brute-force coupling produced non-finite values")
+    return coupling
+
+
 def sinkhorn_one_sided_uot(
     cost: np.ndarray,
     *,

@@ -101,6 +101,8 @@ Methods:
 - `Blind DAS`: joint DAS over all 144 attention heads.
 - `PLOT-DAS`: $2 \times 144$ UOT head localization followed by calibrated
   top-$K$ joint DAS.
+- `Brute-force DAS`: direct per-variable full-head MSE localization followed by
+  the same calibrated top-$K$ joint DAS.
 - `Oracle DAS`: joint DAS over heads $7.3, 7.9, 8.6, 8.10$.
 
 Entry point and task-specific protocol:
@@ -131,7 +133,8 @@ These folders are included under `experiments/` for completeness. They are not t
 - `experiments/heq/`: main-paper HEQ scripts and implementation package.
 - `experiments/binary_addition/`: main-paper 4-bit binary-addition scripts and implementation package.
 - `experiments/mcqa/`: main-paper MCQA scripts, implementation package, and Slurm launchers.
-- `experiments/ioi/`: blind, PLOT-guided, and oracle DAS on MIB IOI.
+- `experiments/ioi/`: blind, PLOT-guided, brute-force-localized, and oracle DAS
+  on MIB IOI.
 - `paper/`: local ignored manuscript sources, generated figures, and paper-build artifacts.
 - `models/`: local checkpoints.
 - `results/`: timestamped experiment outputs.

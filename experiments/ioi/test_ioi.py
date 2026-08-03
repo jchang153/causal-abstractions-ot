@@ -26,6 +26,7 @@ from experiments.ioi.interventions import (
 )
 from experiments.ioi.plot import (
     SignatureBank,
+    bruteforce_coupling_from_cost,
     build_cost_matrix,
     calibrate_uot_grid,
     choose_k,
@@ -187,6 +188,19 @@ def test_plot_cost_uot_and_deterministic_ranking():
     assert top_k_heads(tied, heads, "token", 2) == ((0, 0), (0, 1))
 
 
+def test_bruteforce_coupling_ranks_macro_family_mse_without_tuning():
+    cost = np.asarray([[0.3, 0.1, 0.2], [5.0, 5.0, 4.0]], dtype=np.float64)
+    coupling = bruteforce_coupling_from_cost(cost)
+    heads = ((0, 0), (0, 1), (0, 2))
+    assert coupling.shape == (2, 3)
+    assert np.isfinite(coupling).all()
+    assert np.array_equal(coupling, -cost)
+    assert top_k_heads(coupling, heads, "position", 3) == (
+        (0, 1), (0, 2), (0, 0)
+    )
+    assert top_k_heads(coupling, heads, "token", 1) == ((0, 2),)
+
+
 def test_staged_calibration_never_receives_heldout_groups():
     seen = []
 
@@ -277,7 +291,7 @@ def test_opt_in_gpt2_smoke(tmp_path):
 
     assert main(
         [
-            "--methods", "blind,plot,oracle", "--quick-rows", "100", "--calibration-rows", "50",
+            "--methods", "blind,plot,bruteforce,oracle", "--quick-rows", "100", "--calibration-rows", "50",
             "--signature-bank-size", "8", "--uot-epsilons", "1",
             "--uot-beta-neural", "1", "--plot-k", "1",
             "--microbatch-size", "4", "--effective-batch-size", "32",

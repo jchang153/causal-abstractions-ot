@@ -1,4 +1,4 @@
-"""Run blind DAS, PLOT-DAS, and oracle DAS on the released MIB IOI task."""
+"""Run blind, PLOT, brute-force, and oracle DAS on the released MIB IOI task."""
 
 from __future__ import annotations
 
@@ -39,6 +39,7 @@ from experiments.ioi.interventions import (  # noqa: E402
 )
 from experiments.ioi.plot import (  # noqa: E402
     SignatureBank,
+    bruteforce_coupling_from_cost,
     build_cost_matrix,
     calibrate_uot_grid,
     choose_k,
@@ -61,7 +62,11 @@ def _csv(value: str, cast):
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--methods", default="blind,plot,oracle", help="Comma-separated: blind,plot,oracle")
+    parser.add_argument(
+        "--methods",
+        default="blind,plot,bruteforce,oracle",
+        help="Comma-separated: blind,plot,bruteforce (or brute-force),oracle",
+    )
     parser.add_argument("--model-name", default="gpt2")
     parser.add_argument("--dataset-name", default="mib-bench/ioi")
     parser.add_argument(
@@ -79,7 +84,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--signature-bank-size", type=int, default=1000)
     parser.add_argument("--uot-epsilons", default="0.5,1,2")
     parser.add_argument("--uot-beta-neural", default="0.1,0.3,1,3")
-    parser.add_argument("--plot-k", default="1,2,3")
+    parser.add_argument(
+        "--plot-k",
+        default="1,2,3",
+        help="Top-K DAS grid shared by PLOT and brute-force localization",
+    )
     parser.add_argument("--das-dimension", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1.0)
@@ -92,8 +101,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("results/ioi"))
     parser.add_argument("--force", action="store_true", help="Ignore compatible cached artifacts")
     args = parser.parse_args(argv)
-    args.methods = _csv(args.methods, str)
-    unknown = set(args.methods) - {"blind", "plot", "oracle"}
+    args.methods = tuple(
+        "bruteforce" if method == "brute-force" else method
+        for method in _csv(args.methods, str)
+    )
+    unknown = set(args.methods) - {"blind", "plot", "bruteforce", "oracle"}
     if unknown:
         parser.error(f"Unknown methods: {sorted(unknown)}")
     args.uot_epsilons = _csv(args.uot_epsilons, float)
@@ -263,8 +275,98 @@ def _evaluate_selected(
     return metrics, float(perf_counter() - started)
 
 
+def _train_and_calibrate_localized_das(
+    *,
+    method: str,
+    coupling: np.ndarray,
+    candidate_heads,
+    k_values,
+    output_dir: Path,
+    force: bool,
+    model,
+    tokenizer,
+    banks: IOIBanks,
+    causal_model: LinearCausalModel,
+    device: torch.device,
+    das_config: DASTrainConfig,
+    eval_batch_size: int,
+):
+    """Train all six localized DAS candidates and freeze one K per variable."""
+
+    variables = {}
+    selected_runtime_objects = {}
+    training_cold_seconds = 0.0
+    training_current_seconds = 0.0
+    calibration_seconds = 0.0
+    for variable in VARIABLES:
+        candidates = []
+        rotations_by_k = {}
+        heads_by_k = {}
+        for k in sorted(set(int(value) for value in k_values)):
+            heads = top_k_heads(coupling, candidate_heads, variable, k)
+            checkpoint = output_dir / "checkpoints" / f"{method}_{variable}_k{k}.pt"
+            rotations, training, cached = _train_cached(
+                checkpoint,
+                force=force,
+                model=model,
+                tokenizer=tokenizer,
+                banks=banks,
+                variable=variable,
+                causal_model=causal_model,
+                heads=heads,
+                device=device,
+                config=das_config,
+            )
+            calibration_started = perf_counter()
+            metrics = evaluate_mse(
+                model,
+                tokenizer,
+                banks.calibration,
+                variable=variable,
+                causal_model=causal_model,
+                heads=heads,
+                rotations=rotations,
+                device=device,
+                batch_size=eval_batch_size,
+            )
+            candidate_calibration_seconds = float(perf_counter() - calibration_started)
+            training_cold_seconds += float(training["runtime_seconds"])
+            training_current_seconds += 0.0 if cached else float(training["runtime_seconds"])
+            calibration_seconds += candidate_calibration_seconds
+            candidates.append(
+                {
+                    "k": int(k),
+                    "heads": [head_label(head) for head in heads],
+                    "macro_mse": float(metrics["macro_mse"]),
+                    "metrics": metrics,
+                    "training": training,
+                    "checkpoint_cached": cached,
+                    "calibration_runtime_seconds": candidate_calibration_seconds,
+                }
+            )
+            rotations_by_k[int(k)] = rotations
+            heads_by_k[int(k)] = heads
+        selected = choose_k(candidates)
+        selected_k = int(selected["k"])
+        variables[variable] = {
+            "heads": selected["heads"],
+            "k": selected_k,
+            "coupling_row": coupling[VARIABLES.index(variable)].tolist(),
+            "calibration_candidates": candidates,
+        }
+        selected_runtime_objects[variable] = (
+            heads_by_k[selected_k],
+            rotations_by_k[selected_k],
+        )
+    return variables, selected_runtime_objects, {
+        "das_training_seconds": training_cold_seconds,
+        "current_das_training_seconds": training_current_seconds,
+        "calibration_seconds": calibration_seconds,
+    }
+
+
 def _summary_text(summary: Mapping[str, object]) -> str:
-    lines = ["Blind IOI Head Localization with PLOT-DAS", ""]
+    lines = ["Blind IOI Head Localization with PLOT-DAS and Brute-Force DAS", ""]
     causal = summary["causal_model"]["model"]
     lines.append(
         "Causal coefficients: "
@@ -417,8 +519,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
         }
 
-    if "plot" in args.methods:
-        signature_path = output_dir / "plot" / "signatures.json"
+    deferred_localized_evaluations: dict[str, dict[str, tuple[object, object]]] = {}
+    signatures = None
+    signature_cached = False
+    cost = None
+    cost_diagnostics = None
+    if {"plot", "bruteforce"}.intersection(args.methods):
+        signature_path = output_dir / "localization" / "signatures.json"
         signatures, signature_cached = _artifact(
             signature_path,
             force=args.force,
@@ -433,7 +540,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             dumper=lambda path, value: _write_json(path, value.as_dict()),
         )
         cost, cost_diagnostics = build_cost_matrix(signatures, causal_model)
-        _write_json(output_dir / "plot" / "costs.json", cost_diagnostics)
+        _write_json(output_dir / "localization" / "costs.json", cost_diagnostics)
+
+    if "plot" in args.methods:
+        assert signatures is not None and cost is not None
         uot_started = perf_counter()
         uot_path = output_dir / "plot" / "uot_calibration.json"
         if uot_path.exists() and not args.force:
@@ -462,75 +572,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             uot_cached = False
         uot_seconds = float(perf_counter() - uot_started)
         frozen_coupling = np.asarray(uot_payload["selected"]["coupling"], dtype=np.float64)
-
-        plot_variables = {}
-        selected_runtime_objects = {}
-        plot_training_cold_seconds = 0.0
-        plot_training_current_seconds = 0.0
-        plot_calibration_seconds = 0.0
-        plot_test_seconds = 0.0
-        for variable in VARIABLES:
-            candidates = []
-            rotations_by_k = {}
-            heads_by_k = {}
-            for k in sorted(set(args.plot_k)):
-                heads = top_k_heads(frozen_coupling, signatures.heads, variable, k)
-                checkpoint = output_dir / "checkpoints" / f"plot_{variable}_k{k}.pt"
-                rotations, training, cached = _train_cached(
-                    checkpoint,
-                    force=args.force,
-                    model=model,
-                    tokenizer=tokenizer,
-                    banks=banks,
-                    variable=variable,
-                    causal_model=causal_model,
-                    heads=heads,
-                    device=device,
-                    config=das_config,
-                )
-                calibration_started = perf_counter()
-                metrics = evaluate_mse(
-                    model,
-                    tokenizer,
-                    banks.calibration,
-                    variable=variable,
-                    causal_model=causal_model,
-                    heads=heads,
-                    rotations=rotations,
-                    device=device,
-                    batch_size=args.eval_batch_size,
-                )
-                calibration_seconds = float(perf_counter() - calibration_started)
-                plot_training_cold_seconds += float(training["runtime_seconds"])
-                plot_training_current_seconds += (
-                    0.0 if cached else float(training["runtime_seconds"])
-                )
-                plot_calibration_seconds += calibration_seconds
-                candidates.append(
-                    {
-                        "k": int(k),
-                        "heads": [head_label(head) for head in heads],
-                        "macro_mse": float(metrics["macro_mse"]),
-                        "metrics": metrics,
-                        "training": training,
-                        "checkpoint_cached": cached,
-                        "calibration_runtime_seconds": calibration_seconds,
-                    }
-                )
-                rotations_by_k[int(k)] = rotations
-                heads_by_k[int(k)] = heads
-            selected = choose_k(candidates)
-            selected_k = int(selected["k"])
-            plot_variables[variable] = {
-                "heads": selected["heads"],
-                "k": selected_k,
-                "coupling_row": frozen_coupling[VARIABLES.index(variable)].tolist(),
-                "calibration_candidates": candidates,
-            }
-            selected_runtime_objects[variable] = (
-                heads_by_k[selected_k],
-                rotations_by_k[selected_k],
+        plot_variables, selected_runtime_objects, localized_runtime = (
+            _train_and_calibrate_localized_das(
+                method="plot",
+                coupling=frozen_coupling,
+                candidate_heads=signatures.heads,
+                k_values=args.plot_k,
+                output_dir=output_dir,
+                force=args.force,
+                model=model,
+                tokenizer=tokenizer,
+                banks=banks,
+                causal_model=causal_model,
+                device=device,
+                das_config=das_config,
+                eval_batch_size=args.eval_batch_size,
             )
+        )
 
         # Both coupling rows and both K values are frozen before any PLOT held-out access.
         _write_json(
@@ -549,39 +607,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 },
             },
         )
-        for variable in VARIABLES:
-            selected_heads, selected_rotations = selected_runtime_objects[variable]
-            test_metrics, test_seconds = _evaluate_selected(
-                model,
-                tokenizer,
-                banks,
-                variable,
-                causal_model,
-                selected_heads,
-                selected_rotations,
-                device,
-                args.eval_batch_size,
-            )
-            plot_test_seconds += test_seconds
-            plot_variables[variable]["test"] = test_metrics
-            plot_variables[variable]["test_runtime_seconds"] = test_seconds
-
         signature_seconds = signatures.runtime_seconds
         tuning_seconds = float(uot_payload.get("runtime_seconds", uot_seconds if not uot_cached else 0.0))
         cold = (
             signature_seconds
             + tuning_seconds
-            + plot_training_cold_seconds
-            + plot_calibration_seconds
-            + plot_test_seconds
+            + float(localized_runtime["das_training_seconds"])
+            + float(localized_runtime["calibration_seconds"])
         )
         current = (
             (0.0 if signature_cached else signature_seconds)
             + (0.0 if uot_cached else tuning_seconds)
-            + plot_training_current_seconds
-            + plot_calibration_seconds
-            + plot_test_seconds
+            + float(localized_runtime["current_das_training_seconds"])
+            + float(localized_runtime["calibration_seconds"])
         )
+        deferred_localized_evaluations["plot"] = selected_runtime_objects
         method_results["plot"] = {
             "variables": plot_variables,
             "selected_uot": {
@@ -593,18 +633,116 @@ def main(argv: Sequence[str] | None = None) -> int:
             "runtime": {
                 "signature_collection_seconds": signature_seconds,
                 "uot_tuning_seconds": tuning_seconds,
-                "das_training_seconds": plot_training_cold_seconds,
-                "current_das_training_seconds": plot_training_current_seconds,
-                "calibration_seconds": plot_calibration_seconds,
-                "heldout_evaluation_seconds": plot_test_seconds,
+                **localized_runtime,
+                "heldout_evaluation_seconds": 0.0,
                 "cold_seconds": cold,
                 "current_invocation_seconds": current,
                 "amortized_seconds_per_retained_variable": cold / len(VARIABLES),
             },
         }
 
-    # All data-dependent choices are now frozen. Fixed blind/oracle methods are
-    # evaluated here as well so no held-out metrics exist during PLOT selection.
+    if "bruteforce" in args.methods:
+        assert signatures is not None and cost is not None and cost_diagnostics is not None
+        coupling_started = perf_counter()
+        frozen_coupling = bruteforce_coupling_from_cost(cost)
+        coupling_seconds = float(perf_counter() - coupling_started)
+        brute_payload = {
+            "score_type": "negative_macro_family_mse",
+            "cost_matrix": cost.tolist(),
+            "coupling": frozen_coupling.tolist(),
+            "family_costs": cost_diagnostics["family_costs"],
+            "runtime_seconds": coupling_seconds,
+        }
+        _write_json(output_dir / "bruteforce" / "coupling.json", brute_payload)
+        brute_variables, selected_runtime_objects, localized_runtime = (
+            _train_and_calibrate_localized_das(
+                method="bruteforce",
+                coupling=frozen_coupling,
+                candidate_heads=signatures.heads,
+                k_values=args.plot_k,
+                output_dir=output_dir,
+                force=args.force,
+                model=model,
+                tokenizer=tokenizer,
+                banks=banks,
+                causal_model=causal_model,
+                device=device,
+                das_config=das_config,
+                eval_batch_size=args.eval_batch_size,
+            )
+        )
+        _write_json(
+            output_dir / "bruteforce" / "frozen_selection.json",
+            {
+                "score_type": brute_payload["score_type"],
+                "variables": {
+                    variable: {
+                        "k": brute_variables[variable]["k"],
+                        "heads": brute_variables[variable]["heads"],
+                    }
+                    for variable in VARIABLES
+                },
+            },
+        )
+        signature_seconds = signatures.runtime_seconds
+        cold = (
+            signature_seconds
+            + coupling_seconds
+            + float(localized_runtime["das_training_seconds"])
+            + float(localized_runtime["calibration_seconds"])
+        )
+        current = (
+            (0.0 if signature_cached else signature_seconds)
+            + coupling_seconds
+            + float(localized_runtime["current_das_training_seconds"])
+            + float(localized_runtime["calibration_seconds"])
+        )
+        deferred_localized_evaluations["bruteforce"] = selected_runtime_objects
+        method_results["bruteforce"] = {
+            "variables": brute_variables,
+            "score_type": brute_payload["score_type"],
+            "cost_matrix": brute_payload["cost_matrix"],
+            "signature_cached": signature_cached,
+            "runtime": {
+                "signature_collection_seconds": signature_seconds,
+                "coupling_construction_seconds": coupling_seconds,
+                **localized_runtime,
+                "heldout_evaluation_seconds": 0.0,
+                "cold_seconds": cold,
+                "current_invocation_seconds": current,
+                "amortized_seconds_per_retained_variable": cold / len(VARIABLES),
+            },
+        }
+
+    # All data-dependent choices are now frozen before any held-out access.
+    for method, runtime_objects in deferred_localized_evaluations.items():
+        method_test_seconds = 0.0
+        for variable in VARIABLES:
+            heads, rotations = runtime_objects[variable]
+            test_metrics, test_seconds = _evaluate_selected(
+                model,
+                tokenizer,
+                banks,
+                variable,
+                causal_model,
+                heads,
+                rotations,
+                device,
+                args.eval_batch_size,
+            )
+            method_test_seconds += test_seconds
+            method_results[method]["variables"][variable]["test"] = test_metrics
+            method_results[method]["variables"][variable]["test_runtime_seconds"] = test_seconds
+        runtime = method_results[method]["runtime"]
+        runtime["heldout_evaluation_seconds"] = method_test_seconds
+        runtime["cold_seconds"] = float(runtime["cold_seconds"]) + method_test_seconds
+        runtime["current_invocation_seconds"] = (
+            float(runtime["current_invocation_seconds"]) + method_test_seconds
+        )
+        runtime["amortized_seconds_per_retained_variable"] = (
+            float(runtime["cold_seconds"]) / len(VARIABLES)
+        )
+
     for method, runtime_objects in deferred_fixed_evaluations.items():
         method_test_seconds = 0.0
         for variable in VARIABLES:
@@ -641,8 +779,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "shared_runtime": shared_runtime,
         "methods": method_results,
         "selection_protocol": {
-            "fit_uses": ["causal regression", "PLOT signatures", "DAS rotations"],
-            "calibration_uses": ["shared UOT setting", "PLOT-DAS K per variable"],
+            "fit_uses": [
+                "causal regression",
+                "shared configured-size full-head intervention bank",
+                "DAS rotations",
+            ],
+            "calibration_uses": [
+                "shared UOT setting for PLOT only",
+                "localized DAS K per variable",
+            ],
             "test_uses": ["final frozen evaluation only"],
         },
     }

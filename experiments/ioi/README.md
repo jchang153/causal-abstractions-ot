@@ -1,13 +1,16 @@
-# Blind IOI Head Localization with PLOT-DAS
+# Blind IOI Head Localization with PLOT-DAS and Brute-Force DAS
 
 This folder implements the Indirect Object Identification causal-variable track
 from MIB using GPT-2 Small and the released `mib-bench/ioi` Hugging Face dataset.
-It compares three localization regimes while keeping the DAS objective and
+It compares four localization regimes while keeping the DAS objective and
 high-level model fixed:
 
 - **Blind DAS:** joint DAS over all $12 \times 12 = 144$ attention heads.
 - **PLOT-DAS:** a $2 \times 144$ one-sided UOT coupling localizes heads, followed
   by joint DAS on each row's top $K \in \{1,2,3\}$ heads.
+- **Brute-force DAS:** every full head activation is patched separately on the
+  same signature bank as PLOT. Heads are ranked independently for each abstract
+  variable by macro family MSE, followed by the same top-$K$ joint DAS sweep.
 - **Oracle DAS:** joint DAS over the known IOI heads $7.3, 7.9, 8.6, 8.10$.
 
 Every intervention acts on a head's $64$-dimensional attention-weighted value
@@ -59,7 +62,7 @@ Run the complete experiment on a GPU:
 ```bash
 python experiments/ioi/run.py \
   --device cuda \
-  --methods blind,plot,oracle \
+  --methods blind,plot,bruteforce,oracle \
   --microbatch-size 8 \
   --output-dir results/ioi/gpt2_seed0
 ```
@@ -67,7 +70,8 @@ python experiments/ioi/run.py \
 The effective batch size remains $1024$; reduce `--microbatch-size` if GPU
 memory is limited. Useful CLI controls include `--split-seed`,
 `--signature-bank-size`, `--uot-epsilons`, `--uot-beta-neural`, `--plot-k`, and
-`--das-dimension`. `--quick-rows` is only for development and will not reproduce
+`--das-dimension`; `--plot-k` is the localized-DAS grid shared by PLOT and
+brute-force. `--quick-rows` is only for development and will not reproduce
 the benchmark coefficients.
 
 At startup the runner validates the locked Torch, Transformers, and pyvene
@@ -82,7 +86,14 @@ output directory or `--force` is used.
 
 ## Selection and artifacts
 
-PLOT uses a deterministic $1{,}000$-raw-row training subset for signatures.
+PLOT and brute-force localization share a deterministic $1{,}000$-raw-row
+training subset and the exact same cached full-head interventions. Brute-force
+localization directly computes each variable-head entry as the per-family MSE
+between neural and abstract intervention effects and then macro-averages the
+three families. It has no localization hyperparameters: its six DAS candidates
+are trained immediately, and calibration selects $K$ independently per row.
+
+PLOT uses those interventions as signatures.
 For each UOT setting, full-vector top-$K$ interventions are calibrated first.
 One UOT setting is selected by the macro-average of the two rows' independently
 best calibration MSE. After freezing the coupling, six DAS candidates are
@@ -92,7 +103,9 @@ Blind and oracle DAS do not use calibration for model selection.
 The output directory contains:
 
 - `banks.json` and `causal_model.json`;
-- `plot/signatures.json`, `plot/costs.json`, and `plot/uot_calibration.json`;
+- `localization/signatures.json` and `localization/costs.json` shared by both
+  localization methods;
+- `plot/uot_calibration.json` and `bruteforce/coupling.json`;
 - all blind, oracle, and PLOT-DAS candidate checkpoints under `checkpoints/`;
 - `manifest.json`, `summary.json`, and a concise `summary.txt`.
 
