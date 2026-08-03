@@ -89,6 +89,29 @@ bash experiments/mcqa/slurm/submit_delta_mcqa_hierarchical_parallel_all.sh <time
 
 MCQA requires access to the model and dataset. Set `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` before launching non-interactive runs.
 
+### Indirect Object Identification (IOI)
+
+Location: `experiments/ioi/`
+
+Task: MIB's GPT-2 Small causal-variable IOI track using the released
+`mib-bench/ioi` data and the position/token high-level variables.
+
+Methods:
+
+- `Blind DAS`: joint DAS over all 144 attention heads.
+- `PLOT-DAS`: $2 \times 144$ UOT head localization followed by calibrated
+  top-$K$ joint DAS.
+- `Oracle DAS`: joint DAS over heads $7.3, 7.9, 8.6, 8.10$.
+
+Entry point and task-specific protocol:
+
+```bash
+python experiments/ioi/run.py --help
+```
+
+See [`experiments/ioi/README.md`](experiments/ioi/README.md) for the exact data
+split, regression, intervention semantics, resumable artifacts, and smoke tests.
+
 ## Additional Experiment Folders
 
 These folders are included under `experiments/` for completeness. They are not the main-paper experiment folders listed above.
@@ -108,6 +131,7 @@ These folders are included under `experiments/` for completeness. They are not t
 - `experiments/heq/`: main-paper HEQ scripts and implementation package.
 - `experiments/binary_addition/`: main-paper 4-bit binary-addition scripts and implementation package.
 - `experiments/mcqa/`: main-paper MCQA scripts, implementation package, and Slurm launchers.
+- `experiments/ioi/`: blind, PLOT-guided, and oracle DAS on MIB IOI.
 - `paper/`: local ignored manuscript sources, generated figures, and paper-build artifacts.
 - `models/`: local checkpoints.
 - `results/`: timestamped experiment outputs.

@@ -10,5 +10,5 @@ sentencepiece>=0.2
 safetensors>=0.4
 tqdm>=4.66
 pytest>=8,<10
-pyvene
+pyvene==0.1.8
 sae-lens==6.39.0
