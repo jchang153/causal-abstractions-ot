@@ -140,6 +140,11 @@ def _parse_rows(text: str) -> tuple[str, ...]:
     return tuple(x.strip() for x in str(text).split(",") if x.strip())
 
 
+def _synchronize_device(device: torch.device | None) -> None:
+    if device is not None and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def _checkpoint_map(hidden_size: int) -> dict[int, str]:
     if int(hidden_size) == 8:
         mapping = {
@@ -450,6 +455,7 @@ def _run_alignment_stage(
     row_allowed_timesteps: dict[str, set[int]] | None = None,
     evaluate_test: bool = True,
 ) -> dict[str, object]:
+    _synchronize_device(device)
     start_time = time.perf_counter()
     alignment_method = str(alignment_method).replace("-", "")
     if alignment_method == "bruteforce":
@@ -624,6 +630,7 @@ def _run_alignment_stage(
             }
         )
         selected_test_seconds = float(time.perf_counter() - selected_test_start)
+    _synchronize_device(device)
     wall_elapsed = time.perf_counter() - start_time
     selected_runtime = (
         float(best_trial.get("runtime_seconds", wall_elapsed)) + float(selected_test_seconds)
@@ -633,10 +640,17 @@ def _run_alignment_stage(
     return {
         "stage": str(stage_name),
         "alignment_method": alignment_method,
+        # The reported protocol fixes one calibration-selected epsilon.  The
+        # literal multi-epsilon execution wall time remains available below as
+        # a diagnostic, but is not the paper/runtime-table quantity.
         "runtime_seconds": float(selected_runtime),
         "wall_runtime_seconds": float(wall_elapsed),
         "setup_runtime_seconds": float(setup_seconds),
         "selected_test_runtime_seconds": float(selected_test_seconds),
+        "runtime_definition": (
+            "signature/cost setup plus the calibration-selected epsilon trial and "
+            "test evaluation of that selected trial; other epsilon trials excluded"
+        ),
         "test_evaluation_policy": "selected_global_alignment_trial_only" if bool(evaluate_test) else "deferred",
         "sites": [site.key() for site in sites],
         "fit_diagnostics": diagnostics,
@@ -677,10 +691,12 @@ def _run_alignment_resolution_sweep(
     selecting each abstract row's best resolution within each epsilon, then
     selecting one shared epsilon by the macro-average of those row-level
     calibration scores.  Complete per-resolution stages remain available under
-    ``resolution_results``.  Reported runtime is the coupling+calibration time
-    for every resolution at the selected shared epsilon, plus test evaluation
-    of the frozen calibration-selected row from each coupling.
+    ``resolution_results``.  Reported runtime fixes the single shared epsilon
+    selected by macro-average calibration, sums its coupling+calibration cost
+    across every resolution, and adds final selected-row test evaluation.
     """
+    _synchronize_device(device)
+    sweep_start_time = time.perf_counter()
     resolution_results: dict[str, dict[str, object]] = {}
     for resolution, resolution_sites in sites_by_resolution.items():
         resolution_results[str(int(resolution))] = _run_alignment_stage(
@@ -843,7 +859,9 @@ def _run_alignment_resolution_sweep(
         float(stage["wall_runtime_seconds"]) for stage in resolution_results.values()
     )
     calibration_sweep_wall_seconds = float(selected_epsilon_resolution_runtime_seconds)
-    sweep_wall_seconds = float(calibration_sweep_wall_seconds + selected_test_seconds)
+    _synchronize_device(device)
+    literal_sweep_wall_seconds = float(time.perf_counter() - sweep_start_time)
+    reported_sweep_seconds = float(calibration_sweep_wall_seconds + selected_test_seconds)
     sweep_setup_seconds = sum(float(stage["setup_runtime_seconds"]) for stage in resolution_results.values())
     selected_view = {
         "alignment_method": str(alignment_method).replace("-", ""),
@@ -858,18 +876,18 @@ def _run_alignment_resolution_sweep(
     return {
         "stage": str(stage_name),
         "alignment_method": str(alignment_method).replace("-", ""),
-        "runtime_seconds": float(sweep_wall_seconds),
-        "wall_runtime_seconds": float(sweep_wall_seconds),
+        "runtime_seconds": float(reported_sweep_seconds),
+        "wall_runtime_seconds": float(literal_sweep_wall_seconds),
         "setup_runtime_seconds": float(sweep_setup_seconds),
         "runtime_definition": (
-            "sum of coupling+calibration runtime across all independent resolutions at the "
-            "globally selected epsilon plus test runtime for frozen calibration-selected rows"
-            if selected_epsilon is not None
-            else "sum of coupling+calibration runtime across all independent resolutions plus "
-            "test runtime for frozen calibration-selected rows"
+            "sum of setup, coupling, and calibration runtime across all independent "
+            "resolutions at one shared calibration-selected epsilon, plus final test "
+            "evaluation of the frozen calibration-selected rows; other epsilons excluded"
         ),
         "calibration_sweep_runtime_seconds": float(calibration_sweep_wall_seconds),
-        "selected_epsilon_resolution_sweep_runtime_seconds": float(calibration_sweep_wall_seconds),
+        "selected_epsilon_resolution_sweep_runtime_seconds": float(
+            selected_epsilon_resolution_runtime_seconds
+        ),
         "full_hyperparameter_sweep_wall_runtime_seconds": float(full_hyperparameter_sweep_wall_seconds),
         "selected_test_runtime_seconds": float(selected_test_seconds),
         "epsilon_selection_rule": "macro_average_of_each_row_best_resolution_calibration_combined",
@@ -1215,6 +1233,17 @@ def _train_das_rotator(
     }
 
 
+def _warm_das_optimizer(device: torch.device) -> None:
+    """Pay one-time PyTorch optimizer initialization outside method timers."""
+    parameter = nn.Parameter(torch.zeros(1, device=device))
+    optimizer = torch.optim.Adam((parameter,), lr=1e-3)
+    optimizer.zero_grad(set_to_none=True)
+    parameter.sum().backward()
+    optimizer.step()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def _das_exact_match_rate(
     model: GRUAdder,
     records: Sequence[EndogenousPairRecord],
@@ -1286,6 +1315,7 @@ def _run_das_stage(
     rotation_map: dict[int, RotatedBasis] | None,
     skip: bool = False,
 ) -> dict[str, object]:
+    _synchronize_device(device)
     start_time = time.perf_counter()
     if bool(skip):
         per_row = {
@@ -1453,6 +1483,7 @@ def _run_das_stage(
         calib_inv.append(float(row_best["calibration"]["invariance"]))
         test_sens.append(float(test_eval["sensitivity"]))
         test_inv.append(float(test_eval["invariance"]))
+    _synchronize_device(device)
     elapsed = time.perf_counter() - start_time
     return {
         "stage": str(stage_name),
@@ -1646,6 +1677,9 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     )
     family_order = _family_order(int(args.width), str(args.source_policy))
 
+    if not bool(args.skip_das):
+        _warm_das_optimizer(device)
+
     transport_stage_a = _make_transport_config(
         epsilons=_parse_floats(args.stage_a_epsilons),
         top_k_grid=(1,),
@@ -1723,6 +1757,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         row_allowed_timesteps=row_allowed_timesteps,
     )
 
+    _synchronize_device(device)
     pca_start = time.perf_counter()
     rotation_map, pca_diagnostics = fit_pca_rotations(
         fit_examples=split.fit,
@@ -1731,6 +1766,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         hidden_size=int(args.hidden_size),
         variant=str(args.pca_variant),
     )
+    _synchronize_device(device)
     pca_fit_seconds = time.perf_counter() - pca_start
 
     pca_resolutions = _parse_ints(args.pca_resolutions) if str(args.pca_resolutions).strip() else _default_resolutions(int(args.hidden_size))
@@ -1979,6 +2015,11 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     )
 
     stage_a_breakdown = _alignment_stage_runtime_breakdown("stage_a", stage_a)
+    stage_a_search_seconds = max(
+        0.0,
+        float(stage_a["runtime_seconds"]) - float(stage_a.get("selected_test_runtime_seconds", 0.0)),
+    )
+    stage_a_breakdown["stage_a_search_runtime_seconds"] = float(stage_a_search_seconds)
     stage_b_canonical_breakdown = _alignment_stage_runtime_breakdown("stage_b_canonical", stage_b_canonical)
     stage_b_pca_breakdown = _alignment_stage_runtime_breakdown("stage_b_pca", stage_b_pca)
     pca_fit_breakdown = {"pca_fit_runtime_seconds": float(pca_fit_seconds)}
@@ -2001,7 +2042,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         "plot_in_timestep": _method_record(
             name=native_method_name,
             accuracy_source=stage_b_canonical["best_trial"],
-            runtime_seconds=float(stage_a["runtime_seconds"]) + float(stage_b_canonical["runtime_seconds"]),
+            runtime_seconds=float(stage_a_search_seconds) + float(stage_b_canonical["runtime_seconds"]),
             row_keys=row_keys,
             runtime_breakdown={
                 **stage_a_breakdown,
@@ -2011,7 +2052,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         "plot_pca_in_timestep": _method_record(
             name=pca_method_name,
             accuracy_source=stage_b_pca["best_trial"],
-            runtime_seconds=float(stage_a["runtime_seconds"]) + float(pca_fit_seconds) + float(stage_b_pca["runtime_seconds"]),
+            runtime_seconds=float(stage_a_search_seconds) + float(pca_fit_seconds) + float(stage_b_pca["runtime_seconds"]),
             row_keys=row_keys,
             runtime_breakdown={
                 **stage_a_breakdown,
@@ -2022,7 +2063,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         "plot_guided_das_full_timestep": _method_record(
             name="PLOT-guided DAS full timestep",
             accuracy_source=stage_b_das_full,
-            runtime_seconds=float(stage_a["runtime_seconds"]) + float(stage_b_das_full["runtime_seconds"]),
+            runtime_seconds=float(stage_a_search_seconds) + float(stage_b_das_full["runtime_seconds"]),
             row_keys=row_keys,
             runtime_breakdown={
                 **stage_a_breakdown,
@@ -2032,7 +2073,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         "plot_guided_das_canonical_support": _method_record(
             name="PLOT-guided DAS canonical support",
             accuracy_source=stage_b_das_canonical,
-            runtime_seconds=float(stage_a["runtime_seconds"]) + float(stage_b_canonical["runtime_seconds"]) + float(stage_b_das_canonical["runtime_seconds"]),
+            runtime_seconds=float(stage_a_search_seconds) + float(stage_b_canonical["runtime_seconds"]) + float(stage_b_das_canonical["runtime_seconds"]),
             row_keys=row_keys,
             runtime_breakdown={
                 **stage_a_breakdown,
@@ -2043,7 +2084,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         "plot_pca_guided_das": _method_record(
             name="PLOT-PCA-guided DAS",
             accuracy_source=stage_b_das_pca,
-            runtime_seconds=float(stage_a["runtime_seconds"]) + float(pca_fit_seconds) + float(stage_b_pca["runtime_seconds"]) + float(stage_b_das_pca["runtime_seconds"]),
+            runtime_seconds=float(stage_a_search_seconds) + float(pca_fit_seconds) + float(stage_b_pca["runtime_seconds"]) + float(stage_b_das_pca["runtime_seconds"]),
             row_keys=row_keys,
             runtime_breakdown={
                 **stage_a_breakdown,

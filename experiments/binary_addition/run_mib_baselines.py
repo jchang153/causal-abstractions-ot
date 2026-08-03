@@ -40,6 +40,16 @@ def parse_ints(value: str) -> tuple[int, ...]:
     return tuple(int(item.strip()) for item in value.split(",") if item.strip())
 
 
+def parse_checkpoint_map(value: str) -> dict[int, Path]:
+    mapping: dict[int, Path] = {}
+    for chunk in str(value).split(";"):
+        if not chunk.strip():
+            continue
+        seed, path = chunk.split("=", 1)
+        mapping[int(seed.strip())] = Path(path.strip())
+    return mapping
+
+
 def atomic_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -63,12 +73,33 @@ def default_checkpoint(seed: int, hidden_size: int) -> Path:
     return ROOT / "eval" / "shared_checkpoints" / f"gru_h{hidden_size}_seed{seed}.pt"
 
 
+def warm_dbm_optimizer(device: torch.device) -> None:
+    """Pay one-time PyTorch optimizer initialization outside method timers."""
+    parameter = torch.nn.Parameter(torch.zeros(1, device=device))
+    optimizer = torch.optim.AdamW((parameter,), lr=1e-3, weight_decay=0.0)
+    optimizer.zero_grad(set_to_none=True)
+    parameter.sum().backward()
+    optimizer.step()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=ROOT / "results" / "delta")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--methods", default=",".join(METHODS))
     parser.add_argument("--seeds", default="0,1,2")
+    parser.add_argument(
+        "--checkpoint-map",
+        default="",
+        help="Optional semicolon-separated seed=checkpoint paths; prevents fallback retraining.",
+    )
     parser.add_argument("--rows", default="C1,C2,C3")
     parser.add_argument("--timesteps", default="0,1,2,3")
     parser.add_argument("--width", type=int, default=4)
@@ -101,6 +132,14 @@ def main() -> None:
     if unknown:
         raise ValueError(f"Unknown methods: {unknown}")
     seeds = parse_ints(args.seeds)
+    checkpoint_map = parse_checkpoint_map(args.checkpoint_map)
+    if checkpoint_map:
+        missing_seeds = sorted(set(seeds) - set(checkpoint_map))
+        if missing_seeds:
+            raise ValueError(f"Checkpoint map is missing seeds: {missing_seeds}")
+        missing_paths = [str(path) for path in checkpoint_map.values() if not path.exists()]
+        if missing_paths:
+            raise FileNotFoundError(f"Checkpoint paths do not exist: {missing_paths}")
     timesteps = parse_ints(args.timesteps)
     row_keys = tuple(item.strip() for item in args.rows.split(",") if item.strip())
     specs = tuple(
@@ -109,6 +148,8 @@ def main() -> None:
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     if args.device == "cuda" and device.type != "cuda":
         raise RuntimeError("CUDA requested but unavailable; run inside the allocated srun step")
+    if any(method.startswith("dbm-") for method in methods):
+        warm_dbm_optimizer(device)
     run_name = args.run_name or f"binary_addition_mib_baselines_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir = args.out_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -126,7 +167,11 @@ def main() -> None:
         standard_checkpoint = default_checkpoint(seed, args.hidden_size)
         fallback_checkpoint = run_dir / "checkpoints" / f"gru_h{args.hidden_size}_seed{seed}.pt"
         args.seed = int(seed)
-        args.model_checkpoint = str(standard_checkpoint if standard_checkpoint.exists() else fallback_checkpoint)
+        args.model_checkpoint = str(
+            checkpoint_map[seed]
+            if checkpoint_map
+            else (standard_checkpoint if standard_checkpoint.exists() else fallback_checkpoint)
+        )
         model, model_metadata = _load_or_train_model(args, all_examples, split)
         model.eval()
         model.requires_grad_(False)
@@ -152,11 +197,13 @@ def main() -> None:
                     pca_by_timestep[timestep] = PCABasis(cached_pca["components"])
                     pca_metadata[str(timestep)] = dict(cached_pca["metadata"])
                 else:
+                    synchronize_device(device)
                     pca_started = perf_counter()
                     observations = collect_pca_observations(
                         fit_records, timestep=timestep, run_cache=run_cache
                     )
                     pca_by_timestep[timestep] = PCABasis.fit(observations, rank=args.pca_rank)
+                    synchronize_device(device)
                     pca_metadata[str(timestep)] = {
                         "observation_count": int(observations.shape[0]),
                         "hidden_size": int(observations.shape[1]),
@@ -190,12 +237,23 @@ def main() -> None:
 
         for method in methods:
             for row in row_keys:
+                row_payloads: list[tuple[Path, dict[str, object]]] = []
                 for timestep in timesteps:
                     stem = f"{method}_seed{seed}_{row}_t{timestep}"
                     output_path = run_dir / method / f"{stem}.json"
                     if output_path.exists() and not args.no_resume:
                         print(f"[resume] {output_path}")
+                        payload = json.loads(output_path.read_text())
+                        if "candidate_search_seconds" not in payload:
+                            prior_test_seconds = float(
+                                (payload.get("test") or {}).get("evaluation_seconds", 0.0)
+                            )
+                            payload["candidate_search_seconds"] = max(
+                                0.0, float(payload.get("total_seconds", 0.0)) - prior_test_seconds
+                            )
+                        row_payloads.append((output_path, payload))
                         continue
+                    synchronize_device(device)
                     started = perf_counter()
                     basis = (
                         pca_by_timestep[timestep]
@@ -238,7 +296,6 @@ def main() -> None:
                         }
                         if isinstance(basis, PCABasis):
                             checkpoint_payload["pca_components"] = basis.components.cpu()
-                        torch.save(checkpoint_payload, checkpoint_path)
                         payload["checkpoint"] = str(checkpoint_path.relative_to(run_dir))
                     payload["calibration"] = evaluate_candidate(
                         model=model,
@@ -251,23 +308,76 @@ def main() -> None:
                         device=device,
                         batch_size=args.eval_batch_size,
                     )
-                    payload["test"] = evaluate_candidate(
+                    # Candidate-search runtime includes mask training and
+                    # calibration, but excludes checkpoint/result serialization
+                    # and test evaluation.  Test is run only after calibration
+                    # selects one timestep for this abstract row.
+                    synchronize_device(device)
+                    payload["candidate_search_seconds"] = float(perf_counter() - started)
+                    payload["test"] = None
+                    payload["selected_for_test"] = False
+                    payload["total_seconds"] = float(payload["candidate_search_seconds"])
+                    if method != "full-state":
+                        torch.save(checkpoint_payload, checkpoint_path)
+                    atomic_json(output_path, payload)
+                    row_payloads.append((output_path, payload))
+                    print(
+                        f"[candidate] {stem} cal={payload['calibration']['combined']:.4f}"
+                    )
+
+                row_payloads.sort(
+                    key=lambda item: (
+                        -float(item[1]["calibration"]["combined"]),
+                        -float(item[1]["calibration"]["sensitivity"]),
+                        -float(item[1]["calibration"]["invariance"]),
+                        int(item[1]["timestep"]),
+                    )
+                )
+                selected_path, selected_payload = row_payloads[0]
+                if not bool(selected_payload.get("selected_for_test")) or not isinstance(
+                    selected_payload.get("test"), dict
+                ):
+                    selected_timestep = int(selected_payload["timestep"])
+                    selected_basis = (
+                        pca_by_timestep[selected_timestep]
+                        if method == "dbm-pca"
+                        else IdentityBasis(args.hidden_size)
+                    )
+                    if method == "full-state":
+                        selected_gate = torch.ones(selected_basis.feature_dim, device=device)
+                    else:
+                        checkpoint_path = run_dir / str(selected_payload["checkpoint"])
+                        checkpoint_payload = torch.load(checkpoint_path, map_location="cpu")
+                        selected_gate = (checkpoint_payload["mask_logits"] > 0).to(
+                            device=device, dtype=torch.float32
+                        )
+                    selected_payload["test"] = evaluate_candidate(
                         model=model,
                         positive_records=banks["test_positive_by_row"][row],
                         invariant_records=banks["test_invariant_by_row"][row],
-                        timestep=timestep,
-                        basis=basis,
-                        gate=gate,
+                        timestep=selected_timestep,
+                        basis=selected_basis,
+                        gate=selected_gate,
                         run_cache=run_cache,
                         device=device,
                         batch_size=args.eval_batch_size,
                     )
-                    payload["total_seconds"] = float(perf_counter() - started)
-                    atomic_json(output_path, payload)
-                    print(
-                        f"[done] {stem} cal={payload['calibration']['combined']:.4f} "
-                        f"test={payload['test']['combined']:.4f}"
+                for output_path, payload in row_payloads:
+                    is_selected = output_path == selected_path
+                    payload["selected_for_test"] = bool(is_selected)
+                    if not is_selected:
+                        payload["test"] = None
+                    selected_test_seconds = (
+                        float(payload["test"].get("evaluation_seconds", 0.0))
+                        if is_selected and isinstance(payload.get("test"), dict)
+                        else 0.0
                     )
+                    payload["total_seconds"] = float(payload["candidate_search_seconds"]) + selected_test_seconds
+                    atomic_json(output_path, payload)
+                print(
+                    f"[selected] {method} seed={seed} row={row} "
+                    f"t={selected_payload['timestep']} test={selected_payload['test']['combined']:.4f}"
+                )
 
     records = [json.loads(path.read_text()) for path in run_dir.glob("*/*.json")]
     selections: dict[str, object] = {}
@@ -305,15 +415,24 @@ def main() -> None:
                     float(item.get("fit_seconds", 0.0))
                     for item in seed_metadata.get("pca", {}).values()
                 )
+            candidate_search_seconds = sum(
+                float(item.get("candidate_search_seconds", item.get("total_seconds", 0.0)))
+                for item in all_method_candidates
+            )
+            selected_test_seconds = sum(
+                float((item.get("test") or {}).get("evaluation_seconds", 0.0))
+                for item in selected_rows
+            )
             seed_values.append(
                 {
                     "seed": seed,
                     "combined": sum(float(item["test"]["combined"]) for item in selected_rows) / len(selected_rows),
                     "sensitivity": sum(float(item["test"]["sensitivity"]) for item in selected_rows) / len(selected_rows),
                     "invariance": sum(float(item["test"]["invariance"]) for item in selected_rows) / len(selected_rows),
-                    "runtime_seconds": pca_setup_seconds + sum(
-                        float(item["total_seconds"]) for item in all_method_candidates
-                    ),
+                    "runtime_seconds": pca_setup_seconds + candidate_search_seconds + selected_test_seconds,
+                    "pca_setup_seconds": pca_setup_seconds,
+                    "candidate_search_seconds": candidate_search_seconds,
+                    "selected_test_seconds": selected_test_seconds,
                     "selected_candidate_runtime_seconds": sum(
                         float(item["total_seconds"]) for item in selected_rows
                     ),
@@ -322,6 +441,15 @@ def main() -> None:
         aggregate[method] = {
             metric: summary_stats([float(item[metric]) for item in seed_values])
             for metric in ("combined", "sensitivity", "invariance", "runtime_seconds")
+        }
+        aggregate[method]["runtime_definition"] = (
+            "PCA fitting when applicable, candidate training and calibration at every timestep, "
+            "and test evaluation only at each row's calibration-selected timestep; shared model, "
+            "data-bank, and activation-cache setup and result serialization are excluded"
+        )
+        aggregate[method]["runtime_breakdown_seconds"] = {
+            key: summary_stats([float(item[key]) for item in seed_values])
+            for key in ("pca_setup_seconds", "candidate_search_seconds", "selected_test_seconds")
         }
         aggregate[method]["per_seed"] = seed_values
     atomic_json(run_dir / "rankings.json", selections)

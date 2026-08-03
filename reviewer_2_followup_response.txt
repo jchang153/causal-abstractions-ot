@@ -1,0 +1,27 @@
+Thank you for the follow-up questions. We address the first question here.
+
+1. We agree that, in a typical abstraction setting, the low-level internal state may have much higher dimension than the high-level state. Our method does not assume that the high- and low-level variables being aligned have the same dimension. For example, an abstract variable $Z_i$ may be Boolean, whereas the activation at a candidate neural site $s_j$ may lie in $\mathbb{R}^{r_j}$.
+
+Instead of directly comparing these internal values, we compare the downstream effects of interventions on the two models. Because the high-level and low-level models solve the same task, we assume that their outputs lie in a common task-output space $\mathcal{Y}$. For each base/source pair $(x_t^b,x_t^s)$, we represent the abstract intervention effect using a distance function $d^{\mathrm{abs}}: \mathcal{Y} \times \mathcal{Y} \to \mathbb{R}^p$:
+
+$\Delta\_{i,t}^{\mathrm{abs}} := d^{\mathrm{abs}}\left(y\_{i,t}^{\mathrm{abs\_swap}},y\_t^{\mathrm{abs}}\right) \in \mathbb{R}^p$.
+
+Stacking these effects across the $T_{\mathrm{ft}}$ fit pairs produces the abstract effect signature
+
+$u\_i := \operatorname{Agg}\left(\Delta^{\mathrm{abs}}\_{i,1},\ldots,\Delta^{\mathrm{abs}}\_{i,T\_{\mathrm{ft}}}\right) \in \mathbb{R}^{p \cdot T\_{\mathrm{ft}}}$.
+
+Analogously, using $d^{\mathrm{nn}}: \mathcal{Y} \times \mathcal{Y} \to \mathbb{R}^p$, we define each neural intervention effect as
+
+$\Delta\_{j,t}^{\mathrm{nn}} := d^{\mathrm{nn}}\left(y\_{j,t}^{\mathrm{nn\_swap}},y\_t^{\mathrm{nn}}\right) \in \mathbb{R}^p$,
+
+and construct the neural effect signature
+
+$v\_j := \operatorname{Agg}\left(\Delta^{\mathrm{nn}}\_{j,1},\ldots,\Delta^{\mathrm{nn}}\_{j,T\_{\mathrm{ft}}}\right) \in \mathbb{R}^{p \cdot T\_{\mathrm{ft}}}$
+
+for each candidate neural site $s_j$. The transport cost is then
+
+$C_{ij} = ||u_i - v_j||_2^2$,
+
+and this cost matrix is supplied to the Sinkhorn algorithm to solve the entropically regularized optimal-transport problem.
+
+Thus, the shared dimension arises only after the two interventions have been propagated to the common task-output space; it is not an assumption about the dimensions of the abstract and neural internal states. This is consistent with the setup used in DAS and MIB. MIB, for example, explicitly assumes that the two models share an input and output space when defining interchange-intervention accuracy, while allowing a high-level variable to align with features of a substantially higher-dimensional neural representation. We have revised the methodology section to make this distinction and the construction of the cost matrix explicit.

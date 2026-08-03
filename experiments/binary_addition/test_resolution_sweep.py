@@ -118,6 +118,7 @@ def test_resolution_sweep_selects_shared_epsilon_and_charges_its_full_resolution
     assert result["best_trial"]["test"]["subset"]["mean_combined"] == 0.4
     assert result["selected_epsilon"] == 0.1
     assert result["calibration_sweep_runtime_seconds"] == 2.5
+    assert result["selected_epsilon_resolution_sweep_runtime_seconds"] == 2.5
     assert result["full_hyperparameter_sweep_wall_runtime_seconds"] == 5.0
     assert result["runtime_seconds"] >= 2.5
     assert result["resolution_results"]["1"]["sites"] == ["r1"]
