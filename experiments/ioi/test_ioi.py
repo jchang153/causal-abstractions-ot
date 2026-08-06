@@ -224,6 +224,8 @@ def test_staged_calibration_never_receives_heldout_groups():
     )
     assert len(trials) == 2
     assert selected["epsilon"] == 0.5
+    assert all(float(trial["runtime_seconds"]) >= 0.0 for trial in trials)
+    assert float(selected["runtime_seconds"]) >= 0.0
     assert seen and set(seen) == {"calibration-only"}
     assert choose_k([{"k": 2, "macro_mse": 1.0}, {"k": 1, "macro_mse": 1.0}])["k"] == 1
 

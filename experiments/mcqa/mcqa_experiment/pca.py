@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from time import perf_counter
 
 import torch
 
@@ -26,6 +27,7 @@ class LayerPCABasis:
     singular_values: torch.Tensor
     explained_variance: torch.Tensor
     num_fit_states: int
+    fit_runtime_seconds: float = 0.0
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -39,6 +41,7 @@ class LayerPCABasis:
             "singular_values": self.singular_values.detach().cpu(),
             "explained_variance": self.explained_variance.detach().cpu(),
             "num_fit_states": int(self.num_fit_states),
+            "fit_runtime_seconds": float(self.fit_runtime_seconds),
         }
 
     @staticmethod
@@ -54,6 +57,7 @@ class LayerPCABasis:
             singular_values=torch.as_tensor(payload["singular_values"], dtype=torch.float32),
             explained_variance=torch.as_tensor(payload["explained_variance"], dtype=torch.float32),
             num_fit_states=int(payload["num_fit_states"]),
+            fit_runtime_seconds=float(payload.get("fit_runtime_seconds", 0.0)),
         )
 
 
@@ -480,8 +484,10 @@ def load_or_fit_pca_basis(
             int(basis.layer) == int(layer)
             and str(basis.token_position_id) == str(token_position_id)
             and int(basis.hidden_size) == int(model.config.hidden_size)
+            and float(basis.fit_runtime_seconds) > 0.0
         ):
             return basis
+    fit_started = perf_counter()
     basis = fit_layer_token_pca_basis(
         model=model,
         bank=bank,
@@ -494,6 +500,7 @@ def load_or_fit_pca_basis(
         include_source=include_source,
         rank_tol=rank_tol,
     )
+    basis = replace(basis, fit_runtime_seconds=float(perf_counter() - fit_started))
     save_pca_basis(path, basis)
     return basis
 
@@ -518,8 +525,10 @@ def load_or_fit_pca_basis_from_prompt_records(
             int(basis.layer) == int(layer)
             and str(basis.token_position_id) == str(token_position_id)
             and int(basis.hidden_size) == int(model.config.hidden_size)
+            and float(basis.fit_runtime_seconds) > 0.0
         ):
             return basis
+    fit_started = perf_counter()
     basis = fit_layer_token_pca_basis_from_prompt_records(
         model=model,
         tokenizer=tokenizer,
@@ -531,5 +540,6 @@ def load_or_fit_pca_basis_from_prompt_records(
         basis_id=basis_id,
         rank_tol=rank_tol,
     )
+    basis = replace(basis, fit_runtime_seconds=float(perf_counter() - fit_started))
     save_pca_basis(path, basis)
     return basis

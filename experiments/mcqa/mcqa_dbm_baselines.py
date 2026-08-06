@@ -15,7 +15,7 @@ from time import perf_counter
 import torch
 
 from mcqa_experiment.checking import payload_uses_unified_iia
-from mcqa_experiment.data import build_pair_banks, load_filtered_mcqa_pipeline
+from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL, build_pair_banks, load_filtered_mcqa_pipeline
 from mcqa_experiment.dbm import (
     DBMMask,
     IdentityBasis,
@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", default="google/gemma-2-2b")
     parser.add_argument("--dataset-path", default="jchang153/copycolors_mcqa")
     parser.add_argument("--dataset-config", default="none")
-    parser.add_argument("--dataset-size", type=int, default=3000)
+    parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--train-size", type=int, default=200)
     parser.add_argument("--calibration-size", type=int, default=200)
     parser.add_argument("--test-size", type=int, default=200)
@@ -191,6 +191,10 @@ def main() -> None:
                 isinstance(existing_payload, dict)
                 and "calibration_candidate_seconds" in existing_payload
                 and payload_uses_unified_iia(existing_payload)
+                and existing_payload.get("partition_protocol") == MCQA_PARTITION_PROTOCOL
+                and existing_payload.get("dataset_size") == int(args.dataset_size)
+                and existing_payload.get("dataset_path") == str(args.dataset_path)
+                and existing_payload.get("dataset_config") == str(args.dataset_config)
             ):
                 print(f"[resume] {output_path}")
                 continue
@@ -215,6 +219,10 @@ def main() -> None:
         payload: dict[str, object] = {
             "method": method, "seed": seed, "target_var": target, "layer": layer,
             "train_size": args.train_size, "calibration_size": args.calibration_size, "test_size": args.test_size,
+            "partition_protocol": MCQA_PARTITION_PROTOCOL,
+            "dataset_size": int(args.dataset_size),
+            "dataset_path": str(args.dataset_path),
+            "dataset_config": str(args.dataset_config),
         }
         if method == "full-layer":
             payload["calibration"] = evaluate_full_layer(

@@ -9,7 +9,7 @@ from time import perf_counter
 import mcqa_run as base_run
 import torch
 from mcqa_experiment.checking import payload_uses_unified_iia
-from mcqa_experiment.data import canonicalize_target_var
+from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL, canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
     _evaluate_single_site_intervention,
@@ -109,8 +109,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--train-pool-size", type=int, default=200)
-    parser.add_argument("--calibration-pool-size", type=int, default=100)
-    parser.add_argument("--test-pool-size", type=int, default=100)
+    parser.add_argument("--calibration-pool-size", type=int, default=200)
+    parser.add_argument("--test-pool-size", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layers", help="Comma-separated layer indices. Default: all layers.")
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
@@ -855,6 +855,9 @@ def _evaluate_selected_stage_a_holdout(
         if holdout_exact_scores else 0.0
     )
     updated["holdout_eval_runtime_seconds"] = float(total_holdout_runtime_seconds)
+    updated["runtime_with_signatures_seconds"] = float(
+        updated.get("runtime_with_signatures_seconds", 0.0)
+    ) + float(total_holdout_runtime_seconds)
     return updated
 
 
@@ -1021,7 +1024,7 @@ def _format_summary(
 
 
 def main() -> None:
-    stage_start = perf_counter()
+    process_start = perf_counter()
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -1040,6 +1043,7 @@ def main() -> None:
     data_metadata = context["data_metadata"]
     device = context["device"]
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
+    method_stage_start = perf_counter()
 
     resolved_layers = tuple(
         _parse_csv_ints(args.layers) or list(range(int(model.config.num_hidden_layers)))
@@ -1178,7 +1182,13 @@ def main() -> None:
             output_path = sweep_root / f"{output_stem}.json"
             summary_path = sweep_root / f"{output_stem}.txt"
             compare_payload = _load_existing_payload(output_path)
-            if compare_payload is not None and str(compare_payload.get("kind")) != "mcqa_plot_layer_transport_only_compare":
+            compare_data = compare_payload.get("data", {}) if isinstance(compare_payload, dict) else {}
+            compare_partition = compare_data.get("partition", {}) if isinstance(compare_data, dict) else {}
+            if compare_payload is not None and (
+                str(compare_payload.get("kind")) != "mcqa_plot_layer_transport_only_compare"
+                or str(compare_payload.get("partition_protocol")) != MCQA_PARTITION_PROTOCOL
+                or compare_partition != data_metadata.get("partition", {})
+            ):
                 print(f"[stageA] ignoring non-transport-only compatibility payload path={output_path}")
                 compare_payload = None
             if compare_payload is None:
@@ -1205,6 +1215,8 @@ def main() -> None:
                     cosine_temperature=float(args.cosine_temperature),
                     bruteforce_temperature=float(args.bruteforce_temperature),
                 )
+                compare_payload["partition_protocol"] = MCQA_PARTITION_PROTOCOL
+                compare_payload["data"] = data_metadata
                 write_json(output_path, compare_payload)
                 report_lines = [
                     f"MCQA PLOT Layer Transport-Only {method.upper()}",
@@ -1284,16 +1296,20 @@ def main() -> None:
         score_slack=float(args.support_score_slack),
     )
     support_extract_seconds = float(perf_counter() - support_start)
-    total_seconds = float(perf_counter() - stage_start)
-    effective_total_seconds = adjust_runtime_for_cached_signatures(
-        wall_runtime_seconds=total_seconds,
+    method_sweep_wall_seconds = float(perf_counter() - method_stage_start)
+    effective_sweep_seconds = adjust_runtime_for_cached_signatures(
+        wall_runtime_seconds=method_sweep_wall_seconds,
         artifact_prepare_load_seconds=artifact_prepare_load_seconds,
         artifact_prepare_create_seconds=artifact_prepare_create_seconds,
         artifact_prepare_recorded_seconds=artifact_prepare_recorded_seconds,
     )
+    selected_plan_runtime_seconds = float(
+        selected_config.get("runtime_with_signatures_seconds", effective_sweep_seconds)
+    )
+    full_process_wall_seconds = float(perf_counter() - process_start)
     rankings_by_var = _rank_layers_from_target_row(
         selected_method_by_var=method_by_var,
-        runtime_seconds=float(selected_config.get("runtime_with_signatures_seconds", total_seconds)),
+        runtime_seconds=selected_plan_runtime_seconds,
     )
 
     support_path = sweep_root / f"mcqa_plot_layer_pos-{str(args.token_position_id)}_sig-{str(args.signature_mode)}_support.json"
@@ -1329,6 +1345,8 @@ def main() -> None:
             "site_labels": [site.label for site in sites],
             "support_path": str(support_path),
             "support_by_var": support_by_var,
+            "data": data_metadata,
+            "partition_protocol": MCQA_PARTITION_PROTOCOL,
             "rankings_by_var": rankings_by_var,
             "selected_joint_config": selected_config,
             "display_method_by_var": method_by_var,
@@ -1351,12 +1369,20 @@ def main() -> None:
                 "t_signature_prepare": float(signature_prepare_runtime_seconds),
                 "t_stageA_ot_localization": float(ot_localization_seconds),
                 "t_support_extract": float(support_extract_seconds),
-                "t_stage_total_wall": float(total_seconds),
+                "t_method_sweep_wall": float(method_sweep_wall_seconds),
+                "t_full_process_wall": float(full_process_wall_seconds),
             },
             "artifact_cache_hit": bool(prepared_artifacts.get("loaded_from_disk", False)),
-            "wall_runtime_seconds": float(total_seconds),
-            "localization_runtime_seconds": float(effective_total_seconds),
-            "runtime_seconds": float(effective_total_seconds),
+            "runtime_definition": (
+                "selected joint transport plan: recorded signature construction, one transport solve, "
+                "shortlisted-layer calibration, and selected-layer test evaluation; model/data loading "
+                "and unselected transport hyperparameters are excluded"
+            ),
+            "runtime_seconds": selected_plan_runtime_seconds,
+            "localization_runtime_seconds": selected_plan_runtime_seconds,
+            "full_sweep_runtime_seconds": float(effective_sweep_seconds),
+            "full_sweep_wall_runtime_seconds": float(method_sweep_wall_seconds),
+            "full_process_wall_runtime_seconds": float(full_process_wall_seconds),
         },
     )
     print(f"Wrote PLOT layer payload to {payload_path}")

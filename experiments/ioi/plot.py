@@ -21,6 +21,11 @@ from .interventions import (
 )
 
 
+def _synchronize_device(device: torch.device) -> None:
+    if torch.device(device).type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
 @dataclass(frozen=True)
 class SignatureBank:
     """Factual and one-head full-vector effects, aligned within each family."""
@@ -233,6 +238,8 @@ def calibrate_uot_grid(
     trials: list[dict[str, object]] = []
     for epsilon in epsilons:
         for beta_neural in beta_neurals:
+            _synchronize_device(device)
+            trial_started = perf_counter()
             coupling = sinkhorn_one_sided_uot(
                 cost, epsilon=float(epsilon), beta_neural=float(beta_neural)
             )
@@ -263,6 +270,7 @@ def calibrate_uot_grid(
                     )
                 per_variable[variable] = records
                 best_by_variable[variable] = choose_k(records)
+            _synchronize_device(device)
             trials.append(
                 {
                     "epsilon": float(epsilon),
@@ -270,6 +278,7 @@ def calibrate_uot_grid(
                     "coupling": coupling.tolist(),
                     "per_variable": per_variable,
                     "best_by_variable": best_by_variable,
+                    "runtime_seconds": float(perf_counter() - trial_started),
                 }
             )
     return choose_shared_uot(trials), trials

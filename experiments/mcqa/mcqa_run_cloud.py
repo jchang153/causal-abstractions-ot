@@ -8,7 +8,7 @@ from pathlib import Path
 import mcqa_run as base_run
 
 
-DEFAULT_RESOLUTION_SWEEP = "128,144,192,256,288,384,576,768"
+DEFAULT_RESOLUTION_SWEEP = "16,32,48,64,128,144,192,256,288,384,576,768"
 
 
 def _parse_csv_strings(value: str | None) -> list[str] | None:
@@ -91,9 +91,9 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.train_pool_size is None:
             args.train_pool_size = 200
         if args.calibration_pool_size is None:
-            args.calibration_pool_size = 100
+            args.calibration_pool_size = 200
         if args.test_pool_size is None:
-            args.test_pool_size = 100
+            args.test_pool_size = 200
         if args.methods is None:
             args.methods = "ot"
         if args.target_vars is None:
@@ -120,9 +120,9 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.train_pool_size is None:
             args.train_pool_size = 200
         if args.calibration_pool_size is None:
-            args.calibration_pool_size = 100
+            args.calibration_pool_size = 200
         if args.test_pool_size is None:
-            args.test_pool_size = 100
+            args.test_pool_size = 200
         if args.methods is None:
             args.methods = "ot,bruteforce"
         if args.target_vars is None:

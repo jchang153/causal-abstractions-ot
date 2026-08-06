@@ -108,7 +108,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--canonical-mask-thresholds", type=str, default="0.8,0.9")
     ap.add_argument("--pca-prefix-dims", type=str, default="1,2,4")
     ap.add_argument("--no-full-support-fallback", action="store_true")
-    ap.add_argument("--das-fit-bank-mode", type=str, default="anchored_prefix", choices=["shared", "anchored_prefix"])
+    ap.add_argument(
+        "--das-fit-bank-mode",
+        type=str,
+        default="shared",
+        choices=["shared", "anchored_prefix"],
+        help=(
+            "Fit-pair policy for DAS. Paper runs use 'shared', which gives every "
+            "variable the same complete fit bank; 'anchored_prefix' is retained "
+            "only for legacy diagnostics."
+        ),
+    )
     ap.add_argument("--das-subspace-dims", type=str, default="")
     ap.add_argument("--das-learning-rate", type=float, default=0.01)
     ap.add_argument("--das-max-epochs", type=int, default=100)
@@ -120,7 +130,7 @@ def parse_args() -> argparse.Namespace:
         "--das-train-records-per-epoch",
         type=int,
         default=0,
-        help="Maximum fit records per epoch; 0 uses the complete anchored fit bank.",
+        help="Maximum fit records per epoch; 0 uses the complete shared fit bank.",
     )
     ap.add_argument("--das-batch-size", type=int, default=64)
     ap.add_argument("--skip-das", action="store_true")
@@ -1317,6 +1327,17 @@ def _run_das_stage(
 ) -> dict[str, object]:
     _synchronize_device(device)
     start_time = time.perf_counter()
+    fit_records_by_row = {
+        row_key: _fit_records_for_row(
+            tuple(banks["fit_by_row"][row_key]),
+            row_key=row_key,
+            fit_bank_mode=str(fit_bank_mode),
+        )
+        for row_key in row_keys
+    }
+    fit_record_counts_by_row = {
+        row_key: int(len(records)) for row_key, records in fit_records_by_row.items()
+    }
     if bool(skip):
         per_row = {
             row_key: {
@@ -1332,12 +1353,15 @@ def _run_das_stage(
                 "subspace_dim": 0,
                 "lr": 0.0,
                 "lambda": 0.0,
+                "fit_record_count": int(fit_record_counts_by_row[row_key]),
             }
             for row_key in row_keys
         }
         return {
             "stage": str(stage_name),
             "runtime_seconds": float(time.perf_counter() - start_time),
+            "fit_bank_mode": str(fit_bank_mode),
+            "fit_record_counts_by_row": fit_record_counts_by_row,
             "skipped": True,
             "trials": [],
             "test": {
@@ -1355,11 +1379,7 @@ def _run_das_stage(
     test_sens = []
     test_inv = []
     for row_key in row_keys:
-        fit_records = _fit_records_for_row(
-            tuple(banks["fit_by_row"][row_key]),
-            row_key=row_key,
-            fit_bank_mode=str(fit_bank_mode),
-        )
+        fit_records = fit_records_by_row[row_key]
         row_best = None
         row_best_key = None
         for support in support_menu[row_key]:
@@ -1478,6 +1498,7 @@ def _run_das_stage(
             "subspace_dim": int(row_best["subspace_dim"]),
             "lambda": float(row_best["lambda"]),
             "lr": float(row_best["lr"]),
+            "fit_record_count": int(len(fit_records)),
         }
         calib_sens.append(float(row_best["calibration"]["sensitivity"]))
         calib_inv.append(float(row_best["calibration"]["invariance"]))
@@ -1488,6 +1509,8 @@ def _run_das_stage(
     return {
         "stage": str(stage_name),
         "runtime_seconds": float(elapsed),
+        "fit_bank_mode": str(fit_bank_mode),
+        "fit_record_counts_by_row": fit_record_counts_by_row,
         "trials": all_trials,
         "calibration": {
             "mean_sensitivity": _mean(calib_sens),
@@ -1631,7 +1654,21 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     seed_dir = out_dir / f"h{args.hidden_size}" / f"seed_{seed}"
     summary_path = seed_dir / "progressive_seed_summary.json"
     if bool(args.skip_existing) and summary_path.exists():
-        return json.loads(summary_path.read_text(encoding="utf-8"))
+        existing = json.loads(summary_path.read_text(encoding="utf-8"))
+        existing_config = existing.get("config", {}) if isinstance(existing, dict) else {}
+        expected_protocol = {
+            "das_fit_bank_mode": str(args.das_fit_bank_mode),
+            "fit_bases": int(args.fit_bases),
+            "calib_bases": int(args.calib_bases),
+            "test_bases": int(args.test_bases),
+            "source_policy": str(args.source_policy),
+            "rows": str(args.rows),
+        }
+        if isinstance(existing_config, dict) and all(
+            existing_config.get(key) == value for key, value in expected_protocol.items()
+        ):
+            return existing
+        print(f"[rebuild] {summary_path} uses a different fit/split protocol")
     seed_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")

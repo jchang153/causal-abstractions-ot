@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import random
@@ -25,6 +26,7 @@ DATASET_PATH = os.environ.get("MCQA_DATASET_PATH", "mib-bench/copycolors_mcqa")
 DATASET_NAME = os.environ.get("MCQA_DATASET_CONFIG", "4_answer_choices")
 _DATASET_CONFIG_UNSET = object()
 LAST_PIPELINE_TIMING_SECONDS: dict[str, float] = {}
+MCQA_PARTITION_PROTOCOL = "base_group_disjoint_v1"
 
 CANONICAL_ANSWER_STRINGS = (" A", " B", " C", " D")
 CANONICAL_ANSWER_LABELS = ("A", "B", "C", "D")
@@ -153,6 +155,8 @@ class MCQAPairBank:
     changed_mask: torch.Tensor
     counterfactual_family_names: list[str]
     expected_answer_texts: list[str]
+    row_ids: tuple[str, ...] = ()
+    base_group_ids: tuple[str, ...] = ()
 
     @property
     def size(self) -> int:
@@ -170,6 +174,10 @@ class MCQAPairBank:
             "changed_count": int(self.changed_mask.sum().item()),
             "changed_rate": float(self.changed_mask.float().mean().item()) if self.size else 0.0,
             "family_counts": family_counts,
+            "row_id_count": int(len(self.row_ids)),
+            "row_ids_sha256": _stable_ids_digest(self.row_ids),
+            "base_group_id_count": int(len(set(self.base_group_ids))),
+            "base_group_ids_sha256": _stable_ids_digest(set(self.base_group_ids)),
         }
 
 
@@ -302,7 +310,7 @@ def _load_counterfactual_rows(
         dataset_name = counterfactual_name.replace("_counterfactual", f"_{split}")
         counterfactual_family = counterfactual_name.replace("_counterfactual", "")
         rows: list[dict[str, object]] = []
-        for row in dataset:
+        for row_index, row in enumerate(dataset):
             base_input = parse_mcqa_example(row)
             counterfactual_row = row[counterfactual_name]
             source_input = parse_mcqa_example(counterfactual_row)
@@ -311,6 +319,10 @@ def _load_counterfactual_rows(
                     "input": base_input,
                     "counterfactual_inputs": [source_input],
                     "counterfactual_family": counterfactual_family,
+                    # All counterfactual variants derived from one factual row must
+                    # remain in the same fit/calibration/test partition.
+                    "base_row_id": f"{split}:{int(row_index)}",
+                    "pair_row_id": f"{split}:{int(row_index)}:{counterfactual_family}",
                 }
             )
         datasets[dataset_name] = rows
@@ -549,6 +561,249 @@ def _compute_row_change_masks(
     return base_outputs, source_outputs, changed_masks
 
 
+def _base_group_id(row: dict[str, object]) -> str:
+    explicit_id = row.get("base_row_id")
+    if explicit_id is not None:
+        return str(explicit_id)
+    base_input = row.get("input")
+    if not isinstance(base_input, dict):
+        raise ValueError("MCQA pair row is missing an input dictionary")
+    # Legacy/synthetic rows lack explicit IDs. The factual prompt is the stable
+    # identity shared by all of its counterfactual variants.
+    return "prompt:" + hashlib.sha256(str(base_input.get("raw_input", "")).encode("utf-8")).hexdigest()
+
+
+def _pair_row_id(row: dict[str, object]) -> str:
+    explicit_id = row.get("pair_row_id")
+    if explicit_id is not None:
+        return str(explicit_id)
+    source_inputs = row.get("counterfactual_inputs")
+    source_input = source_inputs[0] if isinstance(source_inputs, list) and source_inputs else {}
+    source_prompt = source_input.get("raw_input", "") if isinstance(source_input, dict) else ""
+    payload = "\0".join(
+        (
+            _base_group_id(row),
+            str(row.get("counterfactual_family", "")),
+            str(source_prompt),
+        )
+    )
+    return "pair:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _stable_ids_digest(values) -> str:
+    normalized = "\n".join(sorted(str(value) for value in values))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _partition_pooled_rows(
+    rows: list[dict[str, object]],
+    *,
+    causal_model: MCQACausalModel,
+    target_vars: tuple[str, ...],
+    split_seed: int,
+    train_pool_size: int | None,
+    calibration_pool_size: int | None,
+    test_pool_size: int | None,
+    pooled_total_examples: int | None,
+) -> tuple[
+    list[dict[str, object]],
+    dict[str, list[dict[str, object]]],
+    dict[str, list[dict[str, object]]],
+    dict[str, object],
+]:
+    """Partition MCQA pairs without allowing factual-row siblings to leak across splits."""
+
+    canonical_target_vars = tuple(canonicalize_target_var(target_var) for target_var in target_vars)
+    calibration_size = 0 if calibration_pool_size is None else int(calibration_pool_size)
+    test_size = 0 if test_pool_size is None else int(test_pool_size)
+    if pooled_total_examples is not None and int(pooled_total_examples) < 0:
+        raise ValueError("pooled_total_examples must be non-negative")
+    if calibration_size < 0 or test_size < 0:
+        raise ValueError("calibration_pool_size and test_pool_size must be non-negative")
+
+    shuffled_rows = list(rows)
+    random.Random(int(split_seed)).shuffle(shuffled_rows)
+    if pooled_total_examples is not None:
+        shuffled_rows = shuffled_rows[: min(int(pooled_total_examples), len(shuffled_rows))]
+    if not shuffled_rows:
+        raise ValueError("No MCQA rows found for pooled bank construction")
+
+    train_size = len(shuffled_rows) if train_pool_size is None else int(train_pool_size)
+    if train_size < 0:
+        raise ValueError("train_pool_size must be non-negative")
+    if train_size > len(shuffled_rows):
+        raise ValueError(
+            f"Requested train_pool_size={train_size}, but only {len(shuffled_rows)} "
+            "filtered MCQA rows are available"
+        )
+
+    grouped_rows: dict[str, list[dict[str, object]]] = {}
+    for row in shuffled_rows:
+        grouped_rows.setdefault(_base_group_id(row), []).append(row)
+    group_ids = list(grouped_rows)
+    random.Random(f"{int(split_seed)}:base-groups").shuffle(group_ids)
+
+    train_group_ids: list[str] = []
+    train_candidate_count = 0
+    remaining_group_ids = list(group_ids)
+    while train_candidate_count < train_size and remaining_group_ids:
+        group_id = remaining_group_ids.pop(0)
+        train_group_ids.append(group_id)
+        train_candidate_count += len(grouped_rows[group_id])
+    if train_candidate_count < train_size:
+        raise ValueError(
+            f"Could not allocate {train_size} train pairs from {len(shuffled_rows)} available rows"
+        )
+
+    train_candidates = [row for group_id in train_group_ids for row in grouped_rows[group_id]]
+    random.Random(f"{int(split_seed)}:train:shared").shuffle(train_candidates)
+    train_rows = train_candidates[:train_size]
+    if not train_rows:
+        raise ValueError("No MCQA rows found for pooled train split")
+
+    _base_outputs, _source_outputs, changed_masks = _compute_row_change_masks(shuffled_rows, causal_model)
+    changed_by_row_identity = {
+        target_var: {
+            id(row): bool(changed)
+            for row, changed in zip(shuffled_rows, changed_masks[target_var])
+        }
+        for target_var in canonical_target_vars
+    }
+
+    def sensitive_count(candidate_group_ids: list[str], target_var: str) -> int:
+        return sum(
+            int(changed_by_row_identity[target_var][id(row)])
+            for group_id in candidate_group_ids
+            for row in grouped_rows[group_id]
+        )
+
+    required_holdout_size = calibration_size + test_size
+    for target_var in canonical_target_vars:
+        available = sensitive_count(remaining_group_ids, target_var)
+        if available < required_holdout_size:
+            raise ValueError(
+                f"Requested calibration_pool_size={calibration_size} and test_pool_size={test_size} "
+                f"for target_var={target_var}, but only {available} sensitive rows are available "
+                "after globally allocating the train base groups"
+            )
+
+    calibration_group_ids: list[str] = []
+    test_group_ids: list[str] = list(remaining_group_ids)
+    if calibration_size > 0:
+        allocation_found = False
+        # Different deterministic orders avoid a calibration prefix consuming the
+        # only groups needed to satisfy one target's test quota.
+        for attempt in range(256):
+            candidate_order = list(remaining_group_ids)
+            random.Random(f"{int(split_seed)}:calibration-groups:{attempt}").shuffle(candidate_order)
+            candidate_calibration_ids: list[str] = []
+            while candidate_order and any(
+                sensitive_count(candidate_calibration_ids, target_var) < calibration_size
+                for target_var in canonical_target_vars
+            ):
+                candidate_calibration_ids.append(candidate_order.pop(0))
+            if all(
+                sensitive_count(candidate_calibration_ids, target_var) >= calibration_size
+                and sensitive_count(candidate_order, target_var) >= test_size
+                for target_var in canonical_target_vars
+            ):
+                calibration_group_ids = candidate_calibration_ids
+                test_group_ids = candidate_order
+                allocation_found = True
+                break
+        if not allocation_found:
+            raise ValueError(
+                "Could not construct base-group-disjoint MCQA calibration/test partitions "
+                "with the requested target-specific sensitive-example counts"
+            )
+
+    def select_sensitive_rows(
+        candidate_group_ids: list[str],
+        *,
+        target_var: str,
+        size: int,
+        split_name: str,
+    ) -> list[dict[str, object]]:
+        candidates = [
+            row
+            for group_id in candidate_group_ids
+            for row in grouped_rows[group_id]
+            if changed_by_row_identity[target_var][id(row)]
+        ]
+        random.Random(f"{int(split_seed)}:{split_name}:{target_var}").shuffle(candidates)
+        if len(candidates) < size:
+            raise ValueError(
+                f"Only {len(candidates)} sensitive {split_name} rows are available for "
+                f"target_var={target_var}; requested {size}"
+            )
+        return candidates[:size]
+
+    calibration_rows_by_target = {
+        target_var: select_sensitive_rows(
+            calibration_group_ids,
+            target_var=target_var,
+            size=calibration_size,
+            split_name="calibration",
+        )
+        for target_var in canonical_target_vars
+    }
+    test_rows_by_target = {
+        target_var: select_sensitive_rows(
+            test_group_ids,
+            target_var=target_var,
+            size=test_size,
+            split_name="test",
+        )
+        for target_var in canonical_target_vars
+    }
+
+    split_groups = {
+        "train": train_group_ids,
+        "calibration": calibration_group_ids,
+        "test": test_group_ids,
+    }
+    partition_metadata = {
+        "protocol": MCQA_PARTITION_PROTOCOL,
+        "split_seed": int(split_seed),
+        "source_pair_count": int(len(shuffled_rows)),
+        "source_base_group_count": int(len(grouped_rows)),
+        "requested_pair_counts": {
+            "train": int(train_size),
+            "calibration_per_target": int(calibration_size),
+            "test_per_target": int(test_size),
+        },
+        "base_groups": {
+            split_name: {
+                "count": int(len(ids)),
+                "sha256": _stable_ids_digest(ids),
+            }
+            for split_name, ids in split_groups.items()
+        },
+        "selected_pair_rows": {
+            "train": {
+                "count": int(len(train_rows)),
+                "sha256": _stable_ids_digest(_pair_row_id(row) for row in train_rows),
+            },
+            "calibration": {
+                target_var: {
+                    "count": int(len(target_rows)),
+                    "sha256": _stable_ids_digest(_pair_row_id(row) for row in target_rows),
+                }
+                for target_var, target_rows in calibration_rows_by_target.items()
+            },
+            "test": {
+                target_var: {
+                    "count": int(len(target_rows)),
+                    "sha256": _stable_ids_digest(_pair_row_id(row) for row in target_rows),
+                }
+                for target_var, target_rows in test_rows_by_target.items()
+            },
+        },
+        "discarded_train_group_siblings": int(len(train_candidates) - len(train_rows)),
+    }
+    return train_rows, calibration_rows_by_target, test_rows_by_target, partition_metadata
+
+
 def build_pair_banks(
     *,
     tokenizer,
@@ -702,6 +957,8 @@ def build_pair_banks(
                     normalize_answer_text(str(setting["raw_output"]))
                     for setting in interchange_outputs
                 ],
+                row_ids=tuple(_pair_row_id(row) for row in combined_rows),
+                base_group_ids=tuple(_base_group_id(row) for row in combined_rows),
             )
         return banks
 
@@ -715,64 +972,44 @@ def build_pair_banks(
             pooled_rows.extend(datasets_by_name[dataset_name])
     if not pooled_rows:
         raise ValueError("No MCQA rows found for pooled bank construction")
-    rng = random.Random(int(split_seed))
-    shuffled_rows = list(pooled_rows)
-    rng.shuffle(shuffled_rows)
-    if pooled_total_examples is not None:
-        shuffled_rows = shuffled_rows[: min(int(pooled_total_examples), len(shuffled_rows))]
-    total = len(shuffled_rows)
-    resolved_train_pool_size = total if train_pool_size is None else int(train_pool_size)
+    (
+        train_rows,
+        calibration_rows_by_target,
+        test_rows_by_target,
+        partition_metadata,
+    ) = _partition_pooled_rows(
+        pooled_rows,
+        causal_model=causal_model,
+        target_vars=canonical_target_vars,
+        split_seed=int(split_seed),
+        train_pool_size=train_pool_size,
+        calibration_pool_size=calibration_pool_size,
+        test_pool_size=test_pool_size,
+        pooled_total_examples=pooled_total_examples,
+    )
     resolved_calibration_pool_size = 0 if calibration_pool_size is None else int(calibration_pool_size)
     resolved_test_pool_size = 0 if test_pool_size is None else int(test_pool_size)
-    if resolved_train_pool_size < 0 or resolved_calibration_pool_size < 0 or resolved_test_pool_size < 0:
-        raise ValueError(
-            "train_pool_size, calibration_pool_size, and test_pool_size must be non-negative"
-        )
-    if resolved_train_pool_size > total:
-        raise ValueError(
-            f"Requested train_pool_size={resolved_train_pool_size}, but only {total} filtered MCQA rows are available"
-        )
-    train_rows = shuffled_rows[:resolved_train_pool_size]
-    holdout_candidate_rows = shuffled_rows[resolved_train_pool_size:]
-    if not train_rows:
-        raise ValueError("No MCQA rows found for pooled train split")
 
     # Train banks share the same raw train rows across target variables.
-    train_rng = random.Random(f"{int(split_seed)}:train:shared")
-    shared_train_rows = list(train_rows)
-    train_rng.shuffle(shared_train_rows)
     banks_by_split["train"] = {}
-    train_banks = make_bank("train", pooled_dataset_names, shared_train_rows)
+    train_banks = make_bank("train", pooled_dataset_names, train_rows)
     for target_var in canonical_target_vars:
         banks_by_split["train"][target_var] = train_banks[target_var]
 
-    # Calibration/test are target-specific and sized by number of sensitive examples.
-    _base_outputs, _source_outputs, holdout_changed_masks = _compute_row_change_masks(holdout_candidate_rows, causal_model)
+    # Calibration/test select target-sensitive rows only after assigning disjoint
+    # factual-row groups to the global partitions.
     for target_var in canonical_target_vars:
-        changed_mask = holdout_changed_masks[target_var]
-        positive_rows = [row for row, changed in zip(holdout_candidate_rows, changed_mask) if changed]
-        local_rng = random.Random(f"{int(split_seed)}:holdout:{target_var}")
-        local_rng.shuffle(positive_rows)
-        required = resolved_calibration_pool_size + resolved_test_pool_size
-        if len(positive_rows) < required:
-            raise ValueError(
-                f"Requested calibration_pool_size={resolved_calibration_pool_size} and "
-                f"test_pool_size={resolved_test_pool_size} for target_var={target_var}, "
-                f"but only {len(positive_rows)} sensitive rows are available after train allocation"
-            )
-        calibration_rows = positive_rows[:resolved_calibration_pool_size]
-        test_rows = positive_rows[resolved_calibration_pool_size:required]
         if resolved_calibration_pool_size > 0:
             banks_by_split["calibration"][target_var] = make_bank(
                 "calibration",
                 pooled_dataset_names,
-                calibration_rows,
+                calibration_rows_by_target[target_var],
             )[target_var]
         if resolved_test_pool_size > 0:
             banks_by_split["test"][target_var] = make_bank(
                 "test",
                 pooled_dataset_names,
-                test_rows,
+                test_rows_by_target[target_var],
             )[target_var]
 
     if resolved_calibration_pool_size == 0:
@@ -783,6 +1020,7 @@ def build_pair_banks(
         split: {target_var: bank.metadata() for target_var, bank in banks.items()}
         for split, banks in banks_by_split.items()
     }
+    metadata["partition"] = partition_metadata
     return banks_by_split, metadata
 
 

@@ -8,7 +8,7 @@ from time import perf_counter
 
 import mcqa_run as base_run
 from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparison
-from mcqa_experiment.data import canonicalize_target_var
+from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL, canonicalize_target_var
 from mcqa_experiment.reporting import write_text_report
 from mcqa_experiment.runtime import write_json
 
@@ -55,8 +55,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--train-pool-size", type=int, default=200)
-    parser.add_argument("--calibration-pool-size", type=int, default=100)
-    parser.add_argument("--test-pool-size", type=int, default=100)
+    parser.add_argument("--calibration-pool-size", type=int, default=200)
+    parser.add_argument("--test-pool-size", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
@@ -107,8 +107,24 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
         return None
 
 
+def _core_method_runtime_seconds(compare_payload: dict[str, object], method: str) -> float:
+    method_payloads = compare_payload.get("method_payloads", {})
+    if not isinstance(method_payloads, dict):
+        return 0.0
+    payloads = method_payloads.get(str(method), [])
+    if not isinstance(payloads, list):
+        return 0.0
+    return float(
+        sum(
+            float(payload.get("runtime_seconds", 0.0))
+            for payload in payloads
+            if isinstance(payload, dict)
+        )
+    )
+
+
 def main() -> None:
-    stage_start = perf_counter()
+    stage_wall_start = perf_counter()
     parser = _build_parser()
     args = parser.parse_args()
     results_root = Path(args.results_root)
@@ -141,8 +157,19 @@ def main() -> None:
     }
     if compare_payload is not None:
         recorded_config = compare_payload.get("config", {})
-        if not isinstance(recorded_config, dict) or any(
-            recorded_config.get(key) != value for key, value in expected_das_config.items()
+        recorded_data = compare_payload.get("data", {})
+        recorded_partition = recorded_data.get("partition", {}) if isinstance(recorded_data, dict) else {}
+        expected_partition = data_metadata.get("partition", {}) if isinstance(data_metadata, dict) else {}
+        partition_matches = (
+            isinstance(recorded_partition, dict)
+            and isinstance(expected_partition, dict)
+            and recorded_partition == expected_partition
+            and recorded_partition.get("protocol") == MCQA_PARTITION_PROTOCOL
+        )
+        if (
+            not isinstance(recorded_config, dict)
+            or any(recorded_config.get(key) != value for key, value in expected_das_config.items())
+            or not partition_matches
         ):
             print(f"[rebuild] {compare_output_path} uses legacy or mismatched DAS settings")
             compare_payload = None
@@ -174,6 +201,8 @@ def main() -> None:
                 token_position_ids=(str(args.token_position_id),),
             ),
         )
+    core_method_runtime_seconds = _core_method_runtime_seconds(compare_payload, "das")
+    stage_wall_runtime_seconds = float(perf_counter() - stage_wall_start)
     summary_payload = {
         "kind": "mcqa_plot_das_layer",
         "layer": int(args.layer),
@@ -185,7 +214,15 @@ def main() -> None:
         "compare_output_path": str(compare_output_path),
         "method_payloads": compare_payload.get("method_payloads", {}),
         "results": compare_payload.get("results", []),
-        "runtime_seconds": float(perf_counter() - stage_start),
+        "data": data_metadata,
+        "partition_protocol": MCQA_PARTITION_PROTOCOL,
+        "runtime_seconds": float(core_method_runtime_seconds),
+        "core_method_runtime_seconds": float(core_method_runtime_seconds),
+        "stage_wall_runtime_seconds": stage_wall_runtime_seconds,
+        "runtime_accounting": (
+            "sum of per-target DAS method runtimes; excludes model loading, dataset loading/filtering, "
+            "pair-bank construction, and other shared wrapper setup"
+        ),
     }
     payload_path = layer_dir / f"mcqa_plot_das_layer_layer-{int(args.layer)}_pos-{str(args.token_position_id)}_summary.json"
     write_json(payload_path, summary_payload)

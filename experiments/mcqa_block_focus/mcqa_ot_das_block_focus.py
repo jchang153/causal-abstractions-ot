@@ -27,7 +27,7 @@ DEFAULT_LAYERS = (20, 25)
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
 DEFAULT_TOKEN_POSITION_IDS = ("last_token",)
-DEFAULT_BLOCK_RESOLUTIONS = (128, 144, 192, 256, 288, 384, 576, 768)
+DEFAULT_BLOCK_RESOLUTIONS = (16, 32, 48, 64, 128, 144, 192, 256, 288, 384, 576, 768)
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_exact_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
@@ -106,11 +106,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--train-pool-size", type=int, default=200)
-    parser.add_argument("--calibration-pool-size", type=int, default=100)
-    parser.add_argument("--test-pool-size", type=int, default=100)
+    parser.add_argument("--calibration-pool-size", type=int, default=200)
+    parser.add_argument("--test-pool-size", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layers", help="Comma-separated focused layers. Default: 20,25")
-    parser.add_argument("--block-resolutions", help="Comma-separated last-token block widths. Default: 128,144,192,256,288,384,576,768")
+    parser.add_argument(
+        "--block-resolutions",
+        help=(
+            "Comma-separated last-token block widths. Default: "
+            "16,32,48,64,128,144,192,256,288,384,576,768"
+        ),
+    )
     parser.add_argument("--include-144", action="store_true", help="Append 144-d blocks to the resolution grid.")
     parser.add_argument("--ot-epsilons", help="Comma-separated OT epsilons. Default: 0.5,1,2,4")
     parser.add_argument("--support-score-slack", type=float, default=0.05)
@@ -324,7 +330,7 @@ def _format_resolution_summary(
 
 
 def main() -> None:
-    stage_start = perf_counter()
+    process_start = perf_counter()
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -368,6 +374,7 @@ def main() -> None:
     hidden_size = int(model.config.hidden_size)
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in DEFAULT_TARGET_VARS)
     token_position_ids = tuple(token_position.id for token_position in token_positions)
+    method_stage_start = perf_counter()
 
     all_payloads: list[dict[str, object]] = []
     manifest_runs: list[dict[str, object]] = []
@@ -720,7 +727,8 @@ def main() -> None:
                         "t_stageC_das_full": float(das_block_seconds),
                         "t_resolution_total_wall": float(resolution_total_seconds),
                         "t_layer_total_wall_so_far": float(perf_counter() - layer_start),
-                        "t_stage_total_wall_so_far": float(perf_counter() - stage_start),
+                        "t_stage_total_wall_so_far": float(perf_counter() - method_stage_start),
+                        "t_full_process_wall_so_far": float(perf_counter() - process_start),
                     },
                     "ot_output_paths": [
                         str(
@@ -763,6 +771,8 @@ def main() -> None:
     manifest_path = sweep_root / "layer_sweep_manifest.json"
     existing_manifest_runs = _load_existing_runs(manifest_path)
     current_payload_paths = {str(run["payload_path"]) for run in manifest_runs}
+    method_sweep_wall_seconds = float(perf_counter() - method_stage_start)
+    full_process_wall_seconds = float(perf_counter() - process_start)
     write_json(
         manifest_path,
         {
@@ -775,7 +785,12 @@ def main() -> None:
             if explicit_guided_subspace_dims is None
             else [int(dim) for dim in explicit_guided_subspace_dims],
             "context_timing_seconds": context_timing_seconds,
-            "runtime_seconds": float(perf_counter() - stage_start),
+            "runtime_definition": (
+                "method sweep only; model loading, dataset loading/filtering, and pair-bank construction are excluded"
+            ),
+            "runtime_seconds": float(method_sweep_wall_seconds),
+            "method_sweep_wall_runtime_seconds": float(method_sweep_wall_seconds),
+            "full_process_wall_runtime_seconds": float(full_process_wall_seconds),
             "runs": [
                 *[run for run in existing_manifest_runs if str(run.get("payload_path", "")) not in current_payload_paths],
                 *manifest_runs,

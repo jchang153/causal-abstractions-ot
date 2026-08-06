@@ -7,6 +7,7 @@ from pathlib import Path
 from time import perf_counter
 
 import mcqa_run as base_run
+from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL
 from mcqa_experiment.das import DASConfig, run_das_pipeline
 from mcqa_experiment.reporting import write_text_report
 from mcqa_experiment.runtime import write_json
@@ -43,8 +44,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--train-pool-size", type=int, default=200)
-    parser.add_argument("--calibration-pool-size", type=int, default=100)
-    parser.add_argument("--test-pool-size", type=int, default=100)
+    parser.add_argument("--calibration-pool-size", type=int, default=200)
+    parser.add_argument("--test-pool-size", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--native-support-path", required=True)
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
@@ -138,14 +139,22 @@ def _native_support_subspace_dims(
     return tuple(sorted(dict.fromkeys(filtered))) or (int(capped_support_total_dim),)
 
 
-def _existing_native_support_das_payload_valid(payload: dict[str, object] | None) -> bool:
+def _existing_native_support_das_payload_valid(
+    payload: dict[str, object] | None,
+    *,
+    bank_fingerprints: dict[str, object],
+) -> bool:
     if not isinstance(payload, dict):
         return False
-    return str(payload.get("support_mode")) == "selected_plot_handle"
+    return (
+        str(payload.get("support_mode")) == "selected_plot_handle"
+        and str(payload.get("partition_protocol")) == MCQA_PARTITION_PROTOCOL
+        and payload.get("bank_fingerprints") == bank_fingerprints
+    )
 
 
 def main() -> None:
-    stage_start = perf_counter()
+    stage_wall_start = perf_counter()
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -170,6 +179,12 @@ def main() -> None:
 
     _configure_base_run(args, sweep_root=sweep_root, results_timestamp=results_timestamp)
     context = base_run.build_run_context()
+    native_data = native_payload.get("data", {})
+    native_partition = native_data.get("partition", {}) if isinstance(native_data, dict) else {}
+    if native_partition != context["data_metadata"].get("partition", {}):
+        raise ValueError(
+            f"Native support payload {native_support_path} uses a different or legacy MCQA data partition"
+        )
     model = context["model"]
     tokenizer = context["tokenizer"]
     token_positions = context["token_positions"]
@@ -222,8 +237,15 @@ def main() -> None:
         )
         output_path = layer_dir / f"mcqa_plot_das_native_support_layer-{int(layer)}_{str(target_var)}.json"
         summary_path = layer_dir / f"mcqa_plot_das_native_support_layer-{int(layer)}_{str(target_var)}.txt"
+        bank_fingerprints = {
+            split_name: banks_by_split[split_name][str(target_var)].metadata().get("row_ids_sha256")
+            for split_name in ("train", "calibration", "test")
+        }
         payload = _load_json(output_path) if output_path.exists() else None
-        if not _existing_native_support_das_payload_valid(payload):
+        if not _existing_native_support_das_payload_valid(
+            payload,
+            bank_fingerprints=bank_fingerprints,
+        ):
             payload = None
         if payload is None:
             payload = run_das_pipeline(
@@ -251,6 +273,8 @@ def main() -> None:
             )
             payload["support_summary"] = filtered_summary
             payload["support_mode"] = "selected_plot_handle"
+            payload["partition_protocol"] = MCQA_PARTITION_PROTOCOL
+            payload["bank_fingerprints"] = bank_fingerprints
             payload["mask_names"] = [str(mask_name) for mask_name in mask_names]
             payload["guided_support_dim_count"] = int(args.guided_support_dim_count)
             payload["guided_subspace_dims_by_site_label"] = {
@@ -274,6 +298,9 @@ def main() -> None:
             )
         payloads_by_var[str(target_var)] = payload
 
+    core_method_runtime_seconds = float(
+        sum(float(payload.get("runtime_seconds", 0.0)) for payload in payloads_by_var.values())
+    )
     summary_payload = {
         "kind": "mcqa_plot_das_native_support",
         "layer": int(layer),
@@ -285,7 +312,15 @@ def main() -> None:
         "guided_mask_names": [str(mask_name) for mask_name in mask_names],
         "guided_support_dim_count": int(args.guided_support_dim_count),
         "payloads_by_var": payloads_by_var,
-        "runtime_seconds": float(perf_counter() - stage_start),
+        "data": context["data_metadata"],
+        "partition_protocol": MCQA_PARTITION_PROTOCOL,
+        "runtime_seconds": core_method_runtime_seconds,
+        "core_method_runtime_seconds": core_method_runtime_seconds,
+        "stage_wall_runtime_seconds": float(perf_counter() - stage_wall_start),
+        "runtime_accounting": (
+            "sum of per-target DAS method runtimes; excludes model loading, dataset loading/filtering, "
+            "pair-bank construction, support-payload loading, and other shared wrapper setup"
+        ),
     }
     payload_path = layer_dir / f"mcqa_plot_das_native_support_layer-{int(layer)}_summary.json"
     write_json(payload_path, summary_payload)

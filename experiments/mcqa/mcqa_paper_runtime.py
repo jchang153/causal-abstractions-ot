@@ -276,7 +276,8 @@ def _native_selected_width_epsilon_runtime(
             parallel_by_var[str(target_var)] = float(max(values) if values else 0.0)
         return downstream_by_var, parallel_by_var, runtime_by_layer_by_var
 
-    runtime_grid: dict[tuple[str, int, int, float], float] = {}
+    core_runtime_grid: dict[tuple[str, int, int, float], float] = {}
+    signature_setup_by_config: dict[tuple[int, int], float] = {}
     payload_paths: set[Path] = set()
     for target_var in TARGET_VARS:
         entries = rankings.get(target_var)
@@ -296,6 +297,10 @@ def _native_selected_width_epsilon_runtime(
         layer = int(payload.get("layer", -1))
         native_resolution = int(payload.get("native_resolution", payload.get("atomic_width", -1)))
         signature_setup_seconds = _signature_setup_seconds_from_payload(payload)
+        signature_setup_by_config[(layer, native_resolution)] = max(
+            _as_float(signature_setup_by_config.get((layer, native_resolution))),
+            signature_setup_seconds,
+        )
         for ot_path_str in payload.get("ot_output_paths", []):
             compare_payload = _load_json(Path(str(ot_path_str)))
             if not isinstance(compare_payload, dict):
@@ -309,24 +314,22 @@ def _native_selected_width_epsilon_runtime(
                     method_payload.get("runtime_seconds", method_payload.get("wall_runtime_seconds"))
                 )
                 method_signature_seconds = _as_float(method_payload.get("signature_prepare_runtime_seconds"))
-                runtime_grid[(target_var, layer, native_resolution, epsilon)] = float(
-                    method_runtime_seconds - method_signature_seconds + signature_setup_seconds
+                core_runtime_grid[(target_var, layer, native_resolution, epsilon)] = float(
+                    max(0.0, method_runtime_seconds - method_signature_seconds)
                 )
 
-    downstream_by_var: dict[str, float] = {}
-    parallel_by_var: dict[str, float] = {}
-    runtime_by_layer_by_var: dict[str, dict[int, float]] = {}
+    runtime_by_layer_by_var: dict[str, dict[int, float]] = {
+        str(target_var): {} for target_var in entries_by_var
+    }
+    active_targets_by_config: dict[tuple[int, int, float], set[str]] = {}
     for target_var, entry in entries_by_var.items():
         if not entry:
-            downstream_by_var[target_var] = 0.0
-            parallel_by_var[target_var] = 0.0
-            runtime_by_layer_by_var[target_var] = {}
             continue
         selected_layer = int(entry.get("layer", -1))
         selected_width = int(entry.get("native_resolution", entry.get("atomic_width", -1)))
         selected_epsilon = _as_float(entry.get("epsilon"))
-        layer_runtimes: dict[int, float] = {}
-        for (row_var, layer, native_resolution, epsilon), runtime_seconds in runtime_grid.items():
+        layer_runtimes = runtime_by_layer_by_var[str(target_var)]
+        for (row_var, layer, native_resolution, epsilon), runtime_seconds in core_runtime_grid.items():
             if str(row_var) != str(target_var):
                 continue
             if restrict_to_selected_layer and int(layer) != int(selected_layer):
@@ -336,7 +339,27 @@ def _native_selected_width_epsilon_runtime(
             if not _float_matches(epsilon, selected_epsilon):
                 continue
             layer_runtimes[int(layer)] = _as_float(layer_runtimes.get(int(layer))) + float(runtime_seconds)
-        runtime_by_layer_by_var[str(target_var)] = layer_runtimes
+            active_targets_by_config.setdefault(
+                (int(layer), int(native_resolution), float(epsilon)),
+                set(),
+            ).add(str(target_var))
+
+    # Neural-site signatures are constructed once per layer/resolution family
+    # and reused across target rows. Split that shared cost across the active
+    # variables so serial accounting includes it exactly once.
+    for (layer, native_resolution, _epsilon), active_targets in active_targets_by_config.items():
+        if not active_targets:
+            continue
+        shared_seconds = _as_float(signature_setup_by_config.get((layer, native_resolution)))
+        share = float(shared_seconds) / float(len(active_targets))
+        for target_var in active_targets:
+            layer_runtimes = runtime_by_layer_by_var.setdefault(target_var, {})
+            layer_runtimes[int(layer)] = _as_float(layer_runtimes.get(int(layer))) + share
+
+    downstream_by_var: dict[str, float] = {}
+    parallel_by_var: dict[str, float] = {}
+    for target_var in entries_by_var:
+        layer_runtimes = runtime_by_layer_by_var.get(str(target_var), {})
         values = list(layer_runtimes.values())
         downstream_by_var[str(target_var)] = float(sum(values))
         parallel_by_var[str(target_var)] = float(max(values) if values else 0.0)
@@ -413,7 +436,9 @@ def _pca_selected_config_epsilon_runtime(
     restrict_to_selected_config: bool = True,
     restrict_to_selected_epsilon: bool = True,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, dict[int, float]]]:
-    runtime_grid: dict[tuple[str, int, str, str, int, float], float] = {}
+    core_runtime_grid: dict[tuple[str, int, str, str, int, float], float] = {}
+    config_setup_runtime_grid: dict[tuple[int, str, str, int], float] = {}
+    pca_fit_runtime_by_layer: dict[int, float] = {}
     full_config_runtime_grid: dict[tuple[str, int, str, str, int], float] = {}
     payload_paths: set[Path] = set()
     for target_var in TARGET_VARS:
@@ -436,16 +461,23 @@ def _pca_selected_config_epsilon_runtime(
         site_menu = str(payload.get("site_menu"))
         num_bands = int(payload.get("num_bands", -1))
         timing_seconds = payload.get("timing_seconds", {})
-        config_setup_seconds = (
-            _as_float(payload.get("pca_fit_runtime_seconds"))
-            + _as_float(payload.get("pca_site_build_runtime_seconds"))
+        pca_fit_seconds = _as_float(payload.get("pca_fit_runtime_seconds"))
+        site_build_seconds = _as_float(payload.get("pca_site_build_runtime_seconds"))
+        if isinstance(timing_seconds, dict):
+            if pca_fit_seconds <= 0.0:
+                pca_fit_seconds = _as_float(timing_seconds.get("t_stageB_pca_fit"))
+            if site_build_seconds <= 0.0:
+                site_build_seconds = _as_float(timing_seconds.get("t_stageB_pca_site_build"))
+        pca_fit_runtime_by_layer[layer] = max(
+            _as_float(pca_fit_runtime_by_layer.get(layer)),
+            pca_fit_seconds,
         )
-        if config_setup_seconds <= 0.0 and isinstance(timing_seconds, dict):
-            config_setup_seconds = (
-                _as_float(timing_seconds.get("t_stageB_pca_fit"))
-                + _as_float(timing_seconds.get("t_stageB_pca_site_build"))
-            )
-        config_setup_seconds += _signature_setup_seconds_from_payload(payload)
+        config_key = (layer, basis_source_mode, site_menu, num_bands)
+        config_setup_seconds = site_build_seconds + _signature_setup_seconds_from_payload(payload)
+        config_setup_runtime_grid[config_key] = max(
+            _as_float(config_setup_runtime_grid.get(config_key)),
+            config_setup_seconds,
+        )
         core_runtime_by_var: dict[str, float] = {}
         for ot_path_str in payload.get("ot_output_paths", []):
             compare_payload = _load_json(Path(str(ot_path_str)))
@@ -463,12 +495,12 @@ def _pca_selected_config_epsilon_runtime(
                 core_runtime_by_var[target_var] = _as_float(core_runtime_by_var.get(target_var)) + float(
                     method_runtime_seconds - method_signature_seconds
                 )
-                runtime_grid[(target_var, layer, basis_source_mode, site_menu, num_bands, epsilon)] = float(
-                    method_runtime_seconds - method_signature_seconds + config_setup_seconds
+                core_runtime_grid[(target_var, layer, basis_source_mode, site_menu, num_bands, epsilon)] = float(
+                    max(0.0, method_runtime_seconds - method_signature_seconds)
                 )
         for target_var, core_runtime_seconds in core_runtime_by_var.items():
             full_config_runtime_grid[(target_var, layer, basis_source_mode, site_menu, num_bands)] = float(
-                config_setup_seconds + core_runtime_seconds
+                pca_fit_seconds + config_setup_seconds + core_runtime_seconds
             )
 
         if not payload.get("ot_output_paths"):
@@ -479,8 +511,8 @@ def _pca_selected_config_epsilon_runtime(
                 full_config_runtime_grid[(str(target_var), layer, basis_source_mode, site_menu, num_bands)] = float(
                     runtime_seconds
                 )
-                runtime_grid[(str(target_var), layer, basis_source_mode, site_menu, num_bands, _as_float(method_record.get("epsilon"), -1.0))] = float(
-                    runtime_seconds
+                core_runtime_grid[(str(target_var), layer, basis_source_mode, site_menu, num_bands, _as_float(method_record.get("epsilon"), -1.0))] = float(
+                    max(0.0, runtime_seconds - pca_fit_seconds - config_setup_seconds)
                 )
 
     if not bool(restrict_to_selected_epsilon):
@@ -517,22 +549,23 @@ def _pca_selected_config_epsilon_runtime(
             parallel_by_var[str(target_var)] = float(max(values) if values else 0.0)
         return downstream_by_var, parallel_by_var, runtime_by_layer_by_var
 
-    downstream_by_var: dict[str, float] = {}
-    parallel_by_var: dict[str, float] = {}
-    runtime_by_layer_by_var: dict[str, dict[int, float]] = {}
+    runtime_by_layer_by_var: dict[str, dict[int, float]] = {
+        str(target_var): {} for target_var in entries_by_var
+    }
+    active_targets_by_config: dict[tuple[int, str, str, int, float], set[str]] = {}
     for target_var, entry in entries_by_var.items():
         if not entry:
-            downstream_by_var[target_var] = 0.0
-            parallel_by_var[target_var] = 0.0
-            runtime_by_layer_by_var[target_var] = {}
             continue
+        selected_layer = int(entry.get("layer", -1))
         selected_basis = str(entry.get("basis_source_mode"))
         selected_menu = str(entry.get("site_menu"))
         selected_bands = int(entry.get("num_bands", -1))
         selected_epsilon = _as_float(entry.get("epsilon"))
-        layer_runtimes: dict[int, float] = {}
-        for (row_var, layer, basis_source_mode, site_menu, num_bands, epsilon), runtime_seconds in runtime_grid.items():
+        layer_runtimes = runtime_by_layer_by_var[str(target_var)]
+        for (row_var, layer, basis_source_mode, site_menu, num_bands, epsilon), runtime_seconds in core_runtime_grid.items():
             if str(row_var) != str(target_var):
+                continue
+            if restrict_to_selected_layer and int(layer) != int(selected_layer):
                 continue
             if restrict_to_selected_config:
                 if str(basis_source_mode) != selected_basis:
@@ -544,7 +577,37 @@ def _pca_selected_config_epsilon_runtime(
             if not _float_matches(epsilon, selected_epsilon):
                 continue
             layer_runtimes[int(layer)] = _as_float(layer_runtimes.get(int(layer))) + float(runtime_seconds)
-        runtime_by_layer_by_var[str(target_var)] = layer_runtimes
+            active_targets_by_config.setdefault(
+                (int(layer), str(basis_source_mode), str(site_menu), int(num_bands), float(epsilon)),
+                set(),
+            ).add(str(target_var))
+
+    for (layer, basis_source_mode, site_menu, num_bands, _epsilon), active_targets in active_targets_by_config.items():
+        if not active_targets:
+            continue
+        config_key = (layer, basis_source_mode, site_menu, num_bands)
+        share = _as_float(config_setup_runtime_grid.get(config_key)) / float(len(active_targets))
+        for target_var in active_targets:
+            layer_runtimes = runtime_by_layer_by_var.setdefault(target_var, {})
+            layer_runtimes[int(layer)] = _as_float(layer_runtimes.get(int(layer))) + share
+
+    # The PCA basis is fitted once per layer and reused across every band count
+    # and target row at that layer.
+    active_targets_by_layer: dict[int, set[str]] = {}
+    for (layer, _basis, _menu, _bands, _epsilon), active_targets in active_targets_by_config.items():
+        active_targets_by_layer.setdefault(int(layer), set()).update(active_targets)
+    for layer, active_targets in active_targets_by_layer.items():
+        if not active_targets:
+            continue
+        share = _as_float(pca_fit_runtime_by_layer.get(layer)) / float(len(active_targets))
+        for target_var in active_targets:
+            layer_runtimes = runtime_by_layer_by_var.setdefault(target_var, {})
+            layer_runtimes[int(layer)] = _as_float(layer_runtimes.get(int(layer))) + share
+
+    downstream_by_var: dict[str, float] = {}
+    parallel_by_var: dict[str, float] = {}
+    for target_var in entries_by_var:
+        layer_runtimes = runtime_by_layer_by_var.get(str(target_var), {})
         values = list(layer_runtimes.values())
         downstream_by_var[str(target_var)] = float(sum(values))
         parallel_by_var[str(target_var)] = float(max(values) if values else 0.0)

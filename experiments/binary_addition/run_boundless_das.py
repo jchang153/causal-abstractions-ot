@@ -120,7 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calib-bases", type=int, default=64)
     parser.add_argument("--test-bases", type=int, default=64)
     parser.add_argument("--source-policy", default=SOURCE_POLICY)
-    parser.add_argument("--fit-bank-mode", choices=("shared", "anchored_prefix"), default="anchored_prefix")
+    parser.add_argument(
+        "--fit-bank-mode",
+        choices=("shared", "anchored_prefix"),
+        default="shared",
+        help="Use 'shared' for paper runs; 'anchored_prefix' is a legacy diagnostic ablation.",
+    )
     parser.add_argument(
         "--train-records-per-epoch",
         type=int,
@@ -178,8 +183,17 @@ def main() -> None:
     for seed in seeds:
         output_path = run_dir / f"seed_{seed}.json"
         if output_path.exists() and not args.no_resume:
-            print(f"[resume] seed {seed}: {output_path}", flush=True)
-            continue
+            existing = json.loads(output_path.read_text(encoding="utf-8"))
+            if (
+                existing.get("fit_bank_mode") == str(args.fit_bank_mode)
+                and existing.get("source_policy") == str(args.source_policy)
+                and existing.get("fit_bases") == int(args.fit_bases)
+                and existing.get("calib_bases") == int(args.calib_bases)
+                and existing.get("test_bases") == int(args.test_bases)
+            ):
+                print(f"[resume] seed {seed}: {output_path}", flush=True)
+                continue
+            print(f"[rebuild] seed {seed}: incompatible fit/split protocol in {output_path}", flush=True)
         checkpoint = _checkpoint(seed, args.hidden_size)
         if not checkpoint.exists():
             raise FileNotFoundError(f"missing matched seed-{seed} checkpoint: {checkpoint}")
@@ -251,6 +265,11 @@ def main() -> None:
                     {row: tuple(rec for rec in banks["fit_by_row"][row] if not rec.is_active) for row in row_keys},
                 ),
                 "fit_record_counts_after_mode": {row: len(fit_by_row[row]) for row in row_keys},
+                "fit_bank_mode": str(args.fit_bank_mode),
+                "source_policy": str(args.source_policy),
+                "fit_bases": int(args.fit_bases),
+                "calib_bases": int(args.calib_bases),
+                "test_bases": int(args.test_bases),
             }
         )
         _atomic_json(output_path, result)

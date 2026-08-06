@@ -58,8 +58,8 @@ srun --unbuffered python experiments/mcqa/mcqa_run_cloud.py \
   --dataset-size 2000 \
   --split-seed "${SPLIT_SEED:-0}" \
   --train-pool-size "${TRAIN_POOL_SIZE:-200}" \
-  --calibration-pool-size "${CALIBRATION_POOL_SIZE:-100}" \
-  --test-pool-size "${TEST_POOL_SIZE:-100}" \
+  --calibration-pool-size "${CALIBRATION_POOL_SIZE:-200}" \
+  --test-pool-size "${TEST_POOL_SIZE:-200}" \
   --batch-size "${BATCH_SIZE:-64}" \
   --methods das \
   --target-vars "${TARGET_VARS}" \

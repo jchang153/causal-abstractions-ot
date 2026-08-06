@@ -11,6 +11,7 @@ from pathlib import Path
 import mcqa_run as base_run
 from mcqa_experiment.bdas import BoundlessDASConfig, run_boundless_das_pipeline
 from mcqa_experiment.checking import IIA_METRIC_NAME, payload_uses_unified_iia
+from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL
 from mcqa_experiment.runtime import write_json
 from mcqa_experiment.sites import enumerate_residual_sites
 
@@ -43,7 +44,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", default="google/gemma-2-2b")
     parser.add_argument("--dataset-path", default="jchang153/copycolors_mcqa")
     parser.add_argument("--dataset-config", default=None)
-    parser.add_argument("--dataset-size", type=int, default=3000)
+    parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--train-pool-size", type=int, default=200)
     parser.add_argument("--calibration-pool-size", type=int, default=200)
@@ -127,6 +128,12 @@ def main() -> None:
         if existing_result and not payload_uses_unified_iia(existing_result):
             print(f"[rebuild] {output_path} predates normalized full-vocabulary IIA")
             existing_result = {}
+        if (
+            existing_result
+            and existing_result.get("partition_protocol") != MCQA_PARTITION_PROTOCOL
+        ):
+            print(f"[rebuild] {output_path} predates {MCQA_PARTITION_PROTOCOL}")
+            existing_result = {}
         existing_config = existing_result.get("config", {}) if isinstance(existing_result, dict) else {}
         algorithm_config_matches = all(
             existing_config.get(name) == expected
@@ -153,6 +160,12 @@ def main() -> None:
             existing_result = {}
     _configure(args, run_dir, timestamp)
     context = base_run.build_run_context()
+    if existing_result:
+        existing_data = existing_result.get("data", {})
+        existing_partition = existing_data.get("partition", {}) if isinstance(existing_data, dict) else {}
+        if existing_partition != context["data_metadata"].get("partition", {}):
+            print(f"[rebuild] {output_path} uses a different MCQA data partition")
+            existing_result = {}
     model = context["model"]
     tokenizer = context["tokenizer"]
     banks_by_split = context["banks_by_split"]
@@ -230,6 +243,8 @@ def main() -> None:
                 target: list(layer_ids) for target, layer_ids in layers_by_target.items()
             },
             "target_vars": list(target_vars),
+            "data": context["data_metadata"],
+            "partition_protocol": MCQA_PARTITION_PROTOCOL,
             "payloads_by_var": payloads,
             "runtime_accounting": {
                 "shared_upstream_runtime_seconds": float(args.upstream_runtime_seconds),

@@ -1,3 +1,11 @@
+"""Generic MCQA diagnostic grid.
+
+Paper-facing transport runs should use ``mcqa_delta_hierarchical_sweep.py``:
+this broad runner evaluates every requested configuration on the test bank and
+is not a calibration-select-then-test protocol for transport hyperparameter
+sweeps. The single-resolution, final-token Full-DAS invocation remains valid.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -13,7 +21,12 @@ import torch
 
 from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparison
 import mcqa_experiment.data as mcqa_data
-from mcqa_experiment.data import build_pair_banks, canonicalize_target_var, load_filtered_mcqa_pipeline
+from mcqa_experiment.data import (
+    MCQA_PARTITION_PROTOCOL,
+    build_pair_banks,
+    canonicalize_target_var,
+    load_filtered_mcqa_pipeline,
+)
 from mcqa_experiment.ot import (
     OTConfig,
     load_prepared_alignment_artifacts,
@@ -44,8 +57,8 @@ MCQA_DATASET_CONFIG = None
 DATASET_SIZE = 2000  # Cap raw rows loaded from the dataset before factual filtering.
 SPLIT_SEED = 0
 TRAIN_POOL_SIZE = 200
-CALIBRATION_POOL_SIZE = 100
-TEST_POOL_SIZE = 100
+CALIBRATION_POOL_SIZE = 200
+TEST_POOL_SIZE = 200
 
 # Experiment
 METHODS = ["ot"]
@@ -57,7 +70,7 @@ TOKEN_POSITION_IDS = ["correct_symbol", "correct_symbol_period", "last_token"]
 
 BATCH_SIZE = 64 
 
-RESOLUTIONS = [128, 144, 192, 256, 288, 384, 576, 768]
+RESOLUTIONS = [16, 32, 48, 64, 128, 144, 192, 256, 288, 384, 576, 768]
 OT_EPSILONS = [0.5, 1.0, 2.0]
 UOT_BETA_NEURALS = [0.1, 0.3, 1.0, 3.0]
 SIGNATURE_MODES = ["family_label_delta_norm"]
@@ -246,8 +259,21 @@ def execute_run_context(*, context: dict[str, object]) -> None:
     def run_or_resume(config: CompareExperimentConfig, prepared_artifacts):
         existing_payload = _load_existing_run_payload(Path(config.output_path))
         if existing_payload is not None:
-            print(f"[resume] reusing existing output {Path(config.output_path).resolve()}")
-            return existing_payload
+            existing_data = existing_payload.get("data", {})
+            existing_partition = (
+                existing_data.get("partition", {}) if isinstance(existing_data, dict) else {}
+            )
+            if (
+                isinstance(existing_partition, dict)
+                and existing_partition.get("protocol") == MCQA_PARTITION_PROTOCOL
+                and existing_partition == data_metadata.get("partition", {})
+            ):
+                print(f"[resume] reusing existing output {Path(config.output_path).resolve()}")
+                return existing_payload
+            print(
+                f"[rebuild] {Path(config.output_path).resolve()} predates "
+                f"partition protocol {MCQA_PARTITION_PROTOCOL}"
+            )
         return run_comparison(
             model=model,
             tokenizer=tokenizer,
@@ -432,7 +458,28 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                 )
     from mcqa_experiment.runtime import write_json
 
-    write_json(OUTPUT_PATH, {"runs": all_payloads})
+    is_full_das_protocol = (
+        tuple(str(method) for method in METHODS) == ("das",)
+        and len(RESOLUTIONS) == 1
+        and RESOLUTIONS[0] is None
+        and tuple(TOKEN_POSITION_IDS or ()) == ("last_token",)
+        and len(SIGNATURE_MODES) == 1
+    )
+    write_json(
+        OUTPUT_PATH,
+        {
+            "kind": "mcqa_full_das" if is_full_das_protocol else "mcqa_diagnostic_grid",
+            "paper_eligible": bool(is_full_das_protocol),
+            "holdout_policy": (
+                "DAS selects layer/dimension on calibration and evaluates only the selected handle on test"
+                if is_full_das_protocol
+                else "test is evaluated for every requested top-level configuration"
+            ),
+            "data": data_metadata,
+            "partition_protocol": MCQA_PARTITION_PROTOCOL,
+            "runs": all_payloads,
+        },
+    )
     print(f"Wrote aggregate MCQA run payload to {OUTPUT_PATH.resolve()}")
 
 

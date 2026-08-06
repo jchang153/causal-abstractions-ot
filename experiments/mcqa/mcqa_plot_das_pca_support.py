@@ -10,6 +10,7 @@ from pathlib import Path
 from time import perf_counter
 
 import mcqa_run as base_run
+from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL
 from mcqa_experiment.pca import load_pca_basis
 from mcqa_experiment.runtime import write_json
 from mcqa_ot_pca_focus import (
@@ -77,7 +78,7 @@ def _resolve_basis_path(payload: dict[str, object], support_path: Path) -> Path:
 
 def main() -> None:
     args = _parser().parse_args()
-    stage_start = perf_counter()
+    stage_wall_start = perf_counter()
     support_payload = _load_payload(args.pca_support_path)
     support_by_var = support_payload.get("support_by_var")
     if not isinstance(support_by_var, dict):
@@ -132,6 +133,12 @@ def main() -> None:
     base_run.SIGNATURES_DIR = Path(args.signatures_dir)
 
     context = base_run.build_run_context()
+    support_data = support_payload.get("data", {})
+    support_partition = support_data.get("partition", {}) if isinstance(support_data, dict) else {}
+    if support_partition != context["data_metadata"].get("partition", {}):
+        raise ValueError(
+            f"PCA support payload {args.pca_support_path} uses a different or legacy MCQA data partition"
+        )
     model = context["model"]
     tokenizer = context["tokenizer"]
     banks_by_split = context["banks_by_split"]
@@ -191,6 +198,9 @@ def main() -> None:
         )
         for target_var in guided_payloads
     }
+    core_method_runtime_seconds = float(
+        sum(float(payload.get("runtime_seconds", 0.0)) for payload in guided_payloads.values())
+    )
     summary = {
         "kind": "mcqa_plot_das_pca_support_cached",
         "layer": layer,
@@ -207,7 +217,15 @@ def main() -> None:
         "das_search_space": "full_pca_basis",
         "localization_recomputed": False,
         "guided_output_paths": guided_output_paths,
-        "runtime_seconds": float(perf_counter() - stage_start),
+        "data": context["data_metadata"],
+        "partition_protocol": MCQA_PARTITION_PROTOCOL,
+        "runtime_seconds": core_method_runtime_seconds,
+        "core_method_runtime_seconds": core_method_runtime_seconds,
+        "stage_wall_runtime_seconds": float(perf_counter() - stage_wall_start),
+        "runtime_accounting": (
+            "sum of per-target guided DAS method runtimes; excludes model loading, dataset "
+            "loading/filtering, pair-bank construction, cached support/PCA loading, and wrapper setup"
+        ),
     }
     summary_path = layer_dir / f"mcqa_plot_das_pca_support_layer-{layer}_summary.json"
     write_json(summary_path, summary)

@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from experiments.binary_addition import run_progressive_plot as progressive
+from experiments.binary_addition.data import enumerate_all_examples, stratified_base_split
 
 
 def _stage(*, calibration: float, test: float, wall: float, sites: list[str]) -> dict[str, object]:
@@ -123,3 +124,49 @@ def test_resolution_sweep_selects_shared_epsilon_and_charges_its_full_resolution
     assert result["runtime_seconds"] >= 2.5
     assert result["resolution_results"]["1"]["sites"] == ["r1"]
     assert result["resolution_results"]["2"]["sites"] == ["r2"]
+
+
+def test_paper_addition_banks_use_identical_full_fit_pairs_for_every_variable() -> None:
+    all_examples = enumerate_all_examples(width=4)
+    split = stratified_base_split(
+        all_examples,
+        fit_count=128,
+        calib_count=64,
+        test_count=64,
+        seed=0,
+    )
+    specs = progressive._row_specs("all_endogenous", width=4)
+    banks = progressive._build_banks(
+        split,
+        specs,
+        width=4,
+        seed=0,
+        source_policy="structured_26_top3carry_c2x5_c3x7_no_random",
+        all_examples=all_examples,
+    )
+
+    def pair_keys(row_key: str) -> tuple[tuple[int, int, int, int, str], ...]:
+        records = progressive._fit_records_for_row(
+            banks["fit_by_row"][row_key],
+            row_key=row_key,
+            fit_bank_mode="shared",
+        )
+        return tuple(
+            (record.base.a, record.base.b, record.source.a, record.source.b, record.family)
+            for record in records
+        )
+
+    reference = pair_keys("C1")
+    assert len(reference) == 3328
+    for spec in specs:
+        assert pair_keys(spec.key) == reference
+        assert (
+            len(banks["calib_positive_by_row"][spec.key])
+            + len(banks["calib_invariant_by_row"][spec.key])
+            == 1664
+        )
+        assert (
+            len(banks["test_positive_by_row"][spec.key])
+            + len(banks["test_invariant_by_row"][spec.key])
+            == 1664
+        )

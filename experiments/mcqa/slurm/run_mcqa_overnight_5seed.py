@@ -62,8 +62,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--seeds", default="0,1,2,3,4")
     parser.add_argument("--train-pool-size", type=int, default=200)
-    parser.add_argument("--calibration-pool-size", type=int, default=100)
-    parser.add_argument("--test-pool-size", type=int, default=100)
+    parser.add_argument("--calibration-pool-size", type=int, default=200)
+    parser.add_argument("--test-pool-size", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--results-root", default="results")
     parser.add_argument("--run-prefix", default=None)
@@ -91,7 +91,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-b-top-layers-per-var", type=int, default=3)
     parser.add_argument("--stage-b-neighbor-radius", type=int, default=0)
     parser.add_argument("--stage-b-max-layers-per-var", type=int, default=3)
-    parser.add_argument("--native-resolutions", default="128,144,192,256,288,384,576,768")
+    parser.add_argument(
+        "--native-resolutions",
+        default="16,32,48,64,128,144,192,256,288,384,576,768",
+    )
     parser.add_argument("--pca-site-menus", default="partition")
     parser.add_argument("--pca-basis-source-modes", default="all_variants")
     parser.add_argument("--pca-num-bands-values", default="8,16")

@@ -9,10 +9,15 @@ from pathlib import Path
 from time import perf_counter
 
 import mcqa_run as base_run
+from mcqa_paper_runtime import _pca_selected_config_epsilon_runtime
 import torch
 from mcqa_experiment.checking import payload_uses_unified_iia
 from mcqa_experiment.das import DASConfig, run_das_pipeline
-from mcqa_experiment.data import COUNTERFACTUAL_FAMILIES, canonicalize_target_var
+from mcqa_experiment.data import (
+    COUNTERFACTUAL_FAMILIES,
+    MCQA_PARTITION_PROTOCOL,
+    canonicalize_target_var,
+)
 from mcqa_experiment.ot import (
     OTConfig,
     adjust_runtime_for_cached_signatures,
@@ -147,8 +152,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--train-pool-size", type=int, default=200)
-    parser.add_argument("--calibration-pool-size", type=int, default=100)
-    parser.add_argument("--test-pool-size", type=int, default=100)
+    parser.add_argument("--calibration-pool-size", type=int, default=200)
+    parser.add_argument("--test-pool-size", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layers", help="Comma-separated focused layers. Default: 20,25")
     parser.add_argument(
@@ -203,7 +208,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--write-epsilon-artifacts",
         action="store_true",
-        help="Write per-epsilon PCA OT JSON/TXT artifacts. Disabled by default to reduce disk use.",
+        help=(
+            "Also write per-epsilon PCA OT text summaries. Compact per-epsilon JSON records are always "
+            "kept because global epsilon selection and runtime auditing depend on them."
+        ),
     )
     parser.add_argument(
         "--write-support-artifact",
@@ -280,6 +288,7 @@ def _compare_payload_matches_target_vars(
     payload: dict[str, object] | None,
     expected_target_vars: tuple[str, ...],
     expected_transport_target_vars: tuple[str, ...],
+    expected_partition: dict[str, object],
 ) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -293,8 +302,16 @@ def _compare_payload_matches_target_vars(
     actual_transport_target_vars = payload.get("transport_target_vars")
     if not isinstance(actual_transport_target_vars, list):
         return False
-    return tuple(str(target_var) for target_var in actual_transport_target_vars) == tuple(
+    transport_matches = tuple(str(target_var) for target_var in actual_transport_target_vars) == tuple(
         str(target_var) for target_var in expected_transport_target_vars
+    )
+    data = payload.get("data", {})
+    partition = data.get("partition", {}) if isinstance(data, dict) else {}
+    return (
+        transport_matches
+        and isinstance(partition, dict)
+        and partition == expected_partition
+        and partition.get("protocol") == MCQA_PARTITION_PROTOCOL
     )
 
 
@@ -357,41 +374,52 @@ def _unique_prompt_records_for_all_variants(
     token_position,
     tokenizer,
 ) -> list[dict[str, object]]:
-    grouped_rows: dict[str, dict[str, object]] = {}
-    for row in filtered_datasets.get("train", []):
-        base_input = row.get("input")
-        if not isinstance(base_input, dict):
-            continue
+    bank_group_ids = tuple(str(group_id) for group_id in getattr(train_bank, "base_group_ids", ()))
+    use_explicit_group_ids = len(bank_group_ids) == len(train_bank.base_inputs) and bool(bank_group_ids)
+    ordered_base_keys: list[str] = []
+    fallback_base_by_key: dict[str, dict[str, object]] = {}
+    seen_base_keys: set[str] = set()
+    for index, base_input in enumerate(train_bank.base_inputs):
         base_prompt = str(base_input.get("raw_input", ""))
-        if not base_prompt:
-            continue
-        family = str(row.get("counterfactual_family", ""))
-        entry = grouped_rows.setdefault(base_prompt, {"base_input": base_input, "family_sources": {}})
-        if isinstance(row.get("counterfactual_inputs"), list) and row["counterfactual_inputs"]:
-            entry["family_sources"][family] = row["counterfactual_inputs"][0]
+        base_key = bank_group_ids[index] if use_explicit_group_ids else f"prompt:{base_prompt}"
+        if base_key and base_key not in seen_base_keys:
+            seen_base_keys.add(base_key)
+            ordered_base_keys.append(base_key)
+            fallback_base_by_key[base_key] = base_input
 
-    ordered_base_prompts: list[str] = []
-    seen_base_prompts: set[str] = set()
-    for base_input in train_bank.base_inputs:
-        base_prompt = str(base_input.get("raw_input", ""))
-        if base_prompt and base_prompt not in seen_base_prompts:
-            seen_base_prompts.add(base_prompt)
-            ordered_base_prompts.append(base_prompt)
+    # Loader keys are family_split (for example answerPosition_train), not
+    # simply "train". Restrict recovery to factual groups already assigned to
+    # the fit bank so PCA cannot draw prompts from calibration or test groups.
+    grouped_rows: dict[str, dict[str, object]] = {}
+    for dataset_rows in filtered_datasets.values():
+        for row in dataset_rows:
+            base_input = row.get("input")
+            if not isinstance(base_input, dict):
+                continue
+            base_prompt = str(base_input.get("raw_input", ""))
+            explicit_group_id = row.get("base_row_id")
+            base_key = (
+                str(explicit_group_id)
+                if use_explicit_group_ids and explicit_group_id is not None
+                else f"prompt:{base_prompt}"
+            )
+            if base_key not in seen_base_keys:
+                continue
+            family = str(row.get("counterfactual_family", ""))
+            entry = grouped_rows.setdefault(
+                base_key,
+                {"base_input": base_input, "family_sources": {}},
+            )
+            if isinstance(row.get("counterfactual_inputs"), list) and row["counterfactual_inputs"]:
+                entry["family_sources"][family] = row["counterfactual_inputs"][0]
 
     prompt_records: list[dict[str, object]] = []
     seen_prompt_strings: set[str] = set()
-    for base_prompt in ordered_base_prompts:
-        grouped = grouped_rows.get(base_prompt)
+    for base_key in ordered_base_keys:
+        grouped = grouped_rows.get(base_key)
         base_input = grouped.get("base_input") if isinstance(grouped, dict) else None
         if not isinstance(base_input, dict):
-            base_input = next(
-                (
-                    candidate
-                    for candidate in train_bank.base_inputs
-                    if str(candidate.get("raw_input", "")) == base_prompt
-                ),
-                None,
-            )
+            base_input = fallback_base_by_key.get(base_key)
         if isinstance(base_input, dict):
             prompt_string = str(base_input.get("raw_input", ""))
             if prompt_string and prompt_string not in seen_prompt_strings:
@@ -588,6 +616,7 @@ def _basis_metadata(
         "rank": int(basis.rank),
         "hidden_size": int(basis.hidden_size),
         "num_fit_states": int(basis.num_fit_states),
+        "fit_runtime_seconds": float(basis.fit_runtime_seconds),
         "path": str(basis_path),
         "fit_prompt_record_count": 0 if prompt_records is None else len(prompt_records),
     }
@@ -817,7 +846,14 @@ def _run_pca_das_from_support(
             f"mcqa_layer-{int(layer)}_pos-{str(token_position_id)}_pca-{site_catalog_tag}"
             f"_basis-{str(basis_source_mode)}_sig-{str(signature_mode)}_{str(target_var)}_{method_suffix}.txt"
         )
+        bank_fingerprints = {
+            split_name: banks_by_split[split_name][target_var].metadata().get("row_ids_sha256")
+            for split_name in ("train", "calibration", "test")
+        }
         payload = _load_existing_payload(output_path)
+        if payload is not None and payload.get("bank_fingerprints") != bank_fingerprints:
+            print(f"[rebuild] {output_path} uses a different MCQA data partition")
+            payload = None
         if payload is not None and full_pca_basis:
             dimension_hint = payload.get("dimension_hint", {})
             expected_effective_dim = (
@@ -868,6 +904,7 @@ def _run_pca_das_from_support(
                 "restarts": max(1, int(restarts)),
                 "plateau_patience": int(plateau_patience),
             }
+            payload["bank_fingerprints"] = bank_fingerprints
             write_json(output_path, payload)
             _write_das_text_report(
                 summary_path,
@@ -1106,16 +1143,16 @@ def _run_pca_band(
         )
         output_path = layer_dir / f"{output_stem}.json"
         summary_path = layer_dir / f"{output_stem}.txt"
-        compare_payload = _load_existing_payload(output_path) if bool(args.write_epsilon_artifacts) else None
-        if bool(args.write_epsilon_artifacts):
-            if not _compare_payload_matches_target_vars(
-                payload=compare_payload,
-                expected_target_vars=target_vars,
-                expected_transport_target_vars=transport_target_vars,
-            ):
-                compare_payload = None
-            if isinstance(compare_payload, dict) and bool(compare_payload.get("test_evaluated", True)) != bool(evaluate_test):
-                compare_payload = None
+        compare_payload = _load_existing_payload(output_path)
+        if not _compare_payload_matches_target_vars(
+            payload=compare_payload,
+            expected_target_vars=target_vars,
+            expected_transport_target_vars=transport_target_vars,
+            expected_partition=data_metadata["partition"],
+        ):
+            compare_payload = None
+        if isinstance(compare_payload, dict) and bool(compare_payload.get("test_evaluated", True)) != bool(evaluate_test):
+            compare_payload = None
         if compare_payload is None:
             ot_config = OTConfig(
                 method=alignment_method,
@@ -1204,8 +1241,8 @@ def _run_pca_band(
             if _method_uses_epsilon(alignment_method):
                 compare_payload["ot_epsilon"] = float(epsilon)
             compare_payload = _compact_compare_payload(compare_payload)
+            write_json(output_path, compare_payload)
             if bool(args.write_epsilon_artifacts):
-                write_json(output_path, compare_payload)
                 _write_epsilon_summary(summary_path, payload=compare_payload, alignment_method=alignment_method)
         else:
             compare_payload = _compact_compare_payload(compare_payload)
@@ -1393,6 +1430,8 @@ def _run_pca_band(
         "support_score_slack": float(args.support_score_slack),
         "support_extraction_mode": "selected_only",
         "support_by_var": support_by_var,
+        "data": data_metadata,
+        "partition_protocol": MCQA_PARTITION_PROTOCOL,
         "method_by_var": best_ot_by_var,
         "test_evaluated": bool(evaluate_test),
         "screen_mask_names": [str(mask_name) for mask_name in screen_mask_names],
@@ -1452,7 +1491,6 @@ def _run_pca_band(
                 )
             )
             for epsilon in effective_ot_epsilons
-            if bool(args.write_epsilon_artifacts)
         ],
         "summary_path": str(layer_summary_path),
     }
@@ -1481,6 +1519,8 @@ def _run_pca_band(
             "support_path": None if support_path is None else str(support_path),
             "guided_mask_names": [str(mask_name) for mask_name in guided_mask_names],
             "support_extraction_mode": "selected_only",
+            "data": data_metadata,
+            "partition_protocol": MCQA_PARTITION_PROTOCOL,
             "guided_output_paths": plot_support_payload["guided_output_paths"],
             "screen_output_paths": plot_support_payload["screen_output_paths"],
             "guided_das_enabled": bool(args.guided_das),
@@ -1521,7 +1561,7 @@ def _run_pca_band(
 
 
 def main() -> None:
-    stage_start = perf_counter()
+    process_start = perf_counter()
     parser = _build_parser()
     args = parser.parse_args()
     requested_basis_source_mode = str(args.basis_source_mode)
@@ -1583,6 +1623,7 @@ def main() -> None:
     selected_token_position = token_position_by_id.get(str(args.token_position_id))
     if selected_token_position is None:
         raise ValueError(f"Unknown token_position_id {args.token_position_id!r}")
+    method_stage_start = perf_counter()
 
     manifest_runs: list[dict[str, object]] = []
     calibration_run_specs: list[dict[str, object]] = []
@@ -1606,16 +1647,19 @@ def main() -> None:
         layer_dir = sweep_root / f"layer_{int(layer):02d}"
         layer_dir.mkdir(parents=True, exist_ok=True)
 
-        basis_path = layer_dir / (
-            f"mcqa_layer-{int(layer)}_{str(args.token_position_id)}_basis-{str(args.basis_source_mode)}_pca_basis.pt"
-        )
-        prompt_records = None
         pca_fit_start = perf_counter()
         prompt_records = _unique_prompt_records_for_all_variants(
             train_bank=fit_bank_for_basis,
             filtered_datasets=filtered_datasets,
             token_position=selected_token_position,
             tokenizer=tokenizer,
+        )
+        prompt_records_digest = hashlib.sha256(
+            json.dumps(prompt_records, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        basis_path = layer_dir / (
+            f"mcqa_layer-{int(layer)}_{str(args.token_position_id)}"
+            f"_basis-{str(args.basis_source_mode)}_fit-{prompt_records_digest[:12]}_pca_basis.pt"
         )
         basis = load_or_fit_pca_basis_from_prompt_records(
             path=basis_path,
@@ -1629,12 +1673,13 @@ def main() -> None:
             basis_id=f"L{int(layer)}:{str(args.token_position_id)}:pca-{str(args.basis_source_mode)}",
         )
         _synchronize_if_cuda(device)
-        pca_fit_seconds = float(perf_counter() - pca_fit_start)
+        pca_fit_wall_seconds = float(perf_counter() - pca_fit_start)
+        pca_fit_seconds = float(basis.fit_runtime_seconds or pca_fit_wall_seconds)
         for target_var in target_vars:
             for num_bands in num_bands_values:
                 run_spec = {
                     "args": args,
-                    "stage_start": stage_start,
+                    "stage_start": method_stage_start,
                     "context_timing_seconds": context_timing_seconds,
                     "model": model,
                     "tokenizer": tokenizer,
@@ -1748,19 +1793,92 @@ def main() -> None:
         payload = _load_existing_payload(payload_path)
         if not isinstance(payload, dict):
             continue
+        target_var = str(payload["target_vars"][0])
+        runtime_entry = {
+            "variable": target_var,
+            "layer": int(payload["layer"]),
+            "basis_source_mode": str(payload["basis_source_mode"]),
+            "site_menu": str(payload["site_menu"]),
+            "num_bands": int(payload["num_bands"]),
+            "epsilon": selected_epsilon,
+            "payload_path": str(payload_path),
+        }
+        selected_runtime, _, _ = _pca_selected_config_epsilon_runtime(
+            rankings={target_var: [runtime_entry]},
+            entries_by_var={target_var: runtime_entry},
+            restrict_to_selected_config=True,
+            restrict_to_selected_epsilon=True,
+        )
+        full_epsilon_sweep_runtime_seconds = float(payload.get("runtime_seconds", 0.0))
+        payload["full_epsilon_sweep_runtime_seconds"] = full_epsilon_sweep_runtime_seconds
+        payload["runtime_seconds"] = float(selected_runtime.get(target_var, 0.0))
+        payload["localization_runtime_seconds"] = float(selected_runtime.get(target_var, 0.0))
+        payload["runtime_accounting"] = (
+            "this PCA configuration at the selected global epsilon, including PCA fit and recorded "
+            "signature construction; other epsilons and shared model/data preparation are excluded"
+        )
         payload["selected_global_epsilon"] = selected_epsilon
         payload["epsilon_selection_rule"] = global_selection["selection_rule"]
         payload["epsilon_calibration_plans"] = serializable_plans
         payload["selected_for_test"] = bool(spec_index in selected_spec_indices)
         payload["test_evaluated"] = bool(spec_index in selected_spec_indices)
         write_json(payload_path, payload)
+        manifest_record = run["record"]
+        manifest_record["plot_full_epsilon_sweep_runtime_seconds"] = full_epsilon_sweep_runtime_seconds
+        manifest_record["plot_selected_epsilon_runtime_seconds"] = float(
+            selected_runtime.get(target_var, 0.0)
+        )
+        if not bool(args.screen_das or args.guided_das):
+            manifest_record["runtime_seconds"] = float(selected_runtime.get(target_var, 0.0))
+            manifest_record["runtime_definition"] = (
+                "this PCA configuration at the selected global epsilon"
+            )
     manifest_path = sweep_root / "layer_sweep_manifest.json"
     existing_manifest_runs = _load_existing_runs(manifest_path)
     current_payload_paths = {str(run["payload_path"]) for run in manifest_runs}
+    method_sweep_wall_seconds = float(perf_counter() - method_stage_start)
+    full_process_wall_seconds = float(perf_counter() - process_start)
+    runtime_rankings: dict[str, list[dict[str, object]]] = {
+        str(target_var): [] for target_var in transport_target_vars
+    }
+    for run in manifest_runs:
+        support_payload_path = Path(str(run["plot_support_payload_path"]))
+        support_payload = _load_existing_payload(support_payload_path)
+        if not isinstance(support_payload, dict):
+            raise ValueError(f"Missing PCA support runtime payload at {support_payload_path}")
+        for target_var in support_payload.get("target_vars", []):
+            target_var = str(target_var)
+            if target_var not in runtime_rankings:
+                continue
+            runtime_rankings[target_var].append(
+                {
+                    "variable": target_var,
+                    "layer": int(support_payload["layer"]),
+                    "basis_source_mode": str(support_payload["basis_source_mode"]),
+                    "site_menu": str(support_payload["site_menu"]),
+                    "num_bands": int(support_payload["num_bands"]),
+                    "epsilon": float(selected_epsilon),
+                    "payload_path": str(support_payload_path),
+                }
+            )
+    runtime_entries = {
+        target_var: (entries[0] if entries else None)
+        for target_var, entries in runtime_rankings.items()
+    }
+    selected_runtime_by_target, selected_parallel_by_target, _ = _pca_selected_config_epsilon_runtime(
+        rankings=runtime_rankings,
+        entries_by_var=runtime_entries,
+        restrict_to_selected_config=False,
+        restrict_to_selected_epsilon=True,
+    )
+    selected_serial_runtime_seconds = float(sum(selected_runtime_by_target.values()))
+    selected_parallel_runtime_seconds = float(max(selected_parallel_by_target.values(), default=0.0))
     write_json(
         manifest_path,
         {
             "kind": "mcqa_ot_pca_focus",
+            "data": data_metadata,
+            "partition_protocol": MCQA_PARTITION_PROTOCOL,
             "layers": [int(layer) for layer in layers],
             "token_position_id": str(args.token_position_id),
             "site_menu": str(args.site_menu),
@@ -1780,7 +1898,17 @@ def main() -> None:
             "selected_global_epsilon": selected_epsilon,
             "epsilon_selection_rule": global_selection["selection_rule"],
             "epsilon_calibration_plans": serializable_plans,
-            "runtime_seconds": float(perf_counter() - stage_start),
+            "runtime_definition": (
+                "selected global epsilon across every PCA support configuration, including one PCA fit per layer, "
+                "recorded signature construction, and selected-only test evaluation; other epsilons and shared "
+                "model/data preparation are excluded"
+            ),
+            "runtime_seconds": selected_serial_runtime_seconds,
+            "serial_runtime_seconds": selected_serial_runtime_seconds,
+            "parallel_runtime_seconds": selected_parallel_runtime_seconds,
+            "runtime_seconds_by_target": selected_runtime_by_target,
+            "method_sweep_wall_runtime_seconds": float(method_sweep_wall_seconds),
+            "full_process_wall_runtime_seconds": float(full_process_wall_seconds),
             "runs": [
                 *[run for run in existing_manifest_runs if str(run.get("payload_path", "")) not in current_payload_paths],
                 *manifest_runs,
@@ -1793,6 +1921,8 @@ def main() -> None:
         aggregate_path,
         {
             "kind": "mcqa_ot_pca_focus",
+            "data": data_metadata,
+            "partition_protocol": MCQA_PARTITION_PROTOCOL,
             "runs": [
                 *[
                     run

@@ -13,6 +13,7 @@ from typing import Iterable
 
 from mcqa_paper_runtime import write_paper_runtime_summary
 from mcqa_experiment.checking import payload_uses_unified_iia
+from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL
 from mcqa_experiment.selection import select_shared_epsilon
 
 
@@ -56,7 +57,7 @@ DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
 DEFAULT_GUIDED_SUPPORT_DIM_COUNT = 10
 DEFAULT_DIM_HINT_SCALE_FACTORS = (0.5, 0.75, 1.0, 1.5, 2.0)
-DEFAULT_NATIVE_RESOLUTIONS = [128, 144, 192, 256, 288, 384, 576, 768]
+DEFAULT_NATIVE_RESOLUTIONS = [16, 32, 48, 64, 128, 144, 192, 256, 288, 384, 576, 768]
 DEFAULT_DAS_SUBSPACE_DIMS = (
     32,
     64,
@@ -314,7 +315,22 @@ def _stage_output_is_valid(path: Path) -> bool:
         payload = _load_json(path)
     except Exception:
         return False
-    return isinstance(payload, (dict, list)) and payload_uses_unified_iia(payload)
+    if not isinstance(payload, (dict, list)) or not payload_uses_unified_iia(payload):
+        return False
+    partitioned_kinds = {
+        "mcqa_plot_layer",
+        "mcqa_plot_native_support",
+        "mcqa_plot_native_support_layer",
+        "mcqa_ot_pca_focus",
+        "mcqa_plot_pca_support_layer",
+        "mcqa_plot_das_layer",
+        "mcqa_plot_das_native_support",
+        "mcqa_plot_das_pca_support_cached",
+        "mcqa_plot_das_pca_support_layer",
+    }
+    if isinstance(payload, dict) and str(payload.get("kind")) in partitioned_kinds:
+        return payload.get("partition_protocol") == MCQA_PARTITION_PROTOCOL
+    return True
 
 
 def _resolve_num_layers(model_name: str) -> int:
@@ -341,8 +357,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--train-pool-size", type=int, default=200)
-    parser.add_argument("--calibration-pool-size", type=int, default=100)
-    parser.add_argument("--test-pool-size", type=int, default=100)
+    parser.add_argument("--calibration-pool-size", type=int, default=200)
+    parser.add_argument("--test-pool-size", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--results-root", default="results")
     parser.add_argument("--results-timestamp")
@@ -1786,7 +1802,7 @@ def _extract_layer_das_rankings(*, payload_paths: Iterable[Path]) -> dict[str, l
         if not isinstance(payload, dict) or str(payload.get("kind")) != "mcqa_plot_das_layer":
             continue
         layer = int(payload.get("layer"))
-        runtime_seconds = float(payload.get("runtime_seconds", 0.0))
+        wrapper_runtime_seconds = float(payload.get("runtime_seconds", 0.0))
         method_payloads = payload.get("method_payloads", {}).get("das", [])
         for method_payload in method_payloads:
             if not isinstance(method_payload, dict):
@@ -1805,7 +1821,9 @@ def _extract_layer_das_rankings(*, payload_paths: Iterable[Path]) -> dict[str, l
                     "site_label": result.get("site_label"),
                     "subspace_dim": result.get("subspace_dim"),
                     "site_total_dim": result.get("site_total_dim"),
-                    "runtime_seconds": float(runtime_seconds),
+                    "runtime_seconds": float(
+                        method_payload.get("runtime_seconds", wrapper_runtime_seconds)
+                    ),
                 }
             )
     for target_var in list(rankings):
@@ -1904,7 +1922,9 @@ def _extract_dimension_das_rankings(
                     "site_label": result.get("site_label"),
                     "subspace_dim": result.get("subspace_dim"),
                     "site_total_dim": result.get("site_total_dim"),
-                    "runtime_seconds": float(payload.get("runtime_seconds", 0.0)),
+                    "runtime_seconds": float(
+                        method_payload.get("runtime_seconds", payload.get("runtime_seconds", 0.0))
+                    ),
                     "payload_path": str(payload_path),
                     "native_support_payload_path": metadata.get("payload_path"),
                     "dim_hint_effective_dim": metadata.get("dim_hint_effective_dim"),

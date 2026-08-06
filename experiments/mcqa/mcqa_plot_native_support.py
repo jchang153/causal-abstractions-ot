@@ -10,7 +10,7 @@ import mcqa_run as base_run
 import torch
 from mcqa_experiment.checking import payload_uses_unified_iia
 from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparison
-from mcqa_experiment.data import canonicalize_target_var
+from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL, canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
     adjust_runtime_for_cached_signatures,
@@ -29,7 +29,7 @@ from mcqa_experiment.support import extract_ordered_site_support
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
 DEFAULT_TOKEN_POSITION_ID = "last_token"
-DEFAULT_NATIVE_RESOLUTIONS = [128, 144, 192, 256, 288, 384, 576, 768]
+DEFAULT_NATIVE_RESOLUTIONS = [16, 32, 48, 64, 128, 144, 192, 256, 288, 384, 576, 768]
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
 DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_iia_acc"
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
@@ -112,8 +112,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--train-pool-size", type=int, default=200)
-    parser.add_argument("--calibration-pool-size", type=int, default=100)
-    parser.add_argument("--test-pool-size", type=int, default=100)
+    parser.add_argument("--calibration-pool-size", type=int, default=200)
+    parser.add_argument("--test-pool-size", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--layers", required=True, help="Comma-separated focused layers.")
     parser.add_argument(
@@ -191,6 +191,7 @@ def _compare_payload_matches_target_vars(
     payload: dict[str, object] | None,
     expected_target_vars: tuple[str, ...],
     expected_transport_target_vars: tuple[str, ...],
+    expected_partition: dict[str, object],
 ) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -204,8 +205,16 @@ def _compare_payload_matches_target_vars(
     actual_transport_target_vars = payload.get("ot_source_target_vars", payload.get("transport_target_vars"))
     if not isinstance(actual_transport_target_vars, list):
         return False
-    return tuple(str(target_var) for target_var in actual_transport_target_vars) == tuple(
+    transport_matches = tuple(str(target_var) for target_var in actual_transport_target_vars) == tuple(
         str(target_var) for target_var in expected_transport_target_vars
+    )
+    data = payload.get("data", {})
+    partition = data.get("partition", {}) if isinstance(data, dict) else {}
+    return (
+        transport_matches
+        and isinstance(partition, dict)
+        and partition == expected_partition
+        and partition.get("protocol") == MCQA_PARTITION_PROTOCOL
     )
 
 
@@ -266,6 +275,79 @@ def _best_alignment_method_payloads(
     return best_records_by_var, best_method_payload_by_var
 
 
+def _selected_epsilon_runtime_by_target(
+    payloads: list[dict[str, object]],
+    *,
+    method: str,
+    selected_epsilon: float,
+) -> dict[str, float]:
+    """Charge one selected epsilon at every native resolution, never the epsilon sweep."""
+
+    method = _canonical_alignment_method(method)
+    totals: dict[str, float] = {}
+    signature_setup_by_config: dict[tuple[int, int], float] = {}
+    active_targets_by_config: dict[tuple[int, int], set[str]] = {}
+    for payload in payloads:
+        target_vars = payload.get("target_vars", [])
+        if not isinstance(target_vars, list) or len(target_vars) != 1:
+            continue
+        target_var = str(target_vars[0])
+        config_key = (int(payload.get("layer", -1)), int(payload.get("native_resolution", -1)))
+        selected_method_payload: dict[str, object] | None = None
+        for output_path in payload.get("ot_output_paths", []):
+            compare_payload = _load_existing_payload(Path(str(output_path)))
+            if not isinstance(compare_payload, dict):
+                continue
+            if _method_uses_epsilon(method):
+                recorded_epsilon = compare_payload.get("ot_epsilon")
+                if recorded_epsilon is None or abs(
+                    float(recorded_epsilon) - float(selected_epsilon)
+                ) > 1e-9:
+                    continue
+            method_payloads = compare_payload.get("method_payloads", {})
+            candidates = method_payloads.get(method, []) if isinstance(method_payloads, dict) else []
+            selected_method_payload = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if isinstance(candidate, dict) and str(candidate.get("target_var")) == target_var
+                ),
+                None,
+            )
+            if selected_method_payload is not None:
+                break
+        if selected_method_payload is None:
+            raise ValueError(
+                f"Missing {method} runtime for target={target_var} at selected epsilon={selected_epsilon:g} "
+                f"in native payload {payload.get('payload_path')}"
+            )
+        method_seconds = float(
+            selected_method_payload.get(
+                "runtime_seconds",
+                selected_method_payload.get("wall_runtime_seconds", 0.0),
+            )
+        )
+        embedded_signature_seconds = float(
+            selected_method_payload.get("signature_prepare_runtime_seconds", 0.0)
+        )
+        recorded_signature_seconds = float(payload.get("signature_prepare_runtime_seconds", 0.0))
+        totals[target_var] = totals.get(target_var, 0.0) + max(
+            0.0,
+            method_seconds - embedded_signature_seconds,
+        )
+        signature_setup_by_config[config_key] = max(
+            signature_setup_by_config.get(config_key, 0.0),
+            recorded_signature_seconds,
+        )
+        active_targets_by_config.setdefault(config_key, set()).add(target_var)
+    for config_key, active_targets in active_targets_by_config.items():
+        shared_seconds = signature_setup_by_config.get(config_key, 0.0)
+        share = float(shared_seconds) / float(len(active_targets))
+        for target_var in active_targets:
+            totals[target_var] = totals.get(target_var, 0.0) + share
+    return totals
+
+
 def _format_summary(
     *,
     layer: int,
@@ -308,7 +390,7 @@ def _format_summary(
 
 
 def main() -> None:
-    stage_start = perf_counter()
+    process_start = perf_counter()
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -345,6 +427,7 @@ def main() -> None:
     )
     token_position_ids = tuple(token_position.id for token_position in token_positions)
     hidden_size = int(model.config.hidden_size)
+    method_stage_start = perf_counter()
 
     print(
         f"[stageB native] start layers={list(int(layer) for layer in layers)} "
@@ -518,6 +601,7 @@ def main() -> None:
                         payload=compare_payload,
                         expected_target_vars=target_vars,
                         expected_transport_target_vars=transport_target_vars,
+                        expected_partition=data_metadata["partition"],
                     ):
                         compare_payload = None
                     if isinstance(compare_payload, dict) and bool(compare_payload.get("test_evaluated", True)):
@@ -649,6 +733,8 @@ def main() -> None:
                     "site_labels": [site.label for site in sites],
                     "support_path": str(support_path),
                     "support_by_var": support_by_var,
+                    "data": data_metadata,
+                    "partition_protocol": MCQA_PARTITION_PROTOCOL,
                     "support_source_by_var": {
                         target_var: {
                             "mode": f"selected_best_{alignment_method}_row_only",
@@ -715,7 +801,7 @@ def main() -> None:
                         "native_resolution": int(native_resolution),
                         "target_var": target_var,
                         "payload_path": str(payload_path),
-                        "runtime_seconds": float(effective_width_total_seconds),
+                        "preselection_effective_runtime_seconds": float(effective_width_total_seconds),
                     }
                 )
 
@@ -871,26 +957,69 @@ def main() -> None:
         }
         for plan in global_selection["epsilon_plans"]
     ]
-    for payload in all_payloads:
+    for payload, manifest_run in zip(all_payloads, manifest_runs, strict=True):
+        target_var = str(payload["target_vars"][0])
+        selected_config_runtime = _selected_epsilon_runtime_by_target(
+            [payload],
+            method=alignment_method,
+            selected_epsilon=selected_epsilon,
+        ).get(target_var, 0.0)
+        payload["locally_selected_epsilon_runtime_seconds"] = float(payload.get("runtime_seconds", 0.0))
+        payload["runtime_seconds"] = float(selected_config_runtime)
+        payload["localization_runtime_seconds"] = float(selected_config_runtime)
+        payload["runtime_accounting"] = (
+            "this layer/resolution at the selected global epsilon, including recorded signature construction; "
+            "other epsilons and shared model/data preparation are excluded"
+        )
         payload["epsilon_calibration_plans"] = serializable_plans
         write_json(Path(str(payload["payload_path"])), payload)
+        manifest_run["selected_global_epsilon"] = selected_epsilon
+        manifest_run["runtime_seconds"] = float(selected_config_runtime)
+        manifest_run["runtime_definition"] = "this configuration at the selected global epsilon"
 
     manifest_path = sweep_root / "layer_sweep_manifest.json"
+    method_sweep_wall_seconds = float(perf_counter() - method_stage_start)
+    full_process_wall_seconds = float(perf_counter() - process_start)
+    selected_runtime_by_target = _selected_epsilon_runtime_by_target(
+        all_payloads,
+        method=alignment_method,
+        selected_epsilon=selected_epsilon,
+    )
+    selected_serial_runtime_seconds = float(sum(selected_runtime_by_target.values()))
+    selected_parallel_runtime_seconds = float(max(selected_runtime_by_target.values(), default=0.0))
     write_json(
         manifest_path,
         {
             "kind": "mcqa_plot_native_support",
+            "data": data_metadata,
+            "partition_protocol": MCQA_PARTITION_PROTOCOL,
             "layers": [int(layer) for layer in layers],
             "native_resolutions": [int(width) for width in native_resolutions],
             "selected_global_epsilon": selected_epsilon,
             "epsilon_selection_rule": global_selection["selection_rule"],
             "epsilon_calibration_plans": serializable_plans,
-            "runtime_seconds": float(perf_counter() - stage_start),
+            "runtime_definition": (
+                "selected global epsilon across every native resolution, including recorded signature "
+                "construction and selected-only test evaluation; other epsilons and shared model/data preparation are excluded"
+            ),
+            "runtime_seconds": selected_serial_runtime_seconds,
+            "serial_runtime_seconds": selected_serial_runtime_seconds,
+            "parallel_runtime_seconds": selected_parallel_runtime_seconds,
+            "runtime_seconds_by_target": selected_runtime_by_target,
+            "method_sweep_wall_runtime_seconds": float(method_sweep_wall_seconds),
+            "full_process_wall_runtime_seconds": float(full_process_wall_seconds),
             "runs": manifest_runs,
         },
     )
     aggregate_path = sweep_root / "mcqa_run_results.json"
-    write_json(aggregate_path, {"runs": all_payloads})
+    write_json(
+        aggregate_path,
+        {
+            "data": data_metadata,
+            "partition_protocol": MCQA_PARTITION_PROTOCOL,
+            "runs": all_payloads,
+        },
+    )
     print(f"Wrote native support localization manifest to {manifest_path}")
 
 

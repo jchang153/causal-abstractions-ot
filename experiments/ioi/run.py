@@ -162,6 +162,16 @@ def _artifact(path: Path, *, force: bool, loader, builder, dumper=_write_json):
     return value, False
 
 
+def _uot_payload_has_selected_plan_runtime(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    selected = payload.get("selected")
+    if not isinstance(selected, dict):
+        return False
+    runtime_seconds = selected.get("runtime_seconds", payload.get("selected_plan_runtime_seconds"))
+    return isinstance(runtime_seconds, (int, float)) and float(runtime_seconds) >= 0.0
+
+
 def _fit_regression(model, tokenizer, banks: IOIBanks, device, batch_size):
     same_values = intervention_logit_differences(
         model,
@@ -524,6 +534,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     signature_cached = False
     cost = None
     cost_diagnostics = None
+    localization_cost_seconds = 0.0
     if {"plot", "bruteforce"}.intersection(args.methods):
         signature_path = output_dir / "localization" / "signatures.json"
         signatures, signature_cached = _artifact(
@@ -539,17 +550,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             dumper=lambda path, value: _write_json(path, value.as_dict()),
         )
+        cost_started = perf_counter()
         cost, cost_diagnostics = build_cost_matrix(signatures, causal_model)
+        localization_cost_seconds = float(perf_counter() - cost_started)
         _write_json(output_dir / "localization" / "costs.json", cost_diagnostics)
 
     if "plot" in args.methods:
         assert signatures is not None and cost is not None
         uot_started = perf_counter()
         uot_path = output_dir / "plot" / "uot_calibration.json"
-        if uot_path.exists() and not args.force:
-            uot_payload = _read_json(uot_path)
+        cached_uot_payload = _read_json(uot_path) if uot_path.exists() and not args.force else None
+        if _uot_payload_has_selected_plan_runtime(cached_uot_payload):
+            uot_payload = cached_uot_payload
             uot_cached = True
         else:
+            if cached_uot_payload is not None:
+                print("[rebuild] cached IOI UOT sweep lacks selected-plan runtime accounting")
             selected_trial, trials = calibrate_uot_grid(
                 model,
                 tokenizer,
@@ -563,10 +579,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 device=device,
                 batch_size=args.eval_batch_size,
             )
+            full_sweep_wall_runtime_seconds = float(perf_counter() - uot_started)
+            selected_plan_runtime_seconds = float(selected_trial["runtime_seconds"])
             uot_payload = {
                 "selected": selected_trial,
                 "trials": trials,
-                "runtime_seconds": float(perf_counter() - uot_started),
+                "runtime_seconds": selected_plan_runtime_seconds,
+                "selected_plan_runtime_seconds": selected_plan_runtime_seconds,
+                "full_sweep_wall_runtime_seconds": full_sweep_wall_runtime_seconds,
+                "runtime_accounting": (
+                    "all per-variable K calibration candidates for the selected "
+                    "(epsilon, beta_neural) transport plan; unselected transport plans excluded"
+                ),
             }
             _write_json(uot_path, uot_payload)
             uot_cached = False
@@ -608,15 +632,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
         )
         signature_seconds = signatures.runtime_seconds
-        tuning_seconds = float(uot_payload.get("runtime_seconds", uot_seconds if not uot_cached else 0.0))
+        selected_uot = uot_payload["selected"]
+        tuning_seconds = float(
+            selected_uot.get(
+                "runtime_seconds",
+                uot_payload.get("selected_plan_runtime_seconds", uot_payload.get("runtime_seconds", 0.0)),
+            )
+        )
+        full_uot_sweep_seconds = float(
+            uot_payload.get("full_sweep_wall_runtime_seconds", uot_payload.get("runtime_seconds", uot_seconds))
+        )
         cold = (
             signature_seconds
+            + localization_cost_seconds
             + tuning_seconds
             + float(localized_runtime["das_training_seconds"])
             + float(localized_runtime["calibration_seconds"])
         )
         current = (
             (0.0 if signature_cached else signature_seconds)
+            + localization_cost_seconds
             + (0.0 if uot_cached else tuning_seconds)
             + float(localized_runtime["current_das_training_seconds"])
             + float(localized_runtime["calibration_seconds"])
@@ -632,7 +667,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "uot_cached": uot_cached,
             "runtime": {
                 "signature_collection_seconds": signature_seconds,
+                "cost_construction_seconds": localization_cost_seconds,
                 "uot_tuning_seconds": tuning_seconds,
+                "uot_selected_plan_seconds": tuning_seconds,
+                "uot_full_sweep_wall_seconds": full_uot_sweep_seconds,
+                "runtime_accounting": (
+                    "cold_seconds includes method-specific signatures and cost construction, only the selected UOT plan, "
+                    "all localized DAS candidates, calibration, and final held-out evaluation; "
+                    "shared model/data preparation is excluded"
+                ),
                 **localized_runtime,
                 "heldout_evaluation_seconds": 0.0,
                 "cold_seconds": cold,
@@ -687,12 +730,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         signature_seconds = signatures.runtime_seconds
         cold = (
             signature_seconds
+            + localization_cost_seconds
             + coupling_seconds
             + float(localized_runtime["das_training_seconds"])
             + float(localized_runtime["calibration_seconds"])
         )
         current = (
             (0.0 if signature_cached else signature_seconds)
+            + localization_cost_seconds
             + coupling_seconds
             + float(localized_runtime["current_das_training_seconds"])
             + float(localized_runtime["calibration_seconds"])
@@ -705,7 +750,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "signature_cached": signature_cached,
             "runtime": {
                 "signature_collection_seconds": signature_seconds,
+                "cost_construction_seconds": localization_cost_seconds,
                 "coupling_construction_seconds": coupling_seconds,
+                "runtime_accounting": (
+                    "cold_seconds includes method-specific signatures and cost/coupling construction, "
+                    "all localized DAS candidates, calibration, and final held-out evaluation; shared "
+                    "model/data preparation is excluded"
+                ),
                 **localized_runtime,
                 "heldout_evaluation_seconds": 0.0,
                 "cold_seconds": cold,
