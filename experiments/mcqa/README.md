@@ -10,7 +10,10 @@ to uppercase, and accepted only when it is exactly one ASCII symbol A-Z matching
 the causal interchange's final expected answer. Alphabet-restricted and raw
 token-ID accuracies are diagnostics only. OT/UOT/cosine effect signatures remain
 projected onto the 26 answer symbols; brute-force evaluates candidate
-interventions directly with `iia_acc`.
+interventions directly with `iia_acc`. Calibration `iia_acc` is pooled over all
+calibration examples, so counterfactual families contribute in proportion to
+their sample counts for every method. Per-family accuracies remain diagnostic
+only and never affect model or hyperparameter selection.
 
 Method families:
 
@@ -39,17 +42,24 @@ PLOT sweeps select one epsilon globally across abstract variables.  Within each
 epsilon, each variable selects its best native resolution or PCA support config
 using calibration data, and the epsilon score is the equal-weight average of
 those best variable scores.  Only the frozen winning configurations are tested.
+The paper-facing PCA sweep uses `1,2,4,8,16,32,64` equal-width bands; the
+PLOT-PCA-DAS stage consumes the calibration-selected PLOT-PCA support and its
+effective-dimension hint.
 Paper runtime charges every resolution/config evaluated at the selected epsilon
 plus the final selected test evaluations; it does not charge only the
 retrospective winning resolution, nor the sweep over unselected epsilons.
 - `mcqa_plot_layer.py`, `mcqa_plot_native_support.py`, `mcqa_ot_pca_focus.py`, `mcqa_plot_das_layer.py`, `mcqa_plot_das_native_support.py`: individual stage runners.
-- `mcqa_dbm_baselines.py`: resumable DBM/full-layer sweep. It selects layers using calibration accuracy and evaluates only the frozen selected layer on test.
+- `mcqa_dbm_baselines.py`: resumable DBM/full-layer sweep. It selects layers using calibration accuracy and evaluates only the frozen selected layer on test. Factual filtering defaults to batch size 64 independently of the evaluation batch size, matching the PLOT/DAS data path. Pass `--partition-reference PATH` (optionally with a `{seed}` placeholder) to require exact fit/calibration/test partition equality with a PLOT or Full-DAS artifact.
 - `slurm/submit_delta_mcqa_boundless_das.sh`: submit the three-seed bDAS array on Delta.
 - `slurm/submit_delta_mcqa_corrected_reruns.sh`: submit the three-seed unified-IIA
   reruns for PLOT, PLOT-guided DAS, Full DAS, MIB, and bDAS.
 - `slurm/run_delta_mcqa_one_seed_unified_iia.sh`: run the requested one-seed
   unified-IIA comparison inside one allocation-inheriting `srun`, including
   PLOT-bDAS on the per-variable UOT-selected layers.
+- `slurm/run_delta_mcqa_pca_mib_4seed.sh`: focused four-A40 rerun of PLOT-PCA,
+  PLOT-PCA-DAS, full-vector, and DBM canonical/PCA/SAE for seeds 0--3. It assigns
+  one seed per GPU and checks each baseline partition against that seed's PLOT
+  artifact.
 
 MCQA bDAS uses the recommended binary-addition settings: batch size 64,
 no gradient accumulation, 12 maximum epochs, 5 minimum epochs, training-loss

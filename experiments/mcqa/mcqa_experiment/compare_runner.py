@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
 
-from .checking import IIA_METRIC_NAME
+from .checking import IIA_METRIC_NAME, require_pooled_calibration_metric
 from .das import DASConfig, run_das_pipeline
 from .data import canonicalize_target_var
 from .ot import OTConfig, prepare_alignment_artifacts, run_alignment_pipeline, run_bruteforce_site_pipeline
@@ -63,6 +63,7 @@ def run_comparison(
     config: CompareExperimentConfig,
     prepared_ot_artifacts: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    require_pooled_calibration_metric(config.calibration_metric)
     target_vars = tuple(canonicalize_target_var(target_var) for target_var in config.target_vars)
     methods_use_epsilon = any(str(method).lower() in {"ot", "uot"} for method in config.methods)
     source_target_vars = tuple(

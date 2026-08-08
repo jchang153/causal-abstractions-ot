@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import gc
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,7 @@ from mcqa_experiment.runtime import resolve_device
 
 METHODS = ("full-layer", "dbm-canonical", "dbm-pca", "dbm-sae")
 TARGETS = ("answer_pointer", "answer_token")
+DEFAULT_FILTER_BATCH_SIZE = 64
 
 
 def parse_int_grid(value: str, *, upper_exclusive: int | None = None) -> list[int]:
@@ -59,6 +61,65 @@ def atomic_json(path: Path, payload: object) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     temporary.replace(path)
+
+
+def partition_sha256(partition: dict[str, object]) -> str:
+    """Return a stable fingerprint for one complete fit/calibration/test partition."""
+
+    encoded = json.dumps(partition, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def extract_partition_metadata(payload: dict[str, object]) -> dict[str, object]:
+    """Extract partition metadata from a data, method, or aggregate result payload."""
+
+    candidates: list[object] = [payload.get("partition")]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        candidates.append(data.get("partition"))
+    runs = payload.get("runs")
+    if isinstance(runs, list):
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            run_data = run.get("data")
+            if isinstance(run_data, dict):
+                candidates.append(run_data.get("partition"))
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("protocol") == MCQA_PARTITION_PROTOCOL:
+            return candidate
+    raise ValueError(
+        f"Could not find a {MCQA_PARTITION_PROTOCOL!r} partition in the reference payload"
+    )
+
+
+def validate_partition_reference(
+    *,
+    actual_partition: dict[str, object],
+    reference_path_template: str | None,
+    seed: int,
+) -> dict[str, str] | None:
+    """Fail closed when DBM/full-vector banks differ from a reference experiment."""
+
+    if reference_path_template is None:
+        return None
+    reference_path = Path(str(reference_path_template).format(seed=int(seed))).expanduser()
+    try:
+        reference_payload = json.loads(reference_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Could not load partition reference {reference_path}: {error}") from error
+    if not isinstance(reference_payload, dict):
+        raise ValueError(f"Partition reference {reference_path} must contain a JSON object")
+    expected_partition = extract_partition_metadata(reference_payload)
+    actual_digest = partition_sha256(actual_partition)
+    expected_digest = partition_sha256(expected_partition)
+    if actual_partition != expected_partition:
+        raise ValueError(
+            "DBM/full-vector fit/calibration/test partition does not match the reference "
+            f"for seed={int(seed)}: actual={actual_digest} expected={expected_digest} "
+            f"reference={reference_path}"
+        )
+    return {"path": str(reference_path.resolve()), "sha256": expected_digest}
 
 
 def load_sae(*, layer: int, release: str, sae_id_template: str, device: torch.device):
@@ -111,6 +172,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--methods", default=",".join(METHODS))
     parser.add_argument("--targets", default=",".join(TARGETS))
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--filter-batch-size",
+        type=int,
+        default=DEFAULT_FILTER_BATCH_SIZE,
+        help=(
+            "Batch size used only for factual filtering. Keep this equal to the PLOT/DAS "
+            f"filtering batch size so all methods retain the same rows. Default: {DEFAULT_FILTER_BATCH_SIZE}"
+        ),
+    )
     parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
@@ -125,6 +195,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument(
+        "--partition-reference",
+        default=None,
+        help=(
+            "Optional JSON result/data artifact whose partition must exactly match this run. "
+            "The path may contain a {seed} placeholder."
+        ),
+    )
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--verify-sae-only", action="store_true")
     return parser
@@ -158,7 +236,7 @@ def main() -> None:
     model, tokenizer, causal_model, token_positions, filtered = load_filtered_mcqa_pipeline(
         model_name=args.model_name,
         device=str(device),
-        batch_size=args.eval_batch_size,
+        batch_size=args.filter_batch_size,
         dataset_size=args.dataset_size,
         hf_token=hf_token,
         dataset_path=args.dataset_path,
@@ -179,7 +257,48 @@ def main() -> None:
     )
 
     banks_by_seed: dict[int, dict[str, dict[str, object]]] = {}
+    partition_sha256_by_seed: dict[int, str] = {}
+    partition_reference_by_seed: dict[int, dict[str, str] | None] = {}
+
+    def banks_for_seed(seed: int) -> dict[str, dict[str, object]]:
+        if seed in banks_by_seed:
+            return banks_by_seed[seed]
+        banks, metadata = build_pair_banks(
+            tokenizer=tokenizer,
+            causal_model=causal_model,
+            token_positions=token_positions,
+            datasets_by_name=filtered,
+            counterfactual_names=("answerPosition", "randomLetter", "answerPosition_randomLetter"),
+            target_vars=targets,
+            split_seed=int(seed),
+            train_pool_size=args.train_size,
+            calibration_pool_size=args.calibration_size,
+            test_pool_size=args.test_size,
+        )
+        partition = metadata.get("partition")
+        if not isinstance(partition, dict):
+            raise ValueError(f"Pair-bank metadata for seed={int(seed)} is missing its partition")
+        partition_digest = partition_sha256(partition)
+        reference = validate_partition_reference(
+            actual_partition=partition,
+            reference_path_template=args.partition_reference,
+            seed=int(seed),
+        )
+        banks_by_seed[seed] = banks
+        partition_sha256_by_seed[seed] = partition_digest
+        partition_reference_by_seed[seed] = reference
+        recorded_metadata = {
+            **metadata,
+            "filter_batch_size": int(args.filter_batch_size),
+            "partition_sha256": partition_digest,
+            "partition_reference": reference,
+        }
+        atomic_json(run_dir / f"data_seed{seed}_shard{args.shard_index}.json", recorded_metadata)
+        return banks
+
     for method, seed, target, layer in jobs:
+        banks = banks_for_seed(seed)
+        expected_partition_sha256 = partition_sha256_by_seed[seed]
         stem = f"{method}_seed{seed}_{target}_layer{layer}"
         output_path = run_dir / method / f"{stem}.json"
         if output_path.exists() and not args.no_resume:
@@ -195,26 +314,12 @@ def main() -> None:
                 and existing_payload.get("dataset_size") == int(args.dataset_size)
                 and existing_payload.get("dataset_path") == str(args.dataset_path)
                 and existing_payload.get("dataset_config") == str(args.dataset_config)
+                and existing_payload.get("filter_batch_size") == int(args.filter_batch_size)
+                and existing_payload.get("partition_sha256") == expected_partition_sha256
             ):
                 print(f"[resume] {output_path}")
                 continue
-            print(f"[rebuild] {output_path} uses a legacy runtime or IIA protocol")
-        if seed not in banks_by_seed:
-            banks, metadata = build_pair_banks(
-                tokenizer=tokenizer,
-                causal_model=causal_model,
-                token_positions=token_positions,
-                datasets_by_name=filtered,
-                counterfactual_names=("answerPosition", "randomLetter", "answerPosition_randomLetter"),
-                target_vars=targets,
-                split_seed=int(seed),
-                train_pool_size=args.train_size,
-                calibration_pool_size=args.calibration_size,
-                test_pool_size=args.test_size,
-            )
-            banks_by_seed[seed] = banks
-            atomic_json(run_dir / f"data_seed{seed}_shard{args.shard_index}.json", metadata)
-        banks = banks_by_seed[seed]
+            print(f"[rebuild] {output_path} uses stale metrics, filtering, or partition metadata")
         started = perf_counter()
         payload: dict[str, object] = {
             "method": method, "seed": seed, "target_var": target, "layer": layer,
@@ -223,6 +328,9 @@ def main() -> None:
             "dataset_size": int(args.dataset_size),
             "dataset_path": str(args.dataset_path),
             "dataset_config": str(args.dataset_config),
+            "filter_batch_size": int(args.filter_batch_size),
+            "partition_sha256": expected_partition_sha256,
+            "partition_reference": partition_reference_by_seed[seed],
         }
         if method == "full-layer":
             payload["calibration"] = evaluate_full_layer(
@@ -288,24 +396,6 @@ def main() -> None:
                 records.append(record)
         except (json.JSONDecodeError, OSError):
             pass
-    def banks_for_seed(seed: int) -> dict[str, dict[str, object]]:
-        if seed not in banks_by_seed:
-            banks, metadata = build_pair_banks(
-                tokenizer=tokenizer,
-                causal_model=causal_model,
-                token_positions=token_positions,
-                datasets_by_name=filtered,
-                counterfactual_names=("answerPosition", "randomLetter", "answerPosition_randomLetter"),
-                target_vars=targets,
-                split_seed=int(seed),
-                train_pool_size=args.train_size,
-                calibration_pool_size=args.calibration_size,
-                test_pool_size=args.test_size,
-            )
-            banks_by_seed[seed] = banks
-            atomic_json(run_dir / f"data_seed{seed}_shard{args.shard_index}.json", metadata)
-        return banks_by_seed[seed]
-
     def evaluate_selected(record: dict[str, object]) -> dict[str, object]:
         selected = dict(record)
         if selected.get("test_evaluated") is True:
@@ -365,7 +455,15 @@ def main() -> None:
     for method in methods:
         for seed in seeds:
             for target in targets:
-                subset = [record for record in records if record.get("method") == method and record.get("seed") == seed and record.get("target_var") == target]
+                subset = [
+                    record
+                    for record in records
+                    if record.get("method") == method
+                    and record.get("seed") == seed
+                    and record.get("target_var") == target
+                    and record.get("filter_batch_size") == int(args.filter_batch_size)
+                    and record.get("partition_sha256") == partition_sha256_by_seed.get(seed)
+                ]
                 if not subset:
                     continue
                 subset.sort(key=lambda item: (-float(item["calibration"]["iia_acc"]), int(item["layer"])))

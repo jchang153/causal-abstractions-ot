@@ -12,7 +12,11 @@ from time import perf_counter
 from typing import Iterable
 
 from mcqa_paper_runtime import write_paper_runtime_summary
-from mcqa_experiment.checking import payload_uses_unified_iia
+from mcqa_experiment.checking import (
+    POOLED_CALIBRATION_METRIC,
+    payload_uses_pooled_iia_calibration,
+    payload_uses_unified_iia,
+)
 from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL
 from mcqa_experiment.selection import select_shared_epsilon
 
@@ -20,7 +24,7 @@ from mcqa_experiment.selection import select_shared_epsilon
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_STAGE_A_TOKEN_POSITION_IDS = ("last_token",)
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
-DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_iia_acc"
+DEFAULT_CALIBRATION_METRIC = POOLED_CALIBRATION_METRIC
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_STAGE_A_TRANSPORT_METHODS = ("uot",)
@@ -52,7 +56,7 @@ DEFAULT_OT_LAMBDAS = (
 )
 DEFAULT_PCA_SITE_MENUS = ("partition",)
 DEFAULT_PCA_BASIS_SOURCE_MODES = ("all_variants",)
-DEFAULT_PCA_NUM_BANDS_VALUES = (8, 16)
+DEFAULT_PCA_NUM_BANDS_VALUES = (1, 2, 4, 8, 16, 32, 64)
 DEFAULT_PCA_BAND_SCHEME = "equal"
 DEFAULT_GUIDED_MASK_NAMES = ("Selected",)
 DEFAULT_GUIDED_SUPPORT_DIM_COUNT = 10
@@ -315,7 +319,11 @@ def _stage_output_is_valid(path: Path) -> bool:
         payload = _load_json(path)
     except Exception:
         return False
-    if not isinstance(payload, (dict, list)) or not payload_uses_unified_iia(payload):
+    if (
+        not isinstance(payload, (dict, list))
+        or not payload_uses_unified_iia(payload)
+        or not payload_uses_pooled_iia_calibration(payload)
+    ):
         return False
     partitioned_kinds = {
         "mcqa_plot_layer",
@@ -398,8 +406,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--ot-lambdas",
         default="10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30",
     )
-    parser.add_argument("--calibration-metric", default=DEFAULT_CALIBRATION_METRIC)
-    parser.add_argument("--calibration-family-weights", default="1,1,1")
+    parser.add_argument(
+        "--calibration-metric",
+        default=DEFAULT_CALIBRATION_METRIC,
+        choices=(POOLED_CALIBRATION_METRIC,),
+        help="MCQA model-selection objective; fixed to pooled iia_acc.",
+    )
+    parser.add_argument(
+        "--calibration-family-weights",
+        default="1,1,1",
+        help="Deprecated compatibility option; ignored by pooled MCQA calibration.",
+    )
     parser.add_argument(
         "--plot-alignment-method",
         default="ot",
@@ -422,7 +439,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="all_variants",
         help="Comma-separated PCA basis source modes. pair_bank is treated as all_variants.",
     )
-    parser.add_argument("--pca-num-bands-values", default="8,16")
+    parser.add_argument("--pca-num-bands-values", default="1,2,4,8,16,32,64")
     parser.add_argument("--pca-band-scheme", default=DEFAULT_PCA_BAND_SCHEME, choices=("equal", "head"))
     parser.add_argument(
         "--pca-support-extraction-mode",

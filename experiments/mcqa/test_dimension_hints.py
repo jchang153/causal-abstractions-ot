@@ -8,8 +8,21 @@ MCQA_DIR = Path(__file__).resolve().parent
 if str(MCQA_DIR) not in sys.path:
     sys.path.insert(0, str(MCQA_DIR))
 
-from mcqa_delta_hierarchical_sweep import _dim_hint_subspace_dims
-from mcqa_ot_pca_focus import _dimension_hint_subspace_dims, _pca_effective_dims
+from mcqa_delta_hierarchical_sweep import (
+    DEFAULT_PCA_NUM_BANDS_VALUES as HIERARCHICAL_PCA_NUM_BANDS_VALUES,
+    _dim_hint_subspace_dims,
+)
+from mcqa_ot_pca_focus import (
+    DEFAULT_NUM_BANDS_VALUES as DIRECT_PCA_NUM_BANDS_VALUES,
+    _dimension_hint_subspace_dims,
+    _pca_effective_dims,
+)
+
+
+def test_pca_band_sweep_includes_coarse_and_fine_partitions() -> None:
+    expected = (1, 2, 4, 8, 16, 32, 64)
+    assert HIERARCHICAL_PCA_NUM_BANDS_VALUES == expected
+    assert DIRECT_PCA_NUM_BANDS_VALUES == expected
 
 
 def test_native_dimension_hint_uses_paper_scale_factors() -> None:

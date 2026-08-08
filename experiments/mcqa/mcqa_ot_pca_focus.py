@@ -11,7 +11,11 @@ from time import perf_counter
 import mcqa_run as base_run
 from mcqa_paper_runtime import _pca_selected_config_epsilon_runtime
 import torch
-from mcqa_experiment.checking import payload_uses_unified_iia
+from mcqa_experiment.checking import (
+    POOLED_CALIBRATION_METRIC,
+    payload_uses_pooled_iia_calibration,
+    payload_uses_unified_iia,
+)
 from mcqa_experiment.das import DASConfig, run_das_pipeline
 from mcqa_experiment.data import (
     COUNTERFACTUAL_FAMILIES,
@@ -50,10 +54,10 @@ DEFAULT_LAYERS = (20, 25)
 DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
 DEFAULT_TOKEN_POSITION_ID = "last_token"
-DEFAULT_NUM_BANDS = 8
+DEFAULT_NUM_BANDS_VALUES = (1, 2, 4, 8, 16, 32, 64)
 DEFAULT_SITE_MENU = "partition"
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
-DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_iia_acc"
+DEFAULT_CALIBRATION_METRIC = POOLED_CALIBRATION_METRIC
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 3, 4, 5)
@@ -168,11 +172,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-position-id", default=DEFAULT_TOKEN_POSITION_ID)
     parser.add_argument("--target-vars", default="answer_pointer,answer_token")
     parser.add_argument("--site-menu", default=DEFAULT_SITE_MENU, choices=("partition",))
-    parser.add_argument("--num-bands", type=int, default=DEFAULT_NUM_BANDS)
+    parser.add_argument(
+        "--num-bands",
+        type=int,
+        default=None,
+        help="Compatibility single-band override used only when --num-bands-values is omitted.",
+    )
     parser.add_argument(
         "--num-bands-values",
         default=None,
-        help="Comma-separated PCA band counts to sweep in one process. Overrides --num-bands.",
+        help="Comma-separated PCA band counts to sweep. Default when neither band flag is set: 1,2,4,8,16,32,64.",
     )
     parser.add_argument("--band-scheme", default=DEFAULT_BAND_SCHEME, choices=("equal", "head"))
     parser.add_argument(
@@ -194,7 +203,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ot-lambdas", help="Comma-separated OT lambdas. Default: 10,11,...,30")
     parser.add_argument(
         "--calibration-family-weights",
-        help="Comma-separated family weights in answerPosition,randomLetter,answerPosition_randomLetter order. Default: 1,1,1",
+        help="Deprecated compatibility option; ignored by pooled MCQA calibration.",
     )
     parser.add_argument("--support-score-slack", type=float, default=0.05)
     parser.add_argument(
@@ -280,7 +289,13 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
-    return payload if isinstance(payload, dict) and payload_uses_unified_iia(payload) else None
+    return (
+        payload
+        if isinstance(payload, dict)
+        and payload_uses_unified_iia(payload)
+        and payload_uses_pooled_iia_calibration(payload)
+        else None
+    )
 
 
 def _compare_payload_matches_target_vars(
@@ -1210,6 +1225,7 @@ def _run_pca_band(
             ]
             compare_payload = {
                 "kind": "mcqa_ot_pca_focus_epsilon",
+                "calibration_metric": DEFAULT_CALIBRATION_METRIC,
                 "layer": int(layer),
                 "token_position_id": str(args.token_position_id),
                 "site_menu": str(args.site_menu),
@@ -1407,6 +1423,7 @@ def _run_pca_band(
 
     plot_support_payload = {
         "kind": "mcqa_plot_pca_support_layer",
+        "calibration_metric": DEFAULT_CALIBRATION_METRIC,
         "layer": int(layer),
         "token_position_id": str(args.token_position_id),
         "target_vars": [str(target_var) for target_var in target_vars],
@@ -1579,7 +1596,11 @@ def main() -> None:
         dict.fromkeys(
             _parse_csv_ints(args.num_bands_values)
             if args.num_bands_values is not None
-            else [int(args.num_bands)]
+            else (
+                [int(args.num_bands)]
+                if args.num_bands is not None
+                else list(DEFAULT_NUM_BANDS_VALUES)
+            )
         )
     )
     if not num_bands_values or any(int(num_bands) <= 0 for num_bands in num_bands_values):
@@ -1877,6 +1898,7 @@ def main() -> None:
         manifest_path,
         {
             "kind": "mcqa_ot_pca_focus",
+            "calibration_metric": DEFAULT_CALIBRATION_METRIC,
             "data": data_metadata,
             "partition_protocol": MCQA_PARTITION_PROTOCOL,
             "layers": [int(layer) for layer in layers],
@@ -1921,6 +1943,7 @@ def main() -> None:
         aggregate_path,
         {
             "kind": "mcqa_ot_pca_focus",
+            "calibration_metric": DEFAULT_CALIBRATION_METRIC,
             "data": data_metadata,
             "partition_protocol": MCQA_PARTITION_PROTOCOL,
             "runs": [

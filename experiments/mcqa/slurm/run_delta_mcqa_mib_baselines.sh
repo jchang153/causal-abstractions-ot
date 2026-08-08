@@ -45,6 +45,7 @@ run_baseline_shard() {
     --calibration-size 200 \
     --test-size 200 \
     --batch-size 64 \
+    --filter-batch-size 64 \
     --eval-batch-size 128 \
     --epochs 8 \
     --learning-rate 0.01 \

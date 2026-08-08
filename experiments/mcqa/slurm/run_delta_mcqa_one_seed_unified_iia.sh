@@ -125,7 +125,7 @@ python experiments/mcqa/mcqa_delta_hierarchical_sweep.py \
   --ot-epsilons 0.5,1,2,4 \
   --ot-top-k-values 1,2,4 \
   --ot-lambdas 0.5,1,2,4 \
-  --calibration-metric family_weighted_macro_iia_acc \
+  --calibration-metric iia_acc \
   --calibration-family-weights 1,1,1 \
   --stage-b-top-layers-per-var 1 \
   --stage-b-neighbor-radius 0 \
@@ -133,7 +133,7 @@ python experiments/mcqa/mcqa_delta_hierarchical_sweep.py \
   --native-resolutions 16,32,48,64,128,144,192,256,288,384,576,768 \
   --pca-site-menus partition \
   --pca-basis-source-modes all_variants \
-  --pca-num-bands-values 8,16 \
+  --pca-num-bands-values 1,2,4,8,16,32,64 \
   --pca-band-scheme equal \
   --stage-c-top-configs-per-var 1 \
   --guided-max-epochs 100 \
@@ -173,7 +173,7 @@ if [[ ! -f "${FULL_DAS_OUTPUT}" ]] || ! jq -e \
     --layers auto \
     --token-position-ids last_token \
     --resolutions full \
-    --calibration-metric family_weighted_macro_iia_acc \
+    --calibration-metric iia_acc \
     --calibration-family-weights 1,1,1 \
     --das-max-epochs 100 \
     --das-min-epochs 5 \
@@ -269,7 +269,9 @@ python experiments/mcqa/mcqa_dbm_baselines.py \
   --calibration-size 200 \
   --test-size 200 \
   --batch-size 64 \
+  --filter-batch-size 64 \
   --eval-batch-size 128 \
+  --partition-reference "${FULL_DAS_OUTPUT}" \
   --epochs 8 \
   --learning-rate 0.01 \
   --temperature-start 1.0 \

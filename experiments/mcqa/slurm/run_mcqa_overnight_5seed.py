@@ -86,8 +86,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default="0.5,1,2,4",
         help="Downstream Stage B OT lambdas.",
     )
-    parser.add_argument("--calibration-metric", default="family_weighted_macro_iia_acc")
-    parser.add_argument("--calibration-family-weights", default="1,1.5,2")
+    parser.add_argument(
+        "--calibration-metric",
+        default="iia_acc",
+        choices=("iia_acc",),
+        help="MCQA model-selection objective; fixed to pooled iia_acc.",
+    )
+    parser.add_argument(
+        "--calibration-family-weights",
+        default="1,1,1",
+        help="Deprecated compatibility option; ignored by pooled MCQA calibration.",
+    )
     parser.add_argument("--stage-b-top-layers-per-var", type=int, default=3)
     parser.add_argument("--stage-b-neighbor-radius", type=int, default=0)
     parser.add_argument("--stage-b-max-layers-per-var", type=int, default=3)
@@ -97,7 +106,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pca-site-menus", default="partition")
     parser.add_argument("--pca-basis-source-modes", default="all_variants")
-    parser.add_argument("--pca-num-bands-values", default="8,16")
+    parser.add_argument("--pca-num-bands-values", default="1,2,4,8,16,32,64")
     parser.add_argument("--pca-band-scheme", default="equal")
     parser.add_argument("--guided-mask-names", default="Selected")
     parser.add_argument("--guided-max-epochs", type=int, default=100)

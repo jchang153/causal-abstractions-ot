@@ -7,6 +7,15 @@ import unicodedata
 
 
 IIA_METRIC_NAME = "normalized_full_vocab_top1_v1"
+POOLED_CALIBRATION_METRIC = "iia_acc"
+_RECORDED_CALIBRATION_KINDS = {
+    "mcqa_plot_layer",
+    "mcqa_plot_native_support",
+    "mcqa_plot_native_support_layer",
+    "mcqa_ot_pca_focus",
+    "mcqa_ot_pca_focus_epsilon",
+    "mcqa_plot_pca_support_layer",
+}
 
 
 def normalize_answer_symbol(value: object) -> str | None:
@@ -68,7 +77,17 @@ def iia_acc_from_metrics(metrics: dict[str, object]) -> float:
 def selection_metric_from_metrics(metrics: dict[str, object]) -> tuple[str, float]:
     """Return the only scalar permitted for MCQA calibration selection."""
 
-    return "iia_acc", iia_acc_from_metrics(metrics)
+    return POOLED_CALIBRATION_METRIC, iia_acc_from_metrics(metrics)
+
+
+def require_pooled_calibration_metric(calibration_metric: object) -> None:
+    """Reject family-balanced or otherwise non-pooled MCQA objectives."""
+
+    if str(calibration_metric) != POOLED_CALIBRATION_METRIC:
+        raise ValueError(
+            "MCQA calibration must use pooled iia_acc across examples; "
+            f"got calibration_metric={calibration_metric!r}"
+        )
 
 
 def payload_uses_unified_iia(payload: object) -> bool:
@@ -81,4 +100,20 @@ def payload_uses_unified_iia(payload: object) -> bool:
         return all(payload_uses_unified_iia(value) for value in payload.values())
     if isinstance(payload, (list, tuple)):
         return all(payload_uses_unified_iia(value) for value in payload)
+    return True
+
+
+def payload_uses_pooled_iia_calibration(payload: object) -> bool:
+    """Reject cached outputs that record a non-pooled calibration objective."""
+
+    if isinstance(payload, dict):
+        if str(payload.get("kind", "")) in _RECORDED_CALIBRATION_KINDS:
+            if str(payload.get("calibration_metric", "")) != POOLED_CALIBRATION_METRIC:
+                return False
+        if "calibration_metric" in payload:
+            if str(payload["calibration_metric"]) != POOLED_CALIBRATION_METRIC:
+                return False
+        return all(payload_uses_pooled_iia_calibration(value) for value in payload.values())
+    if isinstance(payload, (list, tuple)):
+        return all(payload_uses_pooled_iia_calibration(value) for value in payload)
     return True

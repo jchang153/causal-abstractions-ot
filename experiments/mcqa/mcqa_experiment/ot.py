@@ -17,8 +17,8 @@ except Exception:  # pragma: no cover
     tqdm = None
 
 from . import _env  # noqa: F401
-from .checking import iia_acc_from_metrics
-from .data import COUNTERFACTUAL_FAMILIES, MCQAPairBank, canonicalize_target_var
+from .checking import iia_acc_from_metrics, require_pooled_calibration_metric
+from .data import MCQAPairBank, canonicalize_target_var
 from .intervention import run_soft_site_intervention
 from .metrics import build_variable_signature, metrics_from_logits, prediction_details_from_logits
 from .pca import LayerPCABasis
@@ -789,22 +789,8 @@ def _resolve_calibration_grids(
 
 
 def _calibration_score_from_result(result: dict[str, object], config: OTConfig) -> float:
-    iia_acc = iia_acc_from_metrics(result)
-    if config.calibration_metric == "iia_acc":
-        return iia_acc
-    if config.calibration_metric == "family_weighted_macro_iia_acc":
-        family_iia_accs = result.get("family_iia_accs", {})
-        if not isinstance(family_iia_accs, dict):
-            return iia_acc
-        weighted_sum = 0.0
-        total_weight = 0.0
-        for family_name, weight in zip(COUNTERFACTUAL_FAMILIES, config.calibration_family_weights):
-            if family_name not in family_iia_accs:
-                continue
-            weighted_sum += float(weight) * float(family_iia_accs[family_name])
-            total_weight += float(weight)
-        return iia_acc if total_weight <= 0.0 else float(weighted_sum / total_weight)
-    raise ValueError(f"Unsupported calibration_metric={config.calibration_metric}")
+    require_pooled_calibration_metric(config.calibration_metric)
+    return iia_acc_from_metrics(result)
 
 
 def _evaluate_soft_intervention(

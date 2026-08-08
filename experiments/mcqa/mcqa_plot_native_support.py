@@ -8,7 +8,11 @@ from time import perf_counter
 
 import mcqa_run as base_run
 import torch
-from mcqa_experiment.checking import payload_uses_unified_iia
+from mcqa_experiment.checking import (
+    POOLED_CALIBRATION_METRIC,
+    payload_uses_pooled_iia_calibration,
+    payload_uses_unified_iia,
+)
 from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparison
 from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL, canonicalize_target_var
 from mcqa_experiment.ot import (
@@ -31,7 +35,7 @@ DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPositio
 DEFAULT_TOKEN_POSITION_ID = "last_token"
 DEFAULT_NATIVE_RESOLUTIONS = [16, 32, 48, 64, 128, 144, 192, 256, 288, 384, 576, 768]
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
-DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_iia_acc"
+DEFAULT_CALIBRATION_METRIC = POOLED_CALIBRATION_METRIC
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_OT_TOP_K_VALUES = (1, 2, 4)
@@ -143,7 +147,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ot-lambdas", help="Comma-separated OT lambdas. Default: 0.5,1,2,4")
     parser.add_argument(
         "--calibration-family-weights",
-        help="Comma-separated family weights in answerPosition,randomLetter,answerPosition_randomLetter order. Default: 1,1,1",
+        help="Deprecated compatibility option; ignored by pooled MCQA calibration.",
     )
     parser.add_argument("--support-score-slack", type=float, default=0.05)
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
@@ -183,7 +187,13 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
-    return payload if isinstance(payload, dict) and payload_uses_unified_iia(payload) else None
+    return (
+        payload
+        if isinstance(payload, dict)
+        and payload_uses_unified_iia(payload)
+        and payload_uses_pooled_iia_calibration(payload)
+        else None
+    )
 
 
 def _compare_payload_matches_target_vars(
@@ -715,6 +725,7 @@ def main() -> None:
                 )
                 payload = {
                     "kind": "mcqa_plot_native_support_layer",
+                    "calibration_metric": DEFAULT_CALIBRATION_METRIC,
                     "layer": int(layer),
                     "token_position_id": DEFAULT_TOKEN_POSITION_ID,
                     "signature_mode": str(args.signature_mode),
@@ -991,6 +1002,7 @@ def main() -> None:
         manifest_path,
         {
             "kind": "mcqa_plot_native_support",
+            "calibration_metric": DEFAULT_CALIBRATION_METRIC,
             "data": data_metadata,
             "partition_protocol": MCQA_PARTITION_PROTOCOL,
             "layers": [int(layer) for layer in layers],
@@ -1015,6 +1027,8 @@ def main() -> None:
     write_json(
         aggregate_path,
         {
+            "kind": "mcqa_plot_native_support",
+            "calibration_metric": DEFAULT_CALIBRATION_METRIC,
             "data": data_metadata,
             "partition_protocol": MCQA_PARTITION_PROTOCOL,
             "runs": all_payloads,

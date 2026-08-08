@@ -111,7 +111,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.ot_lambdas is None:
             args.ot_lambdas = "0.25,0.5,1,2,4,8"
         if args.calibration_metric is None:
-            args.calibration_metric = "family_weighted_macro_iia_acc"
+            args.calibration_metric = "iia_acc"
         if args.calibration_family_weights is None:
             args.calibration_family_weights = "1,1,1"
     elif args.preset == "next_bf":
@@ -140,7 +140,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if args.ot_lambdas is None:
             args.ot_lambdas = "0.25,0.5,1,2,4,8"
         if args.calibration_metric is None:
-            args.calibration_metric = "family_weighted_macro_iia_acc"
+            args.calibration_metric = "iia_acc"
         if args.calibration_family_weights is None:
             args.calibration_family_weights = "1,1,1"
     else:
@@ -177,8 +177,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--signature-modes", help="Comma-separated strings")
     parser.add_argument("--ot-top-k-values", help="Comma-separated integers")
     parser.add_argument("--ot-lambdas", help="Comma-separated floats")
-    parser.add_argument("--calibration-metric", help="Calibration objective for OT/UOT selection")
-    parser.add_argument("--calibration-family-weights", help="Comma-separated family weights in COUNTERFACTUAL_FAMILIES order")
+    parser.add_argument(
+        "--calibration-metric",
+        choices=("iia_acc",),
+        help="MCQA model-selection objective; fixed to pooled iia_acc.",
+    )
+    parser.add_argument(
+        "--calibration-family-weights",
+        help="Deprecated compatibility option; ignored by pooled MCQA calibration.",
+    )
     parser.add_argument("--das-max-epochs", type=int)
     parser.add_argument("--das-min-epochs", type=int)
     parser.add_argument("--das-plateau-patience", type=int)

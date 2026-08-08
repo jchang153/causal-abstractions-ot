@@ -20,6 +20,10 @@ from huggingface_hub import login as hf_login
 import torch
 
 from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparison
+from mcqa_experiment.checking import (
+    payload_uses_pooled_iia_calibration,
+    payload_uses_unified_iia,
+)
 import mcqa_experiment.data as mcqa_data
 from mcqa_experiment.data import (
     MCQA_PARTITION_PROTOCOL,
@@ -170,6 +174,8 @@ def _load_existing_run_payload(output_path: Path) -> dict[str, object] | None:
     except Exception:
         return None
     if not isinstance(payload, dict):
+        return None
+    if not payload_uses_unified_iia(payload) or not payload_uses_pooled_iia_calibration(payload):
         return None
     return payload
 

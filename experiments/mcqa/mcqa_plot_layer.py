@@ -8,7 +8,12 @@ from time import perf_counter
 
 import mcqa_run as base_run
 import torch
-from mcqa_experiment.checking import payload_uses_unified_iia
+from mcqa_experiment.checking import (
+    POOLED_CALIBRATION_METRIC,
+    iia_acc_from_metrics,
+    payload_uses_pooled_iia_calibration,
+    payload_uses_unified_iia,
+)
 from mcqa_experiment.data import MCQA_PARTITION_PROTOCOL, canonicalize_target_var
 from mcqa_experiment.ot import (
     OTConfig,
@@ -35,7 +40,7 @@ DEFAULT_TARGET_VARS = ("answer_pointer", "answer_token")
 DEFAULT_COUNTERFACTUAL_NAMES = ("answerPosition", "randomLetter", "answerPosition_randomLetter")
 DEFAULT_TOKEN_POSITION_ID = "last_token"
 DEFAULT_SIGNATURE_MODE = "family_label_delta_norm"
-DEFAULT_CALIBRATION_METRIC = "family_weighted_macro_iia_acc"
+DEFAULT_CALIBRATION_METRIC = POOLED_CALIBRATION_METRIC
 DEFAULT_CALIBRATION_FAMILY_WEIGHTS = (1.0, 1.0, 1.0)
 DEFAULT_OT_EPSILONS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_UOT_BETA_NEURALS = (0.1, 0.3, 1.0, 3.0)
@@ -135,7 +140,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--calibration-family-weights",
-        help="Comma-separated family weights in answerPosition,randomLetter,answerPosition_randomLetter order. Default: 1,1,1",
+        help="Deprecated compatibility option; ignored by pooled MCQA calibration.",
     )
     parser.add_argument("--support-score-slack", type=float, default=0.05)
     parser.add_argument("--signature-mode", default=DEFAULT_SIGNATURE_MODE)
@@ -175,7 +180,13 @@ def _load_existing_payload(path: Path) -> dict[str, object] | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
-    return payload if isinstance(payload, dict) and payload_uses_unified_iia(payload) else None
+    return (
+        payload
+        if isinstance(payload, dict)
+        and payload_uses_unified_iia(payload)
+        and payload_uses_pooled_iia_calibration(payload)
+        else None
+    )
 
 
 def _target_row_ranking(payload: dict[str, object], *, sites) -> list[dict[str, object]]:
@@ -338,25 +349,6 @@ def _sanitize_stage_a_eval_result(record: dict[str, object]) -> dict[str, object
     return cleaned
 
 
-def _stage_a_calibration_score(
-    *,
-    result: dict[str, object],
-    calibration_family_weights: tuple[float, ...],
-) -> float:
-    iia_acc = float(result.get("iia_acc", 0.0))
-    family_iia_accs = result.get("family_iia_accs", {})
-    if not isinstance(family_iia_accs, dict):
-        return iia_acc
-    weighted_sum = 0.0
-    total_weight = 0.0
-    for family_name, weight in zip(DEFAULT_COUNTERFACTUAL_NAMES, calibration_family_weights):
-        if family_name not in family_iia_accs:
-            continue
-        weighted_sum += float(weight) * float(family_iia_accs[family_name])
-        total_weight += float(weight)
-    return iia_acc if total_weight <= 0.0 else float(weighted_sum / total_weight)
-
-
 def _evaluate_fixed_single_layer_calibration_only(
     *,
     model,
@@ -367,7 +359,6 @@ def _evaluate_fixed_single_layer_calibration_only(
     device,
     batch_size: int,
     strength: float,
-    calibration_family_weights: tuple[float, ...],
 ) -> dict[str, object]:
     eval_start = perf_counter()
     calibration_result, calibration_ranking = _evaluate_single_site_intervention(
@@ -382,10 +373,7 @@ def _evaluate_fixed_single_layer_calibration_only(
         include_details=True,
     )
     calibration_result = _sanitize_stage_a_eval_result(calibration_result)
-    calibration_score = _stage_a_calibration_score(
-        result=calibration_result,
-        calibration_family_weights=calibration_family_weights,
-    )
+    calibration_score = iia_acc_from_metrics(calibration_result)
     runtime_seconds = float(perf_counter() - eval_start)
     return {
         "target_var": str(calibration_bank.target_var),
@@ -522,7 +510,6 @@ def _evaluate_stage_a_config(
                 device=device,
                 batch_size=int(batch_size),
                 strength=float(DEFAULT_STAGE_A_INTERVENTION_STRENGTH),
-                calibration_family_weights=calibration_family_weights,
             )
             calibration_sweep_runtime_seconds += float(calibration_eval_payload.get("runtime_seconds", 0.0))
             calibration_result = calibration_eval_payload.get("selected_calibration_result", {})

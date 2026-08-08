@@ -10,7 +10,9 @@ from mcqa_experiment.checking import (
     checker_accuracy,
     normalize_answer_symbol,
     normalized_answer_checker,
+    payload_uses_pooled_iia_calibration,
     payload_uses_unified_iia,
+    require_pooled_calibration_metric,
     selection_metric_from_metrics,
 )
 from mcqa_experiment.metrics import (
@@ -21,6 +23,7 @@ from mcqa_experiment.metrics import (
 )
 from mcqa_experiment.ot import (
     OTConfig,
+    _calibration_score_from_result,
     _select_bruteforce_site,
     _select_hyperparameters,
     solve_bruteforce_coupling_transport,
@@ -293,6 +296,72 @@ def test_legacy_cached_verdicts_are_rejected() -> None:
     )
 
 
+def test_mcqa_calibration_is_pooled_across_examples() -> None:
+    result = {
+        "iia_acc": 0.25,
+        "family_iia_accs": {
+            "answerPosition": 1.0,
+            "randomLetter": 0.0,
+            "answerPosition_randomLetter": 0.0,
+        },
+    }
+    config = OTConfig(calibration_metric="iia_acc")
+    assert _calibration_score_from_result(result, config) == pytest.approx(0.25)
+    require_pooled_calibration_metric("iia_acc")
+
+    legacy_metric = "family_weighted_macro_iia_acc"
+    with pytest.raises(ValueError, match="pooled iia_acc"):
+        _calibration_score_from_result(
+            result,
+            OTConfig(calibration_metric=legacy_metric),
+        )
+    assert payload_uses_pooled_iia_calibration(
+        {"config": {"calibration_metric": "iia_acc"}}
+    )
+    assert not payload_uses_pooled_iia_calibration(
+        {"runs": [{"config": {"calibration_metric": legacy_metric}}]}
+    )
+    assert not payload_uses_pooled_iia_calibration(
+        {"kind": "mcqa_plot_pca_support_layer"}
+    )
+    assert payload_uses_pooled_iia_calibration(
+        {
+            "kind": "mcqa_plot_pca_support_layer",
+            "calibration_metric": "iia_acc",
+        }
+    )
+
+
+def test_stage_a_layer_calibration_is_pooled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcqa_plot_layer import _evaluate_fixed_single_layer_calibration_only
+
+    def fake_evaluate(**_kwargs):
+        return {
+            "iia_acc": 0.25,
+            "family_iia_accs": {
+                "answerPosition": 1.0,
+                "randomLetter": 0.0,
+                "answerPosition_randomLetter": 0.0,
+            },
+        }, []
+
+    monkeypatch.setattr(
+        "mcqa_plot_layer._evaluate_single_site_intervention",
+        fake_evaluate,
+    )
+    payload = _evaluate_fixed_single_layer_calibration_only(
+        model=None,
+        tokenizer=None,
+        calibration_bank=SimpleNamespace(target_var="answer_pointer"),
+        site=SimpleNamespace(label="L1:last_token", layer=1),
+        site_index=0,
+        device=torch.device("cpu"),
+        batch_size=1,
+        strength=1.0,
+    )
+    assert payload["calibration_score"] == pytest.approx(0.25)
+
+
 def test_all_verdict_bearing_paths_name_iia_not_legacy_accuracy() -> None:
     root = Path(__file__).resolve().parent
     paths = [
@@ -323,6 +392,7 @@ def test_all_verdict_bearing_paths_name_iia_not_legacy_accuracy() -> None:
         "fit_bank_single_site_exact_acc",
         'get("exact_acc"',
         '["exact_acc"]',
+        "family_weighted_macro_iia_acc",
     )
     for path in paths:
         source = path.read_text(encoding="utf-8")
