@@ -9,6 +9,7 @@ Entry points:
 - `run_progressive_plot_stage_b_resolution_sweep.py`: rerun native Stage B from a cached Stage A result.
 - `plot_progressive_heatmaps.py`: render paper heatmaps for PLOT, PLOT-native, PLOT-PCA, PLOT-DAS, and full DAS handles.
 - `run_mib_baselines.py`: run Full State, canonical DBM, and DBM+PCA over all recurrent timesteps, selecting timesteps on calibration data before test reporting.
+- `run_local_binary_addition_10seed_suite.sh`: run the complete ten-seed suite serially on Apple Metal with the `torch-metal` environment.
 - `slurm/run_delta_binary_addition_10seed_suite.sh`: run the complete hidden-size-16, ten-seed paper suite across four allocated GPUs and write one combined `suite_summary.json`. It does not run Boundless DAS.
 - `slurm/submit_delta_binary_addition_10seed_suite.sh`: request one four-A40 Delta node and submit the complete suite.
 

@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
 
 from experiments.binary_addition.data import enumerate_all_examples, stratified_base_split
-from experiments.binary_addition.model import TrainConfig, exact_accuracy, train_backbone
+from experiments.binary_addition.model import TrainConfig, exact_accuracy, resolve_device, train_backbone
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--learning-rate", type=float, default=1e-2)
     ap.add_argument("--weight-decay", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda", "mps"])
     ap.add_argument("--fit-bases", type=int, default=128)
     ap.add_argument("--calib-bases", type=int, default=64)
     ap.add_argument("--test-bases", type=int, default=64)
@@ -60,7 +60,7 @@ def main() -> None:
     )
     model, train_summary = train_backbone(cfg, train_examples=train_examples, eval_examples=eval_examples)
 
-    device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
     result = {
         "config": vars(args),
         "split_sizes": {"fit": len(split.fit), "calib": len(split.calib), "test": len(split.test)},

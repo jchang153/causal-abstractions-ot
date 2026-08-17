@@ -25,7 +25,7 @@ from experiments.binary_addition.dbm_baselines import (
     train_dbm,
 )
 from experiments.binary_addition.interventions import build_run_cache
-from experiments.binary_addition.model import exact_accuracy
+from experiments.binary_addition.model import exact_accuracy, resolve_device
 from experiments.binary_addition.run_joint_endogenous_resolution_sweep import (
     EndogenousRowSpec,
     _bank_summaries,
@@ -182,11 +182,15 @@ def warm_dbm_optimizer(device: torch.device) -> None:
     optimizer.step()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -208,7 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calib-bases", type=int, default=64)
     parser.add_argument("--test-bases", type=int, default=64)
     parser.add_argument("--source-policy", default="structured_26_top3carry_c2x5_c3x7_no_random")
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cuda")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=8)
@@ -260,9 +264,9 @@ def main() -> None:
     specs = tuple(
         EndogenousRowSpec(key=row, kind="carry", index=int(row[1:])) for row in row_keys
     )
-    device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
-    if args.device == "cuda" and device.type != "cuda":
-        raise RuntimeError("CUDA requested but unavailable; run inside the allocated srun step")
+    device = resolve_device(args.device)
+    if str(args.device) != "cpu" and device.type != str(args.device):
+        raise RuntimeError(f"{args.device} requested but unavailable")
     if any(method.startswith("dbm-") for method in methods):
         warm_dbm_optimizer(device)
     run_name = args.run_name or f"binary_addition_mib_baselines_{datetime.now().strftime('%Y%m%d_%H%M%S')}"

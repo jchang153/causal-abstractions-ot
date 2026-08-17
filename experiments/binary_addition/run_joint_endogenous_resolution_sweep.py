@@ -15,7 +15,7 @@ sys.path.append(str(ROOT))
 
 from experiments.binary_addition.data import BaseSplit, enumerate_all_examples, stratified_base_split
 from experiments.binary_addition.interventions import build_run_cache, intervene_with_site_handle_batch
-from experiments.binary_addition.model import GRUAdder, TrainConfig, exact_accuracy, train_backbone
+from experiments.binary_addition.model import GRUAdder, TrainConfig, exact_accuracy, resolve_device, train_backbone
 from experiments.binary_addition.pca_basis import fit_pca_rotations
 from experiments.binary_addition.scm import BinaryAdditionExample, intervene_carries
 from experiments.binary_addition.sites import (
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--resolutions", type=str, default="")
     ap.add_argument("--methods", type=str, default="ot,uot")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda", "mps"])
     ap.add_argument("--fit-bases", type=int, default=128)
     ap.add_argument("--calib-bases", type=int, default=64)
     ap.add_argument("--test-bases", type=int, default=64)
@@ -885,7 +885,7 @@ def _load_or_train_model(
     examples: Sequence[BinaryAdditionExample],
     split: BaseSplit,
 ) -> tuple[GRUAdder, dict[str, object]]:
-    device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
     checkpoint_text = str(getattr(args, "model_checkpoint", "")).strip()
     if checkpoint_text:
         checkpoint_path = Path(checkpoint_text).resolve()
@@ -950,7 +950,7 @@ def main() -> None:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
     examples = enumerate_all_examples(width=int(args.width))
     split = stratified_base_split(
         examples,

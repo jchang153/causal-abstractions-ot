@@ -64,6 +64,15 @@ class GRUAdder(nn.Module):
         }
 
 
+def resolve_device(name: str | torch.device) -> torch.device:
+    requested = str(name)
+    if requested == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+    if requested == "mps" and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def examples_to_tensors(examples: Sequence[BinaryAdditionExample]) -> tuple[torch.Tensor, torch.Tensor]:
     x_rows = []
     y_rows = []
@@ -114,7 +123,7 @@ def train_backbone(
     eval_examples: Sequence[BinaryAdditionExample] | None = None,
 ) -> tuple[GRUAdder, dict[str, object]]:
     _seed_everything(config.seed)
-    device = torch.device("cuda" if config.device == "cuda" and torch.cuda.is_available() else "cpu")
+    device = resolve_device(config.device)
 
     if eval_examples is None:
         eval_examples = train_examples

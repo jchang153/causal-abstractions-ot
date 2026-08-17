@@ -19,7 +19,7 @@ sys.path.append(str(ROOT))
 from experiments.binary_addition.das import RotatedSubspace
 from experiments.binary_addition.data import enumerate_all_examples, stratified_base_split
 from experiments.binary_addition.interventions import RunCache, build_run_cache, intervene_with_site_handle_batch
-from experiments.binary_addition.model import GRUAdder, exact_accuracy
+from experiments.binary_addition.model import GRUAdder, exact_accuracy, resolve_device
 from experiments.binary_addition.pca_basis import RotatedBasis, fit_pca_rotations
 from experiments.binary_addition.run_joint_endogenous_resolution_sweep import (
     EndogenousPairRecord,
@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--checkpoint-map", type=str, default="")
     ap.add_argument("--width", type=int, default=4)
     ap.add_argument("--rows", type=str, default="C1,C2,C3")
-    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda", "mps"])
     ap.add_argument("--fit-bases", type=int, default=128)
     ap.add_argument("--calib-bases", type=int, default=64)
     ap.add_argument("--test-bases", type=int, default=64)
@@ -168,6 +168,8 @@ def _parse_rows(text: str) -> tuple[str, ...]:
 def _synchronize_device(device: torch.device | None) -> None:
     if device is not None and device.type == "cuda":
         torch.cuda.synchronize(device)
+    elif device is not None and device.type == "mps":
+        torch.mps.synchronize()
 
 
 def _checkpoint_map(hidden_size: int) -> dict[int, str]:
@@ -1267,6 +1269,8 @@ def _warm_das_optimizer(device: torch.device) -> None:
     optimizer.step()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def _das_exact_match_rate(
@@ -1691,7 +1695,9 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         print(f"[rebuild] {summary_path} uses a different fit/split protocol")
     seed_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
+    if str(args.device) != "cpu" and device.type != str(args.device):
+        raise RuntimeError(f"{args.device} requested but unavailable")
     row_keys = _parse_rows(args.rows)
     examples = enumerate_all_examples(width=int(args.width))
     split = stratified_base_split(
