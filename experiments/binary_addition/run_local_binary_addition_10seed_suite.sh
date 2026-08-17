@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-/Users/jchang153/miniforge3/envs/torch-metal/bin/python}"
-DEVICE="${DEVICE:-mps}"
+DEVICE="${DEVICE:-cpu}"
 RUN_NAME="${RUN_NAME:-binary_addition_h16_10seeds_local_$(date +%Y%m%d_%H%M%S)}"
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
 RUN_DIR="${RESULTS_ROOT}/${RUN_NAME}"
@@ -16,7 +16,11 @@ export PYTHONUNBUFFERED=1
 
 cd "${REPO_ROOT}"
 mkdir -p "${RUN_DIR}" "${MPLCONFIGDIR}"
-"${PYTHON_BIN}" -c 'import torch; assert torch.backends.mps.is_available(), "MPS unavailable"'
+if [[ "${DEVICE}" == "mps" ]]; then
+  "${PYTHON_BIN}" -c 'import torch; assert torch.backends.mps.is_available(), "MPS unavailable"'
+else
+  "${PYTHON_BIN}" -c 'import torch; print(f"torch={torch.__version__} device=cpu")'
+fi
 
 run_seed_suite() {
   local seed="$1"
