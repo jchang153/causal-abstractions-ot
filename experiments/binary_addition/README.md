@@ -9,6 +9,8 @@ Entry points:
 - `run_progressive_plot_stage_b_resolution_sweep.py`: rerun native Stage B from a cached Stage A result.
 - `plot_progressive_heatmaps.py`: render paper heatmaps for PLOT, PLOT-native, PLOT-PCA, PLOT-DAS, and full DAS handles.
 - `run_mib_baselines.py`: run Full State, canonical DBM, and DBM+PCA over all recurrent timesteps, selecting timesteps on calibration data before test reporting.
+- `slurm/run_delta_binary_addition_10seed_suite.sh`: run the complete hidden-size-16, ten-seed paper suite across four allocated GPUs and write one combined `suite_summary.json`. It does not run Boundless DAS.
+- `slurm/submit_delta_binary_addition_10seed_suite.sh`: request one four-A40 Delta node and submit the complete suite.
 
 Transport sweeps use one shared epsilon across abstract variables.  For each
 epsilon, every variable selects its best resolution on calibration data; the
@@ -29,14 +31,21 @@ construction.
 
 Binary-addition DAS now follows the MCQA optimization protocol where applicable: one
 fixed learning rate (`0.01`, selected from the completed seed-0/ten-seed calibration
-history), two reproducible random restarts, batch size 64, full anchored fit banks, and
+history), two reproducible random restarts, batch size 64, full shared fit banks, and
 loss-plateau stopping with 5 minimum epochs, 100 maximum epochs, patience 1, and relative
 improvement threshold `1e-3`. DAS intervention strength is fixed to `1.0`; transport
 lambda grids are not reused for DAS calibration.
 
-The Delta launcher `slurm/run_delta_binary_addition_mib_baselines.sh` runs the three MIB-style
-baselines for seeds 0--2 and carries `C1`--`C3` in one resume-safe `srun`. It uses the main-paper
-128/64/64 base split and the structured source policy used by the progressive PLOT experiment.
+The Delta launcher `slurm/run_delta_binary_addition_10seed_suite.sh` assigns seeds across four
+GPU workers. It sweeps canonical PLOT resolutions and PCA-prefix sizes 1, 2, 4, 8, and 16 for
+both single- and two-stage variants, alongside PLOT-DAS and Full DAS
+branches; canonical/PCA DBM and Full Vector; and the native cosine and brute-force variants.
+Optional support-guided DAS variants and Boundless DAS are skipped. All methods use the same
+128/64/64 base split, corresponding to 3,328 fit pairs, 1,664 calibration pairs, and 1,664 test
+pairs per abstract variable. Canonical and PCA DBM sweep the summed-mask regularization
+coefficient over 0, 1e-5, 1e-4, and 1e-3. Calibration jointly selects the coefficient and
+timestep for each abstract variable, with mask size as a tie-breaker, and reported DBM runtime
+includes every coefficient/timestep candidate.
 
 Example Stage B rerun:
 

@@ -134,6 +134,21 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--das-batch-size", type=int, default=64)
     ap.add_argument("--skip-das", action="store_true")
+    ap.add_argument(
+        "--skip-support-guided-das",
+        action="store_true",
+        help="Skip the optional native-support and PCA-support DAS variants while retaining PLOT-DAS and Full DAS.",
+    )
+    ap.add_argument(
+        "--skip-pca",
+        action="store_true",
+        help="Skip PCA fitting and the Stage-B PCA branch (useful for native cosine/brute-force runs).",
+    )
+    ap.add_argument(
+        "--exclude-stage-a-method",
+        action="store_true",
+        help="Keep Stage A as pipeline preparation but omit its standalone method row from summaries.",
+    )
     ap.add_argument("--skip-existing", action="store_true")
     return ap.parse_args()
 
@@ -1663,6 +1678,11 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
             "test_bases": int(args.test_bases),
             "source_policy": str(args.source_policy),
             "rows": str(args.rows),
+            "alignment_method": str(args.alignment_method),
+            "skip_das": bool(args.skip_das),
+            "skip_support_guided_das": bool(args.skip_support_guided_das),
+            "skip_pca": bool(args.skip_pca),
+            "exclude_stage_a_method": bool(args.exclude_stage_a_method),
         }
         if isinstance(existing_config, dict) and all(
             existing_config.get(key) == value for key, value in expected_protocol.items()
@@ -1694,12 +1714,12 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     alignment_label = {"cosine": "Cosine", "bruteforce": "Brute-force"}.get(alignment_method, "OT")
     alignment_suffix = {"cosine": "cosine", "bruteforce": "bruteforce"}.get(alignment_method, "ot")
     native_method_name = {
-        "cosine": "cosine-native",
-        "bruteforce": "brute-force-native",
+        "cosine": "PLOT-native-cosine",
+        "bruteforce": "PLOT-native-brute-force",
     }.get(alignment_method, "PLOT-native")
     pca_method_name = {
-        "cosine": "cosine-pca",
-        "bruteforce": "brute-force-pca",
+        "cosine": "PLOT-PCA-cosine",
+        "bruteforce": "PLOT-PCA-brute-force",
     }.get(alignment_method, "PLOT-PCA")
 
     specs_all = _row_specs("all_endogenous", int(args.width))
@@ -1794,53 +1814,58 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         row_allowed_timesteps=row_allowed_timesteps,
     )
 
-    _synchronize_device(device)
-    pca_start = time.perf_counter()
-    rotation_map, pca_diagnostics = fit_pca_rotations(
-        fit_examples=split.fit,
-        run_cache=run_cache,
-        width=int(args.width),
-        hidden_size=int(args.hidden_size),
-        variant=str(args.pca_variant),
-    )
-    _synchronize_device(device)
-    pca_fit_seconds = time.perf_counter() - pca_start
-
-    pca_resolutions = _parse_ints(args.pca_resolutions) if str(args.pca_resolutions).strip() else _default_resolutions(int(args.hidden_size))
-    pca_sites_by_resolution = {
-        int(resolution): _build_rotated_sites(
-            timesteps=selected_timesteps,
+    rotation_map = None
+    pca_diagnostics = None
+    pca_fit_seconds = 0.0
+    stage_b_pca = None
+    if not bool(args.skip_pca):
+        _synchronize_device(device)
+        pca_start = time.perf_counter()
+        rotation_map, pca_diagnostics = fit_pca_rotations(
+            fit_examples=split.fit,
+            run_cache=run_cache,
+            width=int(args.width),
             hidden_size=int(args.hidden_size),
-            resolutions=(int(resolution),),
-            site_menu=str(args.pca_site_menu),
+            variant=str(args.pca_variant),
         )
-        for resolution in pca_resolutions
-    }
-    stage_b_pca = _run_alignment_resolution_sweep(
-        stage_name=f"stage_b_pca_{alignment_suffix}_inside_stage_a_timesteps",
-        alignment_method=alignment_method,
-        model=model,
-        specs=specs,
-        row_keys=row_keys,
-        banks=banks,
-        sites_by_resolution=pca_sites_by_resolution,
-        family_order=family_order,
-        transport_cfg=transport_stage_b,
-        selection_rule=str(args.selection_rule),
-        invariance_floor=float(args.invariance_floor),
-        device=device,
-        run_cache=run_cache,
-        batch_size=int(args.das_batch_size),
-        normalize_signatures=bool(args.normalize_signatures),
-        fit_signature_mode=str(args.fit_signature_mode),
-        fit_stratify_mode=str(args.fit_stratify_mode),
-        fit_family_profile=str(args.fit_family_profile),
-        cost_metric=str(args.cost_metric),
-        cosine_temperature=float(args.cosine_temperature),
-        bruteforce_temperature=float(args.bruteforce_temperature),
-        rotation_map=rotation_map,
-        row_allowed_timesteps=row_allowed_timesteps,
-    )
+        _synchronize_device(device)
+        pca_fit_seconds = time.perf_counter() - pca_start
+
+        pca_resolutions = _parse_ints(args.pca_resolutions) if str(args.pca_resolutions).strip() else _default_resolutions(int(args.hidden_size))
+        pca_sites_by_resolution = {
+            int(resolution): _build_rotated_sites(
+                timesteps=selected_timesteps,
+                hidden_size=int(args.hidden_size),
+                resolutions=(int(resolution),),
+                site_menu=str(args.pca_site_menu),
+            )
+            for resolution in pca_resolutions
+        }
+        stage_b_pca = _run_alignment_resolution_sweep(
+            stage_name=f"stage_b_pca_{alignment_suffix}_inside_stage_a_timesteps",
+            alignment_method=alignment_method,
+            model=model,
+            specs=specs,
+            row_keys=row_keys,
+            banks=banks,
+            sites_by_resolution=pca_sites_by_resolution,
+            family_order=family_order,
+            transport_cfg=transport_stage_b,
+            selection_rule=str(args.selection_rule),
+            invariance_floor=float(args.invariance_floor),
+            device=device,
+            run_cache=run_cache,
+            batch_size=int(args.das_batch_size),
+            normalize_signatures=bool(args.normalize_signatures),
+            fit_signature_mode=str(args.fit_signature_mode),
+            fit_stratify_mode=str(args.fit_stratify_mode),
+            fit_family_profile=str(args.fit_family_profile),
+            cost_metric=str(args.cost_metric),
+            cosine_temperature=float(args.cosine_temperature),
+            bruteforce_temperature=float(args.bruteforce_temperature),
+            rotation_map=rotation_map,
+            row_allowed_timesteps=row_allowed_timesteps,
+        )
 
     full_timestep_supports = {
         row_key: (
@@ -1853,45 +1878,46 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         )
         for row_key in row_keys
     }
-    pca_supports = {}
+    pca_supports = {row_key: tuple() for row_key in row_keys}
     canonical_ot_supports = {}
     canonical_thresholds = _parse_floats(args.canonical_mask_thresholds)
     pca_prefix_dims = tuple(dim for dim in _parse_ints(args.pca_prefix_dims) if 1 <= int(dim) <= int(args.hidden_size))
     include_full_fallback = not bool(args.no_full_support_fallback)
     for row_key in row_keys:
         timestep = int(stage_a_timesteps[row_key])
-        pca_components = _pca_component_union(
-            stage_b_pca["best_trial"]["test"]["per_row"][row_key],
-            hidden_size=int(args.hidden_size),
-            timestep=timestep,
-        )
-        pca_menu = [
-            DASSupport(
-                name=f"{row_key}_pca_ot_selected_h{timestep}",
-                basis="pca",
+        if stage_b_pca is not None:
+            pca_components = _pca_component_union(
+                stage_b_pca["best_trial"]["test"]["per_row"][row_key],
+                hidden_size=int(args.hidden_size),
                 timestep=timestep,
-                indices=pca_components,
             )
-        ]
-        for dim in pca_prefix_dims:
-            pca_menu.append(
+            pca_menu = [
                 DASSupport(
-                    name=f"{row_key}_pca_top{int(dim)}_h{timestep}",
+                    name=f"{row_key}_pca_ot_selected_h{timestep}",
                     basis="pca",
                     timestep=timestep,
-                    indices=tuple(range(int(dim))),
+                    indices=pca_components,
                 )
-            )
-        if include_full_fallback:
-            pca_menu.append(
-                DASSupport(
-                    name=f"{row_key}_pca_full_h{timestep}",
-                    basis="pca",
-                    timestep=timestep,
-                    indices=tuple(range(int(args.hidden_size))),
+            ]
+            for dim in pca_prefix_dims:
+                pca_menu.append(
+                    DASSupport(
+                        name=f"{row_key}_pca_top{int(dim)}_h{timestep}",
+                        basis="pca",
+                        timestep=timestep,
+                        indices=tuple(range(int(dim))),
+                    )
                 )
-            )
-        pca_supports[row_key] = _unique_supports(tuple(pca_menu))
+            if include_full_fallback:
+                pca_menu.append(
+                    DASSupport(
+                        name=f"{row_key}_pca_full_h{timestep}",
+                        basis="pca",
+                        timestep=timestep,
+                        indices=tuple(range(int(args.hidden_size))),
+                    )
+                )
+            pca_supports[row_key] = _unique_supports(tuple(pca_menu))
 
         canonical_coords = _canonical_site_union(
             stage_b_canonical["best_trial"]["test"]["per_row"][row_key],
@@ -1986,7 +2012,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         device=device,
         run_cache=run_cache,
         rotation_map=None,
-        skip=bool(args.skip_das),
+        skip=bool(args.skip_das or args.skip_support_guided_das),
     )
     stage_b_das_pca = _run_das_stage(
         stage_name="stage_b_das_inside_pca_ot_support",
@@ -2011,7 +2037,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         device=device,
         run_cache=run_cache,
         rotation_map=rotation_map,
-        skip=bool(args.skip_das),
+        skip=bool(args.skip_das or args.skip_support_guided_das or args.skip_pca),
     )
     full_das_supports = {
         row_key: tuple(
@@ -2058,7 +2084,11 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     )
     stage_a_breakdown["stage_a_search_runtime_seconds"] = float(stage_a_search_seconds)
     stage_b_canonical_breakdown = _alignment_stage_runtime_breakdown("stage_b_canonical", stage_b_canonical)
-    stage_b_pca_breakdown = _alignment_stage_runtime_breakdown("stage_b_pca", stage_b_pca)
+    stage_b_pca_breakdown = (
+        _alignment_stage_runtime_breakdown("stage_b_pca", stage_b_pca)
+        if stage_b_pca is not None
+        else {}
+    )
     pca_fit_breakdown = {"pca_fit_runtime_seconds": float(pca_fit_seconds)}
     stage_b_das_full_breakdown = _das_stage_runtime_breakdown("stage_b_das_full_timestep", stage_b_das_full)
     stage_b_das_canonical_breakdown = _das_stage_runtime_breakdown(
@@ -2068,25 +2098,27 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     stage_b_das_pca_breakdown = _das_stage_runtime_breakdown("stage_b_das_pca_support", stage_b_das_pca)
     full_das_breakdown = _das_stage_runtime_breakdown("full_das", full_das)
 
-    methods = {
-        f"stage_a_{alignment_suffix}": _method_record(
+    methods = {}
+    if not bool(args.exclude_stage_a_method):
+        methods[f"stage_a_{alignment_suffix}"] = _method_record(
             name=f"PLOT Stage-A {alignment_label}",
             accuracy_source=stage_a["best_trial"],
             runtime_seconds=float(stage_a["runtime_seconds"]),
             row_keys=row_keys,
             runtime_breakdown=stage_a_breakdown,
-        ),
-        "plot_in_timestep": _method_record(
-            name=native_method_name,
-            accuracy_source=stage_b_canonical["best_trial"],
-            runtime_seconds=float(stage_a_search_seconds) + float(stage_b_canonical["runtime_seconds"]),
-            row_keys=row_keys,
-            runtime_breakdown={
-                **stage_a_breakdown,
-                **stage_b_canonical_breakdown,
-            },
-        ),
-        "plot_pca_in_timestep": _method_record(
+        )
+    methods["plot_in_timestep"] = _method_record(
+        name=native_method_name,
+        accuracy_source=stage_b_canonical["best_trial"],
+        runtime_seconds=float(stage_a_search_seconds) + float(stage_b_canonical["runtime_seconds"]),
+        row_keys=row_keys,
+        runtime_breakdown={
+            **stage_a_breakdown,
+            **stage_b_canonical_breakdown,
+        },
+    )
+    if stage_b_pca is not None:
+        methods["plot_pca_in_timestep"] = _method_record(
             name=pca_method_name,
             accuracy_source=stage_b_pca["best_trial"],
             runtime_seconds=float(stage_a_search_seconds) + float(pca_fit_seconds) + float(stage_b_pca["runtime_seconds"]),
@@ -2096,29 +2128,30 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
                 **pca_fit_breakdown,
                 **stage_b_pca_breakdown,
             },
-        ),
-        "plot_guided_das_full_timestep": _method_record(
-            name="PLOT-guided DAS full timestep",
-            accuracy_source=stage_b_das_full,
-            runtime_seconds=float(stage_a_search_seconds) + float(stage_b_das_full["runtime_seconds"]),
-            row_keys=row_keys,
-            runtime_breakdown={
-                **stage_a_breakdown,
-                **stage_b_das_full_breakdown,
-            },
-        ),
-        "plot_guided_das_canonical_support": _method_record(
-            name="PLOT-guided DAS canonical support",
-            accuracy_source=stage_b_das_canonical,
-            runtime_seconds=float(stage_a_search_seconds) + float(stage_b_canonical["runtime_seconds"]) + float(stage_b_das_canonical["runtime_seconds"]),
-            row_keys=row_keys,
-            runtime_breakdown={
-                **stage_a_breakdown,
-                **stage_b_canonical_breakdown,
-                **stage_b_das_canonical_breakdown,
-            },
-        ),
-        "plot_pca_guided_das": _method_record(
+        )
+    methods["plot_guided_das_full_timestep"] = _method_record(
+        name="PLOT-DAS",
+        accuracy_source=stage_b_das_full,
+        runtime_seconds=float(stage_a_search_seconds) + float(stage_b_das_full["runtime_seconds"]),
+        row_keys=row_keys,
+        runtime_breakdown={
+            **stage_a_breakdown,
+            **stage_b_das_full_breakdown,
+        },
+    )
+    methods["plot_guided_das_canonical_support"] = _method_record(
+        name="PLOT-guided DAS canonical support",
+        accuracy_source=stage_b_das_canonical,
+        runtime_seconds=float(stage_a_search_seconds) + float(stage_b_canonical["runtime_seconds"]) + float(stage_b_das_canonical["runtime_seconds"]),
+        row_keys=row_keys,
+        runtime_breakdown={
+            **stage_a_breakdown,
+            **stage_b_canonical_breakdown,
+            **stage_b_das_canonical_breakdown,
+        },
+    )
+    if stage_b_pca is not None:
+        methods["plot_pca_guided_das"] = _method_record(
             name="PLOT-PCA-guided DAS",
             accuracy_source=stage_b_das_pca,
             runtime_seconds=float(stage_a_search_seconds) + float(pca_fit_seconds) + float(stage_b_pca["runtime_seconds"]) + float(stage_b_das_pca["runtime_seconds"]),
@@ -2129,15 +2162,14 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
                 **stage_b_pca_breakdown,
                 **stage_b_das_pca_breakdown,
             },
-        ),
-        "full_das": _method_record(
-            name="Full DAS",
-            accuracy_source=full_das,
-            runtime_seconds=float(full_das["runtime_seconds"]),
-            row_keys=row_keys,
-            runtime_breakdown=full_das_breakdown,
-        ),
-    }
+        )
+    methods["full_das"] = _method_record(
+        name="Full DAS",
+        accuracy_source=full_das,
+        runtime_seconds=float(full_das["runtime_seconds"]),
+        row_keys=row_keys,
+        runtime_breakdown=full_das_breakdown,
+    )
     if bool(args.skip_das):
         for method_key in (
             "plot_guided_das_full_timestep",
@@ -2146,6 +2178,9 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
             "full_das",
         ):
             methods.pop(method_key, None)
+    elif bool(args.skip_support_guided_das):
+        methods.pop("plot_guided_das_canonical_support", None)
+        methods.pop("plot_pca_guided_das", None)
 
     stage_a_expected = {f"C{i}": i - 1 for i in range(1, int(args.width))}
     stage_a_hits = [
@@ -2189,7 +2224,6 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         "stages": {
             "stage_a": stage_a,
             f"stage_b_canonical_{alignment_suffix}": stage_b_canonical,
-            f"stage_b_pca_{alignment_suffix}": stage_b_pca,
             "stage_b_das_full_timestep": stage_b_das_full,
             "stage_b_das_canonical_support": stage_b_das_canonical,
             "stage_b_das_pca_support": stage_b_das_pca,
@@ -2197,6 +2231,8 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         },
         "methods": methods,
     }
+    if stage_b_pca is not None:
+        result["stages"][f"stage_b_pca_{alignment_suffix}"] = stage_b_pca
     summary_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 
