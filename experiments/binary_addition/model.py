@@ -17,6 +17,7 @@ class TrainConfig:
     hidden_size: int = 16
     input_size: int = 2
     batch_size: int = 64
+    eval_batch_size: int = 4096
     epochs: int = 250
     learning_rate: float = 1e-2
     weight_decay: float = 0.0
@@ -84,30 +85,78 @@ def examples_to_tensors(examples: Sequence[BinaryAdditionExample]) -> tuple[torc
     return x, y
 
 
-def predict_bits(model: GRUAdder, examples: Sequence[BinaryAdditionExample], device: torch.device) -> torch.Tensor:
+def predict_bits(
+    model: GRUAdder,
+    examples: Sequence[BinaryAdditionExample],
+    device: torch.device,
+    *,
+    batch_size: int = 4096,
+) -> torch.Tensor:
     model.eval()
-    x, _ = examples_to_tensors(examples)
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive")
+    chunks: list[torch.Tensor] = []
     with torch.no_grad():
-        logits = model(x.to(device))["output_logits"]
-    return (torch.sigmoid(logits) >= 0.5).to(torch.int64).cpu()
+        for start in range(0, len(examples), int(batch_size)):
+            batch = examples[start : start + int(batch_size)]
+            x, _ = examples_to_tensors(batch)
+            logits = model(x.to(device))["output_logits"]
+            chunks.append((torch.sigmoid(logits) >= 0.5).to(torch.int64).cpu())
+    if not chunks:
+        return torch.empty((0, model.width + 1), dtype=torch.int64)
+    return torch.cat(chunks, dim=0)
 
 
-def exact_accuracy(model: GRUAdder, examples: Sequence[BinaryAdditionExample], device: torch.device) -> float:
+def accuracy_metrics(
+    model: GRUAdder,
+    examples: Sequence[BinaryAdditionExample],
+    device: torch.device,
+    *,
+    batch_size: int = 4096,
+) -> dict[str, float]:
     if not examples:
-        return 0.0
-    preds = predict_bits(model, examples, device=device)
-    _, y = examples_to_tensors(examples)
-    correct = (preds == y.to(torch.int64)).all(dim=1).float().mean().item()
-    return float(correct)
+        return {"exact": 0.0, "bit": 0.0}
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive")
+    model.eval()
+    exact_correct = 0
+    bit_correct = 0
+    bit_total = 0
+    with torch.no_grad():
+        for start in range(0, len(examples), int(batch_size)):
+            batch = examples[start : start + int(batch_size)]
+            x, y = examples_to_tensors(batch)
+            logits = model(x.to(device))["output_logits"]
+            preds = (torch.sigmoid(logits) >= 0.5).to(torch.int64).cpu()
+            targets = y.to(torch.int64)
+            matches = preds == targets
+            exact_correct += int(matches.all(dim=1).sum().item())
+            bit_correct += int(matches.sum().item())
+            bit_total += int(matches.numel())
+    return {
+        "exact": float(exact_correct / len(examples)),
+        "bit": float(bit_correct / max(1, bit_total)),
+    }
 
 
-def bit_accuracy(model: GRUAdder, examples: Sequence[BinaryAdditionExample], device: torch.device) -> float:
-    if not examples:
-        return 0.0
-    preds = predict_bits(model, examples, device=device)
-    _, y = examples_to_tensors(examples)
-    correct = (preds == y.to(torch.int64)).float().mean().item()
-    return float(correct)
+def exact_accuracy(
+    model: GRUAdder,
+    examples: Sequence[BinaryAdditionExample],
+    device: torch.device,
+    *,
+    batch_size: int = 4096,
+) -> float:
+    return float(accuracy_metrics(model, examples, device=device, batch_size=batch_size)["exact"])
+
+
+def bit_accuracy(
+    model: GRUAdder,
+    examples: Sequence[BinaryAdditionExample],
+    device: torch.device,
+    *,
+    batch_size: int = 4096,
+) -> float:
+    return float(accuracy_metrics(model, examples, device=device, batch_size=batch_size)["bit"])
 
 
 def _seed_everything(seed: int) -> None:
@@ -153,10 +202,25 @@ def train_backbone(
             epoch_loss += float(loss.item()) * batch_size
             n_items += batch_size
 
-        train_exact = exact_accuracy(model, train_examples, device=device)
-        eval_exact = exact_accuracy(model, eval_examples, device=device)
-        train_bit = bit_accuracy(model, train_examples, device=device)
-        eval_bit = bit_accuracy(model, eval_examples, device=device)
+        train_metrics = accuracy_metrics(
+            model,
+            train_examples,
+            device=device,
+            batch_size=int(config.eval_batch_size),
+        )
+        if eval_examples is train_examples:
+            eval_metrics = train_metrics
+        else:
+            eval_metrics = accuracy_metrics(
+                model,
+                eval_examples,
+                device=device,
+                batch_size=int(config.eval_batch_size),
+            )
+        train_exact = float(train_metrics["exact"])
+        eval_exact = float(eval_metrics["exact"])
+        train_bit = float(train_metrics["bit"])
+        eval_bit = float(eval_metrics["bit"])
         rec = {
             "epoch": float(epoch),
             "loss": epoch_loss / max(1, n_items),

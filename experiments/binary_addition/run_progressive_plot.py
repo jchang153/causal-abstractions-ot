@@ -21,6 +21,7 @@ from experiments.binary_addition.data import enumerate_all_examples, stratified_
 from experiments.binary_addition.interventions import RunCache, build_run_cache, intervene_with_site_handle_batch
 from experiments.binary_addition.model import GRUAdder, exact_accuracy, resolve_device
 from experiments.binary_addition.pca_basis import RotatedBasis, fit_pca_rotations
+from experiments.binary_addition.provenance import file_sha256, protocol_provenance
 from experiments.binary_addition.run_joint_endogenous_resolution_sweep import (
     EndogenousPairRecord,
     EndogenousRowSpec,
@@ -71,7 +72,7 @@ class DASSupport:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Progressive PLOT pipeline for the GRU binary-addition benchmark.")
     ap.add_argument("--out-dir", type=str, required=True)
-    ap.add_argument("--hidden-size", type=int, required=True, choices=[8, 16])
+    ap.add_argument("--hidden-size", type=int, required=True)
     ap.add_argument("--seeds", type=str, default="0,1,2")
     ap.add_argument("--checkpoint-map", type=str, default="")
     ap.add_argument("--width", type=int, default=4)
@@ -133,6 +134,7 @@ def parse_args() -> argparse.Namespace:
         help="Maximum fit records per epoch; 0 uses the complete shared fit bank.",
     )
     ap.add_argument("--das-batch-size", type=int, default=64)
+    ap.add_argument("--cache-batch-size", type=int, default=1024)
     ap.add_argument("--skip-das", action="store_true")
     ap.add_argument(
         "--skip-support-guided-das",
@@ -1676,6 +1678,8 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
         existing = json.loads(summary_path.read_text(encoding="utf-8"))
         existing_config = existing.get("config", {}) if isinstance(existing, dict) else {}
         expected_protocol = {
+            "width": int(args.width),
+            "hidden_size": int(args.hidden_size),
             "das_fit_bank_mode": str(args.das_fit_bank_mode),
             "fit_bases": int(args.fit_bases),
             "calib_bases": int(args.calib_bases),
@@ -1687,9 +1691,15 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
             "skip_support_guided_das": bool(args.skip_support_guided_das),
             "skip_pca": bool(args.skip_pca),
             "exclude_stage_a_method": bool(args.exclude_stage_a_method),
+            "canonical_resolutions": str(args.canonical_resolutions),
+            "pca_resolutions": str(args.pca_resolutions),
         }
-        if isinstance(existing_config, dict) and all(
-            existing_config.get(key) == value for key, value in expected_protocol.items()
+        existing_provenance = existing.get("protocol", {}) if isinstance(existing, dict) else {}
+        if (
+            isinstance(existing_config, dict)
+            and all(existing_config.get(key) == value for key, value in expected_protocol.items())
+            and isinstance(existing_provenance, dict)
+            and existing_provenance.get("checkpoint_sha256") == file_sha256(checkpoint)
         ):
             return existing
         print(f"[rebuild] {summary_path} uses a different fit/split protocol")
@@ -1698,7 +1708,11 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     device = resolve_device(args.device)
     if str(args.device) != "cpu" and device.type != str(args.device):
         raise RuntimeError(f"{args.device} requested but unavailable")
+    if int(args.hidden_size) <= 0:
+        raise ValueError("hidden_size must be positive")
     row_keys = _parse_rows(args.rows)
+    if not row_keys:
+        raise ValueError("at least one row is required")
     examples = enumerate_all_examples(width=int(args.width))
     split = stratified_base_split(
         examples,
@@ -1715,7 +1729,12 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
-    run_cache = build_run_cache(model, examples, device=device)
+    run_cache = build_run_cache(
+        model,
+        examples,
+        device=device,
+        batch_size=int(args.cache_batch_size),
+    )
     alignment_method = str(args.alignment_method).replace("-", "")
     alignment_label = {"cosine": "Cosine", "bruteforce": "Brute-force"}.get(alignment_method, "OT")
     alignment_suffix = {"cosine": "cosine", "bruteforce": "bruteforce"}.get(alignment_method, "ot")
@@ -1729,6 +1748,10 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
     }.get(alignment_method, "PLOT-PCA")
 
     specs_all = _row_specs("all_endogenous", int(args.width))
+    available_rows = {spec.key for spec in specs_all}
+    missing_rows = [row for row in row_keys if row not in available_rows]
+    if missing_rows:
+        raise ValueError(f"unknown rows for width={args.width}: {missing_rows}")
     specs = tuple(spec for spec in specs_all if spec.key in set(row_keys))
     banks = _build_banks(
         split,
@@ -2204,6 +2227,7 @@ def _run_one_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_d
             "test": exact_accuracy(model, split.test, device=device),
         },
         "training": train_summary,
+        "protocol": protocol_provenance(split=split, checkpoint=checkpoint, rows=row_keys),
         "bank_summaries": {
             "fit_by_row": _bank_summaries(
                 banks["fit_by_row"],

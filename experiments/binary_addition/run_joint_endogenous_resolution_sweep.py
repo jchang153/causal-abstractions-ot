@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -61,6 +62,20 @@ class EndogenousPairRecord:
     counterfactual_propagation_length: int | None
 
 
+@dataclass(frozen=True)
+class StructuredSourceIndex:
+    width: int
+    examples: tuple[BinaryAdditionExample, ...]
+    by_ab: dict[tuple[int, int], BinaryAdditionExample]
+    input_masks: np.ndarray
+    sum_masks: np.ndarray
+    endogenous_masks: np.ndarray
+    tie_break_ids: np.ndarray
+    carry_candidates: tuple[tuple[np.ndarray, np.ndarray], ...]
+    sum_candidates: tuple[tuple[np.ndarray, np.ndarray], ...]
+    popcount: np.ndarray
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Original-pipeline shared OT/UOT sweep over carries+outputs vs hidden-state/output-logit sites."
@@ -108,6 +123,7 @@ def parse_args() -> argparse.Namespace:
             "structured_24_top3carry_c2c3x5_no_random",
             "structured_24_top3carry_c3x7_no_random",
             "structured_26_top3carry_c2x5_c3x7_no_random",
+            "structured_top3carry_c2x5_c3x7_no_random",
             "structured_28_top3carry_top2sum_no_random",
             "structured_29_top3carry_top2sum",
             "structured_24_top3carry_top1sum_prefix_no_random",
@@ -178,6 +194,7 @@ def _structured_policy_spec(source_policy: str) -> tuple[int, int, bool]:
         "structured_24_top3carry_c2c3x5_no_random": (3, 0, False),
         "structured_24_top3carry_c3x7_no_random": (3, 0, False),
         "structured_26_top3carry_c2x5_c3x7_no_random": (3, 0, False),
+        "structured_top3carry_c2x5_c3x7_no_random": (3, 0, False),
         "structured_28_top3carry_top2sum_no_random": (3, 2, False),
         "structured_29_top3carry_top2sum": (3, 2, True),
         "structured_24_top3carry_top1sum_prefix_no_random": (3, 1, False),
@@ -207,7 +224,10 @@ def _carry_target_counts(source_policy: str, *, width: int) -> tuple[int, ...]:
         counts[2] = 5
     if source_policy == "structured_24_top3carry_c3x7_no_random" and int(width) >= 3:
         counts[2] = 7
-    if source_policy == "structured_26_top3carry_c2x5_c3x7_no_random" and int(width) >= 3:
+    if source_policy in {
+        "structured_26_top3carry_c2x5_c3x7_no_random",
+        "structured_top3carry_c2x5_c3x7_no_random",
+    } and int(width) >= 3:
         counts[1] = 5
         counts[2] = 7
     return tuple(counts)
@@ -358,6 +378,166 @@ def _choose_targeted_sum_sources(
     return tuple(ranked[: int(count)])
 
 
+def _bits_to_mask(bits: Sequence[int]) -> int:
+    return sum((int(bit) & 1) << idx for idx, bit in enumerate(bits))
+
+
+def _build_structured_source_index(
+    all_examples: Sequence[BinaryAdditionExample],
+    *,
+    width: int,
+) -> StructuredSourceIndex:
+    examples = tuple(all_examples)
+    if not examples:
+        raise ValueError("structured source index requires at least one example")
+    if int(width) <= 0:
+        raise ValueError("width must be positive")
+    if 2 * int(width) > 24:
+        raise ValueError("vectorized structured source indexing currently supports width <= 12")
+
+    input_masks = np.asarray(
+        [int(ex.a) | (int(ex.b) << int(width)) for ex in examples],
+        dtype=np.int64,
+    )
+    sum_masks = np.asarray([_bits_to_mask(ex.sum_bits_lsb) for ex in examples], dtype=np.int64)
+    endogenous_masks = np.asarray(
+        [
+            _bits_to_mask(ex.carries) | (_bits_to_mask(ex.sum_bits_lsb) << int(width))
+            for ex in examples
+        ],
+        dtype=np.int64,
+    )
+    tie_break_ids = np.asarray(
+        [int(ex.a) * (1 << int(width)) + int(ex.b) for ex in examples],
+        dtype=np.int64,
+    )
+    carry_candidates = tuple(
+        tuple(
+            np.flatnonzero(
+                np.asarray([int(ex.carry(carry_index)) for ex in examples], dtype=np.int8) == value
+            ).astype(np.int64)
+            for value in (0, 1)
+        )
+        for carry_index in range(1, int(width) + 1)
+    )
+    sum_candidates = tuple(
+        tuple(
+            np.flatnonzero(
+                np.asarray([int(ex.sum_bits_lsb[sum_index]) for ex in examples], dtype=np.int8) == value
+            ).astype(np.int64)
+            for value in (0, 1)
+        )
+        for sum_index in range(int(width))
+    )
+    popcount = np.fromiter(
+        (value.bit_count() for value in range(1 << (2 * int(width)))),
+        dtype=np.uint8,
+        count=1 << (2 * int(width)),
+    )
+    return StructuredSourceIndex(
+        width=int(width),
+        examples=examples,
+        by_ab={(int(ex.a), int(ex.b)): ex for ex in examples},
+        input_masks=input_masks,
+        sum_masks=sum_masks,
+        endogenous_masks=endogenous_masks,
+        tie_break_ids=tie_break_ids,
+        carry_candidates=carry_candidates,
+        sum_candidates=sum_candidates,
+        popcount=popcount,
+    )
+
+
+def _choose_targeted_carry_sources_indexed(
+    base: BinaryAdditionExample,
+    *,
+    carry_index: int,
+    count: int,
+    source_index: StructuredSourceIndex,
+) -> tuple[BinaryAdditionExample, ...]:
+    target_value = 1 - int(base.carry(carry_index))
+    candidate_indices = source_index.carry_candidates[int(carry_index) - 1][target_value]
+    if candidate_indices.size == 0:
+        raise ValueError(f"no source found that flips C{carry_index} for base ({base.a}, {base.b})")
+    count = min(int(count), int(candidate_indices.size))
+    base_sum = _bits_to_mask(base.sum_bits_lsb)
+    base_endogenous = _bits_to_mask(base.carries) | (
+        _bits_to_mask(base.sum_bits_lsb) << int(source_index.width)
+    )
+    base_input = int(base.a) | (int(base.b) << int(source_index.width))
+    prefix_mask = (1 << int(carry_index)) - 1
+    endogenous_mask = ((1 << (2 * int(source_index.width))) - 1) ^ (1 << (int(carry_index) - 1))
+    prefix_mismatch = source_index.popcount[
+        (source_index.sum_masks[candidate_indices] ^ base_sum) & prefix_mask
+    ].astype(np.int64)
+    other_endogenous = source_index.popcount[
+        (source_index.endogenous_masks[candidate_indices] ^ base_endogenous) & endogenous_mask
+    ].astype(np.int64)
+    input_hamming = source_index.popcount[
+        source_index.input_masks[candidate_indices] ^ base_input
+    ].astype(np.int64)
+
+    # Encode the existing lexicographic key exactly in a unique int64 score.
+    scores = prefix_mismatch
+    scores = scores * (2 * int(source_index.width)) + other_endogenous
+    scores = scores * (2 * int(source_index.width) + 1) + input_hamming
+    scores = scores * (1 << (2 * int(source_index.width))) + source_index.tie_break_ids[candidate_indices]
+    if count == int(candidate_indices.size):
+        local = np.arange(int(candidate_indices.size), dtype=np.int64)
+    else:
+        local = np.argpartition(scores, count - 1)[:count]
+    local = local[np.argsort(scores[local], kind="stable")]
+    return tuple(source_index.examples[int(idx)] for idx in candidate_indices[local])
+
+
+def _choose_targeted_sum_sources_indexed(
+    base: BinaryAdditionExample,
+    *,
+    sum_index: int,
+    count: int,
+    source_index: StructuredSourceIndex,
+    prefix_aware: bool,
+) -> tuple[BinaryAdditionExample, ...]:
+    target_value = 1 - int(base.sum_bits_lsb[sum_index])
+    candidate_indices = source_index.sum_candidates[int(sum_index)][target_value]
+    if candidate_indices.size == 0:
+        raise ValueError(f"no source found that flips S{sum_index} for base ({base.a}, {base.b})")
+    base_sum = _bits_to_mask(base.sum_bits_lsb)
+    base_endogenous = _bits_to_mask(base.carries) | (
+        _bits_to_mask(base.sum_bits_lsb) << int(source_index.width)
+    )
+    base_input = int(base.a) | (int(base.b) << int(source_index.width))
+    prefix_mask = (1 << int(sum_index)) - 1 if prefix_aware else 0
+    other_sum_mask = ((1 << int(source_index.width)) - 1) ^ (1 << int(sum_index))
+    other_endogenous_mask = ((1 << (2 * int(source_index.width))) - 1) ^ (
+        1 << (int(source_index.width) + int(sum_index))
+    )
+    prefix_mismatch = source_index.popcount[
+        (source_index.sum_masks[candidate_indices] ^ base_sum) & prefix_mask
+    ].astype(np.int64)
+    other_sum = source_index.popcount[
+        (source_index.sum_masks[candidate_indices] ^ base_sum) & other_sum_mask
+    ].astype(np.int64)
+    other_endogenous = source_index.popcount[
+        (source_index.endogenous_masks[candidate_indices] ^ base_endogenous) & other_endogenous_mask
+    ].astype(np.int64)
+    input_hamming = source_index.popcount[
+        source_index.input_masks[candidate_indices] ^ base_input
+    ].astype(np.int64)
+    legacy_tie = np.asarray(
+        [
+            int(source_index.examples[int(idx)].a) * 100 + int(source_index.examples[int(idx)].b)
+            for idx in candidate_indices
+        ],
+        dtype=np.int64,
+    )
+    order = np.lexsort(
+        (candidate_indices, legacy_tie, input_hamming, other_endogenous, other_sum, prefix_mismatch)
+    )
+    selected = candidate_indices[order[: int(count)]]
+    return tuple(source_index.examples[int(idx)] for idx in selected)
+
+
 def _structured_sources_for_base(
     base: BinaryAdditionExample,
     *,
@@ -365,8 +545,13 @@ def _structured_sources_for_base(
     all_examples: Sequence[BinaryAdditionExample],
     seed: int,
     source_policy: str,
+    source_index: StructuredSourceIndex | None = None,
 ) -> tuple[tuple[str, BinaryAdditionExample], ...]:
-    by_ab = {(int(ex.a), int(ex.b)): ex for ex in all_examples}
+    by_ab = (
+        source_index.by_ab
+        if source_index is not None
+        else {(int(ex.a), int(ex.b)): ex for ex in all_examples}
+    )
     families: list[tuple[str, BinaryAdditionExample]] = []
     for bit in range(int(width)):
         families.append((f"flip_A{bit}", by_ab[(int(base.a) ^ (1 << bit), int(base.b))]))
@@ -375,25 +560,42 @@ def _structured_sources_for_base(
     _carry_source_count, sum_source_count, include_random = _structured_policy_spec(source_policy)
     sum_target_mode = _sum_target_mode(source_policy)
     for carry_index in range(1, int(width) + 1):
-        targeted = _choose_targeted_carry_sources(
-            base,
-            carry_index=carry_index,
-            count=int(carry_counts[carry_index - 1]),
-            candidates=all_examples,
-        )
+        if source_index is None:
+            targeted = _choose_targeted_carry_sources(
+                base,
+                carry_index=carry_index,
+                count=int(carry_counts[carry_index - 1]),
+                candidates=all_examples,
+            )
+        else:
+            targeted = _choose_targeted_carry_sources_indexed(
+                base,
+                carry_index=carry_index,
+                count=int(carry_counts[carry_index - 1]),
+                source_index=source_index,
+            )
         for rank, source in enumerate(targeted, start=1):
             family = f"target_C{carry_index}" if int(carry_counts[carry_index - 1]) == 1 else f"target_C{carry_index}_{rank}"
             families.append((family, source))
     for sum_index in range(int(width)):
         if sum_source_count <= 0:
             continue
-        targeted = _choose_targeted_sum_sources(
-            base,
-            sum_index=sum_index,
-            count=sum_source_count,
-            candidates=all_examples,
-            prefix_aware=(sum_target_mode == "prefix"),
-        )
+        if source_index is None:
+            targeted = _choose_targeted_sum_sources(
+                base,
+                sum_index=sum_index,
+                count=sum_source_count,
+                candidates=all_examples,
+                prefix_aware=(sum_target_mode == "prefix"),
+            )
+        else:
+            targeted = _choose_targeted_sum_sources_indexed(
+                base,
+                sum_index=sum_index,
+                count=sum_source_count,
+                source_index=source_index,
+                prefix_aware=(sum_target_mode == "prefix"),
+            )
         for rank, source in enumerate(targeted, start=1):
             family = f"target_S{sum_index}" if sum_source_count == 1 else f"target_S{sum_index}_{rank}"
             families.append((family, source))
@@ -610,6 +812,7 @@ def _build_row_records(
     width: int,
     seed: int,
     source_policy: str,
+    source_index: StructuredSourceIndex | None = None,
 ) -> dict[str, tuple[EndogenousPairRecord, ...]]:
     rows: dict[str, list[EndogenousPairRecord]] = {spec.key: [] for spec in specs}
     for base in split_bases:
@@ -627,6 +830,7 @@ def _build_row_records(
             "structured_24_top3carry_c2c3x5_no_random",
             "structured_24_top3carry_c3x7_no_random",
             "structured_26_top3carry_c2x5_c3x7_no_random",
+            "structured_top3carry_c2x5_c3x7_no_random",
             "structured_28_top3carry_top2sum_no_random",
             "structured_29_top3carry_top2sum",
             "structured_24_top3carry_top1sum_prefix_no_random",
@@ -638,6 +842,7 @@ def _build_row_records(
                 all_examples=all_examples,
                 seed=seed,
                 source_policy=source_policy,
+                source_index=source_index,
             )
         else:
             raise ValueError(f"unknown source_policy: {source_policy!r}")
@@ -667,6 +872,11 @@ def _build_banks(
     source_policy: str,
     all_examples: Sequence[BinaryAdditionExample],
 ) -> dict[str, object]:
+    source_index = (
+        None
+        if source_policy == "all_source"
+        else _build_structured_source_index(all_examples, width=int(width))
+    )
     fit_by_row = _build_row_records(
         split.fit,
         all_examples,
@@ -674,6 +884,7 @@ def _build_banks(
         width=width,
         seed=seed,
         source_policy=source_policy,
+        source_index=source_index,
     )
     calib_all = _build_row_records(
         split.calib,
@@ -682,6 +893,7 @@ def _build_banks(
         width=width,
         seed=seed,
         source_policy=source_policy,
+        source_index=source_index,
     )
     test_all = _build_row_records(
         split.test,
@@ -690,6 +902,7 @@ def _build_banks(
         width=width,
         seed=seed,
         source_policy=source_policy,
+        source_index=source_index,
     )
     return {
         "fit_by_row": fit_by_row,
@@ -775,15 +988,59 @@ def _fit_cost_matrix(
     cost_metric: str,
     rotation_map: dict[int, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, object]]:
-    pair_site_cache: dict[tuple[int, int, int, int, str], torch.Tensor] = {}
-
+    output_dim = int(model.width) + 1
     unique_records: dict[tuple[int, int, int, int, str], EndogenousPairRecord] = {}
     for spec in specs:
         for rec in fit_by_row[spec.key]:
             unique_records[(rec.base.a, rec.base.b, rec.source.a, rec.source.b, rec.family)] = rec
     all_records = list(unique_records.values())
+    strata = _fit_strata(int(model.width), str(fit_stratify_mode))
+    bucket_order = tuple((family, stratum) for family in family_order for stratum in strata)
+    bucket_lookup = {bucket: idx for idx, bucket in enumerate(bucket_order)}
+    record_lookup = {
+        (rec.base.a, rec.base.b, rec.source.a, rec.source.b, rec.family): idx
+        for idx, rec in enumerate(all_records)
+    }
 
+    abstract_rows: list[torch.Tensor] = []
+    bucket_indices_by_spec: list[torch.Tensor] = []
+    bucket_counts_by_spec: list[torch.Tensor] = []
+    weight_vectors: list[torch.Tensor] = []
+    for spec in specs:
+        family_weights = torch.tensor(
+            [_family_weight_for_row(row_key=spec.key, family=family, profile=fit_family_profile) for family in family_order],
+            dtype=torch.float32,
+        )
+        weight_vec = family_weights.repeat_interleave(len(strata) * output_dim)
+        weight_vectors.append(weight_vec)
+        bucket_indices = torch.full((len(all_records),), -1, dtype=torch.int64)
+        bucket_counts = torch.zeros(len(bucket_order), dtype=torch.float32)
+        abstract_sums = torch.zeros((len(bucket_order), output_dim), dtype=torch.float32)
+        for rec in fit_by_row[spec.key]:
+            if fit_signature_mode == "active_only" and not rec.is_active:
+                continue
+            bucket = (rec.family, _record_fit_stratum(rec, fit_stratify_mode))
+            bucket_idx = int(bucket_lookup[bucket])
+            record_idx = int(
+                record_lookup[(rec.base.a, rec.base.b, rec.source.a, rec.source.b, rec.family)]
+            )
+            bucket_indices[record_idx] = bucket_idx
+            bucket_counts[bucket_idx] += 1.0
+            abstract_sums[bucket_idx] += _abstract_signature(rec)
+        abstract_means = abstract_sums / bucket_counts.clamp_min(1.0).unsqueeze(1)
+        abstract_rows.append(abstract_means.reshape(-1) * weight_vec)
+        bucket_indices_by_spec.append(bucket_indices)
+        bucket_counts_by_spec.append(bucket_counts)
+
+    # Stream neural signatures directly into row/family/stratum aggregates.
+    # This is algebraically identical to caching every pair/site tensor, while
+    # bounding memory at O(rows * buckets * output_dim) instead of O(pairs * sites).
+    neural_site_rows_by_spec: list[list[torch.Tensor]] = [[] for _ in specs]
     for site in sites:
+        neural_sums = [
+            torch.zeros((len(bucket_order), output_dim), dtype=torch.float32)
+            for _ in specs
+        ]
         for start in range(0, len(all_records), int(batch_size)):
             batch_records = all_records[start : start + int(batch_size)]
             batch_logits = intervene_with_site_handle_batch(
@@ -798,54 +1055,19 @@ def _fit_cost_matrix(
             )
             batch_probs = torch.sigmoid(batch_logits)
             factual = torch.stack([run_cache.get_run(rec.base).output_probs for rec in batch_records], dim=0)
-            batch_sigs = batch_probs - factual
-            for rec, sig in zip(batch_records, batch_sigs):
-                pair_site_cache[(rec.base.a, rec.base.b, rec.source.a, rec.source.b, site.key())] = sig.detach().cpu()
-
-    strata = _fit_strata(int(model.width), str(fit_stratify_mode))
-    bucket_order = tuple((family, stratum) for family in family_order for stratum in strata)
-
-    abstract_rows = []
-    neural_rows = []
-    for spec in specs:
-        family_weights = torch.tensor(
-            [_family_weight_for_row(row_key=spec.key, family=family, profile=fit_family_profile) for family in family_order],
-            dtype=torch.float32,
-        )
-        weight_vec = family_weights.repeat_interleave(len(strata) * (int(model.width) + 1))
-        per_bucket: dict[tuple[str, str], list[torch.Tensor]] = {bucket: [] for bucket in bucket_order}
-        neural_per_bucket_by_site: list[dict[tuple[str, str], list[torch.Tensor]]] = [
-            {bucket: [] for bucket in bucket_order} for _ in sites
-        ]
-        for rec in fit_by_row[spec.key]:
-            if fit_signature_mode == "active_only" and not rec.is_active:
-                continue
-            bucket = (rec.family, _record_fit_stratum(rec, fit_stratify_mode))
-            per_bucket[bucket].append(_abstract_signature(rec))
-            for site_idx, site in enumerate(sites):
-                neural_per_bucket_by_site[site_idx][bucket].append(
-                    pair_site_cache[(rec.base.a, rec.base.b, rec.source.a, rec.source.b, site.key())]
-                )
-        abstract_rows.append(
-            torch.cat(
-                [_aggregate_mean_or_zeros(per_bucket[bucket], dim=int(model.width) + 1) for bucket in bucket_order],
-                dim=0,
+            batch_sigs = (batch_probs - factual).to(torch.float32)
+            for spec_idx, bucket_indices in enumerate(bucket_indices_by_spec):
+                selected = bucket_indices[start : start + len(batch_records)]
+                valid = selected >= 0
+                if bool(valid.any()):
+                    neural_sums[spec_idx].index_add_(0, selected[valid], batch_sigs[valid])
+        for spec_idx, sums in enumerate(neural_sums):
+            means = sums / bucket_counts_by_spec[spec_idx].clamp_min(1.0).unsqueeze(1)
+            neural_site_rows_by_spec[spec_idx].append(
+                means.reshape(-1) * weight_vectors[spec_idx]
             )
-            * weight_vec
-        )
-        neural_site_rows = []
-        for site_idx, _site in enumerate(sites):
-            neural_site_rows.append(
-                torch.cat(
-                    [
-                        _aggregate_mean_or_zeros(neural_per_bucket_by_site[site_idx][bucket], dim=int(model.width) + 1)
-                        for bucket in bucket_order
-                    ],
-                    dim=0,
-                )
-                * weight_vec
-            )
-        neural_rows.append(torch.stack(neural_site_rows, dim=0))
+
+    neural_rows = [torch.stack(site_rows, dim=0) for site_rows in neural_site_rows_by_spec]
 
     abstract_table = torch.stack(abstract_rows, dim=0)
     neural_table = torch.stack(neural_rows, dim=0)
@@ -870,7 +1092,8 @@ def _fit_cost_matrix(
         "abstract_signatures": abstract_table.tolist(),
         "neural_signatures": neural_table.tolist(),
         "cost_matrix": cost.tolist(),
-        "cached_pair_site_signatures": int(len(pair_site_cache)),
+        "cached_pair_site_signatures": int(len(all_records) * len(sites)),
+        "signature_aggregation": "streaming_bucket_means",
         "fit_signature_mode": str(fit_signature_mode),
         "fit_stratify_mode": str(fit_stratify_mode),
         "fit_strata": list(strata),

@@ -15,6 +15,7 @@ from experiments.binary_addition.data import enumerate_all_examples, stratified_
 from experiments.binary_addition.interventions import build_run_cache
 from experiments.binary_addition.model import exact_accuracy
 from experiments.binary_addition.pca_basis import fit_pca_rotations
+from experiments.binary_addition.provenance import file_sha256, protocol_provenance
 from experiments.binary_addition.run_progressive_plot import (
     _build_banks,
     _checkpoint_map,
@@ -24,6 +25,7 @@ from experiments.binary_addition.run_progressive_plot import (
     _parse_checkpoint_map,
     _parse_floats,
     _parse_ints,
+    _parse_rows,
     _row_specs,
     _run_alignment_resolution_sweep,
     _summary_stats,
@@ -45,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--hidden-size", type=int, default=16)
     parser.add_argument("--width", type=int, default=4)
+    parser.add_argument("--rows", default="C1,C2,C3")
     parser.add_argument("--seeds", default="0,1,2,3,4,5,6,7,8,9")
     parser.add_argument("--checkpoint-map", default="")
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu")
@@ -70,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fit-stratify-mode", default="none")
     parser.add_argument("--cost-metric", choices=["sq_l2", "l1", "cosine"], default="sq_l2")
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--cache-batch-size", type=int, default=1024)
     parser.add_argument("--skip-existing", action="store_true")
     return parser.parse_args()
 
@@ -86,8 +90,32 @@ def _run_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_dir: 
     seed_dir = out_dir / f"h{args.hidden_size}" / f"seed_{seed}"
     summary_name = "single_stage_plot_pca_seed_summary.json" if args.basis == "pca" else "single_stage_plot_seed_summary.json"
     summary_path = seed_dir / summary_name
+    row_keys = _parse_rows(str(args.rows))
+    if not row_keys:
+        raise ValueError("at least one row is required")
     if args.skip_existing and summary_path.exists():
-        return json.loads(summary_path.read_text())
+        existing = json.loads(summary_path.read_text())
+        config = existing.get("config", {})
+        protocol = existing.get("protocol", {})
+        expected_config = {
+            "width": int(args.width),
+            "hidden_size": int(args.hidden_size),
+            "fit_bases": int(args.fit_bases),
+            "calib_bases": int(args.calib_bases),
+            "test_bases": int(args.test_bases),
+            "rows": str(args.rows),
+            "source_policy": str(args.source_policy),
+            "basis": str(args.basis),
+            "resolutions": str(args.resolutions),
+        }
+        if (
+            isinstance(config, dict)
+            and all(config.get(key) == value for key, value in expected_config.items())
+            and isinstance(protocol, dict)
+            and protocol.get("checkpoint_sha256") == file_sha256(checkpoint)
+        ):
+            return existing
+        print(f"[rebuild] {summary_path} uses a different model or experiment protocol")
     seed_dir.mkdir(parents=True, exist_ok=True)
 
     device = _device(str(args.device))
@@ -106,10 +134,19 @@ def _run_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_dir: 
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    run_cache = build_run_cache(model, examples, device=device)
+    run_cache = build_run_cache(
+        model,
+        examples,
+        device=device,
+        batch_size=int(args.cache_batch_size),
+    )
 
-    row_keys = ("C1", "C2", "C3")
-    specs = tuple(spec for spec in _row_specs("all_endogenous", int(args.width)) if spec.key in row_keys)
+    all_specs = _row_specs("all_endogenous", int(args.width))
+    available_rows = {spec.key for spec in all_specs}
+    missing_rows = [row for row in row_keys if row not in available_rows]
+    if missing_rows:
+        raise ValueError(f"unknown rows for width={args.width}: {missing_rows}")
+    specs = tuple(spec for spec in all_specs if spec.key in set(row_keys))
     banks = _build_banks(
         split,
         specs,
@@ -193,6 +230,7 @@ def _run_seed(args: argparse.Namespace, *, seed: int, checkpoint: str, out_dir: 
             "test": exact_accuracy(model, split.test, device=device),
         },
         "training": training,
+        "protocol": protocol_provenance(split=split, checkpoint=checkpoint, rows=row_keys),
         "pca_fit_seconds": float(pca_fit_seconds),
         "pca_diagnostics": pca_diagnostics,
         "stage": stage,

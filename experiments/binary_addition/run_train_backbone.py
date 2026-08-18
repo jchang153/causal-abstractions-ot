@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--width", type=int, default=4)
     ap.add_argument("--hidden-size", type=int, default=16)
     ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--eval-batch-size", type=int, default=4096)
     ap.add_argument("--epochs", type=int, default=250)
     ap.add_argument("--learning-rate", type=float, default=1e-2)
     ap.add_argument("--weight-decay", type=float, default=0.0)
@@ -52,6 +53,7 @@ def main() -> None:
         width=int(args.width),
         hidden_size=int(args.hidden_size),
         batch_size=int(args.batch_size),
+        eval_batch_size=int(args.eval_batch_size),
         epochs=int(args.epochs),
         learning_rate=float(args.learning_rate),
         weight_decay=float(args.weight_decay),

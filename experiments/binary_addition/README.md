@@ -10,6 +10,7 @@ Entry points:
 - `plot_progressive_heatmaps.py`: render paper heatmaps for PLOT, PLOT-native, PLOT-PCA, PLOT-DAS, and full DAS handles.
 - `run_mib_baselines.py`: run Full State, canonical DBM, and DBM+PCA over all recurrent timesteps, selecting timesteps on calibration data before test reporting.
 - `run_local_binary_addition_10seed_suite.sh`: run the complete ten-seed suite serially with the `torch-metal` environment, using CPU by setting `DEVICE=cpu` or Apple Metal with `DEVICE=mps`.
+- `run_local_binary_addition_plot4_w8_h64.sh`: run the resume-safe one-seed 8-bit/hidden-size-64 CPU pilot for single- and two-stage PLOT and PLOT-PCA only. It uses internal carries `C1`--`C7`, a 512/256/256 base split, and resolutions 1--64 in powers of two.
 - `slurm/run_delta_binary_addition_10seed_suite.sh`: run the complete hidden-size-16, ten-seed paper suite across four allocated GPUs and write one combined `suite_summary.json`. It does not run Boundless DAS.
 - `slurm/submit_delta_binary_addition_10seed_suite.sh`: request one four-A40 Delta node and submit the complete suite.
 
@@ -47,6 +48,12 @@ pairs per abstract variable. Canonical and PCA DBM sweep the summed-mask regular
 coefficient over 0, 1e-5, 1e-4, and 1e-3. Calibration jointly selects the coefficient and
 timestep for each abstract variable, with mask size as a tie-breaker, and reported DBM runtime
 includes every coefficient/timestep candidate.
+
+The 8-bit pilot trains one factual backbone on all 65,536 input pairs and requires exact
+accuracy 1.0 before any intervention method runs. Its width-neutral structured source policy
+uses 46 sources per base, producing 23,552 fit pairs and 11,776 calibration/test pairs per
+internal carry. Model checkpoints and result directories are local artifacts and are never
+tracked by Git.
 
 Example Stage B rerun:
 

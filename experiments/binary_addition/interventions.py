@@ -29,17 +29,26 @@ class IntervenedRunBatch:
 
 @dataclass
 class RunCache:
-    runs: dict[tuple[int, int], FactualRun]
-    inputs: dict[tuple[int, int], torch.Tensor]
+    index_by_key: dict[tuple[int, int], int]
+    input_table: torch.Tensor
+    hidden_table: torch.Tensor
+    output_logit_table: torch.Tensor
+    output_prob_table: torch.Tensor
 
     def key(self, example: BinaryAdditionExample) -> tuple[int, int]:
         return (int(example.a), int(example.b))
 
     def get_run(self, example: BinaryAdditionExample) -> FactualRun:
-        return self.runs[self.key(example)]
+        idx = self.index_by_key[self.key(example)]
+        return FactualRun(
+            hidden_states=self.hidden_table[idx],
+            output_logits=self.output_logit_table[idx],
+            output_probs=self.output_prob_table[idx],
+        )
 
     def get_input(self, example: BinaryAdditionExample) -> torch.Tensor:
-        return self.inputs[self.key(example)]
+        idx = self.index_by_key[self.key(example)]
+        return self.input_table[idx : idx + 1]
 
 
 def _single_example_tensor(example: BinaryAdditionExample, device: torch.device) -> torch.Tensor:
@@ -92,14 +101,46 @@ def build_run_cache(
     examples: Sequence[BinaryAdditionExample],
     *,
     device: torch.device,
+    batch_size: int = 1024,
 ) -> RunCache:
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive")
     unique = {(int(ex.a), int(ex.b)): ex for ex in examples}
-    runs: dict[tuple[int, int], FactualRun] = {}
-    inputs: dict[tuple[int, int], torch.Tensor] = {}
-    for key, ex in unique.items():
-        inputs[key] = _single_example_tensor(ex, device=device)
-        runs[key] = factual_run(model, ex, device=device)
-    return RunCache(runs=runs, inputs=inputs)
+    keys = tuple(unique)
+    ordered_examples = tuple(unique[key] for key in keys)
+    input_chunks: list[torch.Tensor] = []
+    hidden_chunks: list[torch.Tensor] = []
+    logit_chunks: list[torch.Tensor] = []
+    prob_chunks: list[torch.Tensor] = []
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(ordered_examples), int(batch_size)):
+            batch = ordered_examples[start : start + int(batch_size)]
+            x, _ = examples_to_tensors(batch)
+            out = model(x.to(device))
+            input_chunks.append(x.detach().cpu())
+            hidden_chunks.append(out["hidden_states"].detach().cpu())
+            logits = out["output_logits"].detach().cpu()
+            logit_chunks.append(logits)
+            prob_chunks.append(torch.sigmoid(logits))
+
+    if ordered_examples:
+        input_table = torch.cat(input_chunks, dim=0)
+        hidden_table = torch.cat(hidden_chunks, dim=0)
+        output_logit_table = torch.cat(logit_chunks, dim=0)
+        output_prob_table = torch.cat(prob_chunks, dim=0)
+    else:
+        input_table = torch.empty((0, model.width, model.input_size), dtype=torch.float32)
+        hidden_table = torch.empty((0, model.width, model.hidden_size), dtype=torch.float32)
+        output_logit_table = torch.empty((0, model.width + 1), dtype=torch.float32)
+        output_prob_table = torch.empty((0, model.width + 1), dtype=torch.float32)
+    return RunCache(
+        index_by_key={key: idx for idx, key in enumerate(keys)},
+        input_table=input_table,
+        hidden_table=hidden_table,
+        output_logit_table=output_logit_table,
+        output_prob_table=output_prob_table,
+    )
 
 
 def _apply_site_delta(
