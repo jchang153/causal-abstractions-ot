@@ -15,6 +15,12 @@ MIB/
 hf-cache/
 mcqa_plot_*_mcqa_*/
 
+# Model checkpoints are local experiment artifacts and must never be tracked.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
 # LaTeX build artifacts
 paper/*.aux
 paper/*.fdb_latexmk
