@@ -1,5 +1,11 @@
 # Blind IOI Head Localization with PLOT-DAS and Brute-Force DAS
 
+## Historical supporting benchmark
+
+The August 3 IOI studies are retained from the earlier revision period. IOI is not
+one of the three main benchmarks in the current ICLR 2027 / arXiv v2 manuscript.
+See [experiment history](../../docs/experiment_history.md) for its result grouping.
+
 This folder implements the Indirect Object Identification causal-variable track
 from MIB using GPT-2 Small and the released `mib-bench/ioi` Hugging Face dataset.
 It compares four localization regimes while keeping the DAS objective and

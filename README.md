@@ -1,162 +1,107 @@
 # PLOT: Progressive Localization via Optimal Transport
 
-This repository contains the experiment code for the [PLOT paper](https://arxiv.org/abs/2605.06979). The paper-facing experiment code is organized under `experiments/` by benchmark.
+Code for [PLOT](https://arxiv.org/abs/2605.06979). The current research checkout
+corresponds to the **ICLR 2027 revision**, also prepared as `arxiv_v2` on
+October 4, 2026. The original public arXiv submission and older NeurIPS/ICML
+experiments use earlier protocols; do not combine their result tables.
 
-<p align="center">
-  <img src="figs/plot_diagram.png" alt="PLOT progressive localization diagram" width="100%">
-</p>
+![PLOT progressively localizes a causal variable across tokens, layers, and within-layer sites](figs/plot_pipeline_iclr2027.png)
 
-Figure: PLOT as a progressive localization engine. The diagram follows one high-level variable, $Z_2$ in red, though OT localization is performed jointly over all high-level variables and candidate neural sites. PLOT first localizes coarse sites such as tokens/layers, then refines within them to coordinates or PCA spans. The resulting signal can be calibrated into a direct handle or used to guide DAS.
+PLOT matches causal and neural intervention effects, then refines the candidate
+sites from tokens or layers to native coordinates or PCA spans. Selected handles
+can be used directly or to guide DAS. The figure is the current ICLR manuscript
+pipeline; its vector source and provenance are in [figs/](figs/README.md).
 
-## Main Paper Experiments
+## Start here
 
-The following folders correspond to the experiments reported in the main paper.
+- **Run baseline MCQA DAS:** [baseline guide](experiments/mcqa/BASELINE_DAS.md).
+  Includes AT at 128 dimensions, exact preprocessing, calibration and IIA scoring.
+- **Find current paper experiments:** [experiment catalog](experiments/README.md)
+  and [paper provenance](docs/experiment_history.md).
+- **Find a saved run:** [results index](RESULTS_INDEX.md). The complete old-to-new
+  folder map is [experiment_inventory.json](docs/experiment_inventory.json).
 
-### Hierarchical Equality
+## Current paper sources
 
-Location: `experiments/heq/`
+The latest paper combines several completed runs rather than one newest folder.
+Source dates below identify the artifacts used by its tables, not the date of the
+latest source-code edit. Detailed paths, protocols and caveats are in the catalog.
 
-Task: hierarchical equality over inputs `W, X, Y, Z`, with abstract variables `WX = [W == X]` and `YZ = [Y == Z]`.
+| Benchmark | Current paper evidence | Current local source |
+|---|---|---|
+| Hierarchical equality | September 24 stable six-epsilon PLOT rerun plus saved DAS, seeds 1-10 | `experiments/heq/heq_rerun/`; shared primitives in `experiments/heq/equality_experiment/` |
+| 4-bit binary addition | September 22 unrestricted serial OT staging; August 26 DAS reused; width 16, seeds 0-4 | `experiments/binary_addition/run_staging_comparison.py`, `run_staging_suite.py`, `run_progressive_plot.py` |
+| MCQA | September 24 full-beta UOT replay and corrected DAS; September 22 DBM, five seeds | `experiments/mcqa/`, paper execution/collection scripts in `experiments/mcqa_staging_budget/` |
+| MCQA ablations | September 25 signature, matching, KL-guided DAS and balanced-OT Stage A follow-ups | MCQA task packages and paper execution scripts; see results index |
 
-Methods:
+IOI, decimal addition, fixed-carry MLP tasks, 8-bit/variable-length pilots and
+older MCQA sweeps are preserved as historical or supporting studies. They are
+not the latest manuscript's three main benchmarks.
 
-- `PLOT`: OT/UOT transport handles over individual hidden-neuron sites.
-- `DAS`: rotated subspace intervention search on the same factual backbone.
+**Saved results and current code differ.** The saved September MCQA DAS results
+used corrected full-vocabulary cross-entropy and the MIB substring scorer.
+The current DAS code uses strict normalized full-vocabulary top-1 IIA. Later
+optimization defaults also differ from some saved HEQ/binary-addition runs.
+Use the saved run configuration and code snapshot for an exact historical
+comparison; changing the checker or optimizer requires a new run. The provenance
+guide distinguishes original reporting, replayed timings and later code changes.
 
-Entry points:
+## Repository layout
 
-```bash
-python experiments/heq/equality_run.py
-python experiments/heq/equality_calibration_strategy_sweep.py
-python experiments/heq/equality_clean_epsilon_sweep.py
-python experiments/heq/equality_paper_figures.py
+```text
+experiments/
+  common/                     shared runtime/model helpers
+  heq/                        HEQ implementation and local paper rerun
+  binary_addition/            recurrent addition and controlled staging
+  mcqa/                       MCQA implementation and standalone DAS
+  mcqa_staging_budget/        local paper GPU launch/collection workflows
+  ioi/                        preserved earlier IOI benchmark
+  archive/
+    early_tasks/              decimal addition and fixed-carry MLP
+    mcqa_exploration/          superseded broad/layer/block studies
+    demos/                    historical notebooks
+    figure_utilities/         earlier standalone plotting utility
+results/                      local, Git-ignored artifacts
+  paper/iclr_2027/            authoritative current table sources
+  supporting/iclr_2027/       completed ablations and companion studies
+  archive/                   earlier submission periods
+  development/               pilots, predecessors, plans and excluded runs
+figs/                         current README image plus archived old image
+docs/                         experiment provenance and relocation map
 ```
 
-`equality_paper_figures.py` regenerates the HEQ plots under the local ignored `paper/plots/` folder from saved result JSON files.
+Old experiment and dated result paths are relative compatibility symlinks, so
+historical commands and embedded source references continue to resolve. New
+outputs should use the grouped canonical paths. Shared active code stays in its
+established location. Local results, model checkpoints and some newer paper-run
+source packages are not uploaded with this documentation cleanup; availability
+is recorded in the experiment catalog.
 
-### 4-Bit Binary Addition
+Manuscripts, figure exports and handoff archives are stored separately in the
+linked `Codex Projects/PLOT` workspace (`paper/`, `arxiv_v2/`, `exports/`).
+Checkpoints remain under local `models/` and `eval/shared_checkpoints/`.
 
-Location: `experiments/binary_addition/`
+## Setup and checks
 
-Task: 4-bit ripple-carry addition with a GRUCell backbone. The abstract variables are the internal carries `C1`, `C2`, and `C3`; the output is `(C4, S3, S2, S1, S0)`.
-
-Methods:
-
-- `PLOT`: Stage A timestep localization.
-- `PLOT-native`: Stage A plus native-coordinate Stage B handles.
-- `PLOT-PCA`: Stage A plus PCA-basis Stage B handles.
-- `PLOT-DAS`: DAS restricted to the Stage A timestep.
-- `Full DAS`: DAS over all recurrent timesteps and subspace sizes.
-
-Entry points:
-
-```bash
-python experiments/binary_addition/run_train_backbone.py --help
-python experiments/binary_addition/run_progressive_plot.py --help
-python experiments/binary_addition/run_progressive_plot_stage_b_resolution_sweep.py --help
-python experiments/binary_addition/plot_progressive_heatmaps.py --help
-```
-
-### MCQA
-
-Location: `experiments/mcqa/`
-
-Task: Gemma-2-2B multiple-choice question answering on the CopyColors-style MCQA benchmark. The abstract variables are `answer_pointer` and `answer_token`.
-
-Methods:
-
-- `PLOT`: Stage A UOT layer localization.
-- `PLOT-native`: Stage A plus native-coordinate Stage B handles.
-- `PLOT-PCA`: Stage A plus PCA-basis Stage B handles.
-- `PLOT-DAS`: DAS restricted to the Stage A layer.
-- `PLOT-native-DAS`: DAS guided by the native Stage B support.
-- `PLOT-PCA-DAS`: DAS guided by the PCA Stage B support.
-- `Full DAS`: DAS over all layers and the full subspace grid.
-
-Main local/serial entry points:
-
-```bash
-python experiments/mcqa/mcqa_delta_hierarchical_sweep.py --help
-python experiments/mcqa/mcqa_run_cloud.py --help
-python experiments/mcqa/mcqa_paper_runtime.py --help
-```
-
-Cluster launchers are in `experiments/mcqa/slurm/`. For the staged Delta workflow:
-
-```bash
-bash experiments/mcqa/slurm/submit_delta_mcqa_hierarchical_parallel_all.sh <timestamp>
-```
-
-MCQA requires access to the model and dataset. Set `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` before launching non-interactive runs.
-
-### Indirect Object Identification (IOI)
-
-Location: `experiments/ioi/`
-
-Task: MIB's GPT-2 Small causal-variable IOI track using the released
-`mib-bench/ioi` data and the position/token high-level variables.
-
-Methods:
-
-- `Blind DAS`: joint DAS over all 144 attention heads.
-- `PLOT-DAS`: $2 \times 144$ UOT head localization followed by calibrated
-  top-$K$ joint DAS.
-- `Brute-force DAS`: direct per-variable full-head MSE localization followed by
-  the same calibrated top-$K$ joint DAS.
-- `Oracle DAS`: joint DAS over heads $7.3, 7.9, 8.6, 8.10$.
-
-Entry point and task-specific protocol:
-
-```bash
-python experiments/ioi/run.py --help
-```
-
-See [`experiments/ioi/README.md`](experiments/ioi/README.md) for the exact data
-split, regression, intervention semantics, resumable artifacts, and smoke tests.
-
-## Additional Experiment Folders
-
-These folders are included under `experiments/` for completeness. They are not the main-paper experiment folders listed above.
-
-- `experiments/binary_addition_c1/`: fixed-`C1` MLP binary-addition benchmark.
-- `experiments/two_digit_addition/`: two-digit decimal addition experiments and helpers.
-- `experiments/heq_intervention_heatmaps/`: HEQ intervention-heatmap plotting utility.
-- `experiments/mcqa_broad_sweep/`: broad MCQA Delta sweep and launcher.
-- `experiments/mcqa_layerwise/`: MCQA layerwise OT analysis.
-- `experiments/mcqa_block_focus/`: MCQA OT/DAS block-focus run.
-- `experiments/mcqa_diagnostics/`: MCQA filter diagnostic notebook.
-- `experiments/notebook_demos/`: notebook demos for basic interventions, DAS, and addition variants.
-
-## Repository Layout
-
-- `experiments/common/`: shared runtime helpers, pyvene helpers, and variable-width MLP utilities.
-- `experiments/heq/`: main-paper HEQ scripts and implementation package.
-- `experiments/binary_addition/`: main-paper 4-bit binary-addition scripts and implementation package.
-- `experiments/mcqa/`: main-paper MCQA scripts, implementation package, and Slurm launchers.
-- `experiments/ioi/`: blind, PLOT-guided, brute-force-localized, and oracle DAS
-  on MIB IOI.
-- `paper/`: local ignored manuscript sources, generated figures, and paper-build artifacts.
-- `models/`: local checkpoints.
-- `results/`: timestamped experiment outputs.
-
-## Setup
-
-Install the Python dependencies:
+Use Python 3.10 or newer:
 
 ```bash
 pip install -r requirements.txt
+bash experiments/mcqa/run_baseline_das.sh
 ```
 
-Some experiments require additional heavy dependencies already implied by the scripts, including PyTorch, pyvene, transformers, datasets, and POT. MCQA runs are intended for GPU execution; HEQ and binary-addition smoke runs can run on CPU.
+MCQA needs a CUDA GPU and access to Gemma-2-2B. Set `HF_TOKEN` or
+`HUGGING_FACE_HUB_TOKEN` before a noninteractive run. Weights and datasets are
+loaded separately. Historical notebooks and archival launchers may require their
+original environment and protocols; they are not current reproduction commands.
 
-## Outputs
-
-Experiment runs write JSON payloads, text summaries, and plot artifacts under `results/` or the output directory passed on the command line. Paper figure scripts write into the local ignored `paper/plots/` folder.
-
-## Quick Checks
-
-After editing code, a lightweight import and syntax check is:
+For the tracked baseline, CPU regression tests need no model download:
 
 ```bash
-PYTHONPATH=. python -m compileall -q experiments
+PYTHONPATH=.:experiments/mcqa python -m pytest -q \
+  experiments/mcqa/test_unified_iia.py \
+  experiments/mcqa/test_data_partition.py \
+  experiments/mcqa/test_baseline_das_protocol.py
 ```
+
+Set `PLOT_PAPER_DIR` when generating manuscript figures into a different workspace.

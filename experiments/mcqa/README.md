@@ -1,5 +1,21 @@
 # MCQA
 
+## Current paper versus the latest code
+
+The main-table sources are the September 24 full-beta UOT replay and corrected
+Full DAS/PLOT-DAS, plus the September 22 DBM baseline. Five-seed signature and
+matching ablations live in the September 25 supporting studies. The completed
+KL Stage-A DAS follow-up is distinct from its retained failed attempts.
+
+Saved September DAS scores use the MIB generated-answer substring relation;
+current `das.py` selects and scores with strict normalized full-vocabulary top-1
+IIA. Follow [BASELINE_DAS.md](BASELINE_DAS.md) for current-code experiments, and
+[paper provenance](../../docs/experiment_history.md) for frozen historical results.
+Do not label old cached metrics as outputs of the newer agreement checker.
+
+The legacy staged/Delta entry points below remain available; the newest paper
+GPU workflows are documented in [../mcqa_staging_budget/](../mcqa_staging_budget/README.md).
+
 Main-paper MCQA code lives here. The benchmark evaluates Gemma-2-2B on CopyColors-style multiple-choice prompts and localizes the abstract variables `answer_pointer` and `answer_token`.
 
 ## Evaluation metric
@@ -9,7 +25,7 @@ full-vocabulary top-1 next token is decoded, NFKC-normalized, stripped, folded
 to uppercase, and accepted only when it is exactly one ASCII symbol A-Z matching
 the causal interchange's final expected answer. Alphabet-restricted and raw
 token-ID accuracies are diagnostics only. OT/UOT/cosine effect signatures remain
-projected onto the 26 answer symbols; brute-force evaluates candidate
+projected onto the 26 answer symbols; full-layer evaluates candidate
 interventions directly with `iia_acc`. Calibration `iia_acc` is pooled over all
 calibration examples, so counterfactual families contribute in proportion to
 their sample counts for every method. Per-family accuracies remain diagnostic
@@ -71,6 +87,55 @@ frozen layer/boundary candidates on test.  Its reported runtime includes the
 complete layer training/calibration sweep plus selected test evaluation.
 
 Cluster launchers are in `slurm/`.
+
+### DAS-coordinate UOT proof of concept
+
+`mcqa_das_coordinate_uot.py` trains separate DAS bases for AP at layer index 18
+and AT at layer index 24, using dimensions 1152, 768, 576, and 384. It freezes
+each basis, measures one-coordinate effects on the fit bank, and solves a
+single-row UOT problem per target/dimension/epsilon. Epsilons are 0.5, 1, 2, 4;
+the neural KL coefficient is fixed at 0.1. This is supervised selection inside
+a DAS representation; it does not rerun layer localization.
+
+Calibration selects powers-of-two handle sizes up to each dimension, plus the
+full dimension. Handles fully swap the selected coordinates: there is no lambda,
+transport-mass scaling, or post-selection retraining. With a uniform neural
+prior, single-row UOT rankings are invariant across epsilon; the runner records
+that diagnostic and reuses identical hard-handle calibration results. Exact
+ties prefer smaller K, then the listed dimension/epsilon order. Selection uses
+pooled IIA and the existing shared-epsilon AP/AT macro-average rule.
+
+All eight checkpoints (materialized bases and full state dictionaries), exact
+fit/calibration/test pair banks, incremental signature caches, costs, couplings,
+and calibration records are saved. Test evaluation occurs only after freezing
+selection: two selected handles plus two full-subspace baselines using the same
+selected bases. Every trained basis must pass an exact all-coordinate-versus-DAS
+logit check. The launcher `slurm/delta_mcqa_das_coordinate_uot.sbatch` uses one A40
+and requires exact partition equality with the preceding seed-0 PCA-UOT run.
+
+### Single-stage native PLOT
+
+`slurm/delta_mcqa_single_stage_native.sbatch` runs seed 0 through
+`mcqa_single_stage_native.py`. For each of five block widths (768, 1152,
+1536, 1920, 2304), the candidate set pools blocks from all 26 layers.
+This gives 78, 52, 52, 52, and 26 candidate sites respectively; nondividing
+widths leave smaller final blocks. There is no Stage A or per-layer calibration.
+
+All five effect-signature and cost caches are constructed first. Then each
+of four epsilon values solves one two-row coupling per width: exactly 20
+couplings. AP and AT calibrate their respective rows from each shared coupling,
+using the original native top-k and intervention-strength grids with pooled IIA.
+Selection freezes a shared epsilon and each variable's best width/handle before
+exactly two final test evaluations. Handles may jointly intervene across layers.
+The summary reports all five signature costs and all five coupling/calibration
+costs at the selected epsilon, plus selected test evaluation. Full sweep wall
+time is reported separately. Cached signatures, couplings, and calibration
+outputs support resuming without repeating completed computations.
+
+The launcher uses one A40 and validates the partition against the prior seed-0
+artifact. Override `VENV_PATH`, `PRECHECK_STAMP`, `PARTITION_REFERENCE`, and
+`RUN_ROOT` as needed. Run the launcher with `--dry-run` under bash to print the
+experiment command; submit with `sbatch` from the repository root.
 
 On Delta, first create and validate the isolated NVMe environment with
 `bash experiments/mcqa/slurm/setup_delta_mcqa_env.sh` from an active GPU

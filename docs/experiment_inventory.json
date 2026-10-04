@@ -1,0 +1,815 @@
+{
+  "date": "2026-10-04",
+  "result_directories": [
+    {
+      "old_path": "results/5-3 mcqa full ot uot layerwise",
+      "new_path": "results/archive/neurips_2026_submission_period/mcqa/5-3 mcqa full ot uot layerwise",
+      "status": "historical",
+      "reason": "May 2026 run; original submission-era evidence. Exact table-level venue use is not established for every folder",
+      "confidence": "date_period_inferred",
+      "file_count": 390,
+      "bytes": 14371544
+    },
+    {
+      "old_path": "results/5-5 mcqa full das 5 seeds",
+      "new_path": "results/archive/neurips_2026_submission_period/mcqa/5-5 mcqa full das 5 seeds",
+      "status": "historical",
+      "reason": "May 2026 run; original submission-era evidence. Exact table-level venue use is not established for every folder",
+      "confidence": "date_period_inferred",
+      "file_count": 3,
+      "bytes": 3992639
+    },
+    {
+      "old_path": "results/5-5 mcqa pca partition band sweep",
+      "new_path": "results/archive/neurips_2026_submission_period/mcqa/5-5 mcqa pca partition band sweep",
+      "status": "historical",
+      "reason": "May 2026 run; original submission-era evidence. Exact table-level venue use is not established for every folder",
+      "confidence": "date_period_inferred",
+      "file_count": 109,
+      "bytes": 58342433
+    },
+    {
+      "old_path": "results/5-5 mcqa seeds 0,1,2",
+      "new_path": "results/archive/neurips_2026_submission_period/mcqa/5-5 mcqa seeds 0,1,2",
+      "status": "historical",
+      "reason": "May 2026 run; original submission-era evidence. Exact table-level venue use is not established for every folder",
+      "confidence": "date_period_inferred",
+      "file_count": 1164,
+      "bytes": 242717275
+    },
+    {
+      "old_path": "results/5-6 mcqa plot das overhaul seed0 v2",
+      "new_path": "results/archive/neurips_2026_submission_period/mcqa/5-6 mcqa plot das overhaul seed0 v2",
+      "status": "historical",
+      "reason": "May 2026 run; original submission-era evidence. Exact table-level venue use is not established for every folder",
+      "confidence": "date_period_inferred",
+      "file_count": 91,
+      "bytes": 8489879
+    },
+    {
+      "old_path": "results/5-6 mcqa stageA rowtopk ot-uot rerun",
+      "new_path": "results/archive/neurips_2026_submission_period/mcqa/5-6 mcqa stageA rowtopk ot-uot rerun",
+      "status": "historical",
+      "reason": "May 2026 run; original submission-era evidence. Exact table-level venue use is not established for every folder",
+      "confidence": "date_period_inferred",
+      "file_count": 108,
+      "bytes": 28378990
+    },
+    {
+      "old_path": "results/6-17 local heq binary method reruns",
+      "new_path": "results/archive/icml_2026_workshop_period/heq/6-17 local heq binary method reruns",
+      "status": "historical",
+      "reason": "June 2026 follow-up in the ICML workshop period; may overlap NeurIPS revisions, not a confirmed exclusive venue assignment",
+      "confidence": "date_period_inferred",
+      "file_count": 206,
+      "bytes": 9086222
+    },
+    {
+      "old_path": "results/6-17 mcqa added total variation",
+      "new_path": "results/archive/icml_2026_workshop_period/mcqa/6-17 mcqa added total variation",
+      "status": "historical",
+      "reason": "June 2026 follow-up in the ICML workshop period; may overlap NeurIPS revisions, not a confirmed exclusive venue assignment",
+      "confidence": "date_period_inferred",
+      "file_count": 884,
+      "bytes": 144716314
+    },
+    {
+      "old_path": "results/6-18 mcqa cosine brute-force large native",
+      "new_path": "results/archive/icml_2026_workshop_period/mcqa/6-18 mcqa cosine brute-force large native",
+      "status": "historical",
+      "reason": "June 2026 follow-up in the ICML workshop period; may overlap NeurIPS revisions, not a confirmed exclusive venue assignment",
+      "confidence": "date_period_inferred",
+      "file_count": 570,
+      "bytes": 59003922
+    },
+    {
+      "old_path": "results/6-18 mcqa plot native family norm seeds1-2",
+      "new_path": "results/archive/icml_2026_workshop_period/mcqa/6-18 mcqa plot native family norm seeds1-2",
+      "status": "historical",
+      "reason": "June 2026 follow-up in the ICML workshop period; may overlap NeurIPS revisions, not a confirmed exclusive venue assignment",
+      "confidence": "date_period_inferred",
+      "file_count": 442,
+      "bytes": 73031272
+    },
+    {
+      "old_path": "results/7-21 mcqa cosine brute-force fixed layers seeds1-2",
+      "new_path": "results/archive/neurips_2026_revision_period/mcqa/7-21 mcqa cosine brute-force fixed layers seeds1-2",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 750,
+      "bytes": 40225146
+    },
+    {
+      "old_path": "results/7-21 mcqa cosine brute-force rerun seeds0-2",
+      "new_path": "results/archive/neurips_2026_revision_period/mcqa/7-21 mcqa cosine brute-force rerun seeds0-2",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 1125,
+      "bytes": 60166534
+    },
+    {
+      "old_path": "results/7-25 mcqa extended grid 200-200-200",
+      "new_path": "results/archive/neurips_2026_revision_period/mcqa/7-25 mcqa extended grid 200-200-200",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 1602,
+      "bytes": 160348930
+    },
+    {
+      "old_path": "results/7-26 binary addition local baselines",
+      "new_path": "results/archive/neurips_2026_revision_period/binary_addition/7-26 binary addition local baselines",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 873,
+      "bytes": 126204868
+    },
+    {
+      "old_path": "results/7-26 mcqa MIB baselines",
+      "new_path": "results/archive/neurips_2026_revision_period/mcqa/7-26 mcqa MIB baselines",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 630,
+      "bytes": 2328386
+    },
+    {
+      "old_path": "results/7-29 boundless das",
+      "new_path": "results/archive/neurips_2026_revision_period/mixed/7-29 boundless das",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 119,
+      "bytes": 15910469
+    },
+    {
+      "old_path": "results/7-29 shared epsilon protocol binary addition",
+      "new_path": "results/archive/neurips_2026_revision_period/binary_addition/7-29 shared epsilon protocol binary addition",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 57,
+      "bytes": 88360148
+    },
+    {
+      "old_path": "results/7-30 standardized das",
+      "new_path": "results/archive/neurips_2026_revision_period/mixed/7-30 standardized das",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 11,
+      "bytes": 37165846
+    },
+    {
+      "old_path": "results/7-31 mcqa unified iia seed0",
+      "new_path": "results/archive/neurips_2026_revision_period/mcqa/7-31 mcqa unified iia seed0",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 595,
+      "bytes": 55056133
+    },
+    {
+      "old_path": "results/8-17 binary addition regularized 10seed rerun",
+      "new_path": "results/archive/neurips_2026_revision_period/binary_addition/8-17 binary addition regularized 10seed rerun",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 4,
+      "bytes": 2691325
+    },
+    {
+      "old_path": "results/8-17 binary addition regularized 10seed rerun cpu",
+      "new_path": "results/archive/neurips_2026_revision_period/binary_addition/8-17 binary addition regularized 10seed rerun cpu",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 2159,
+      "bytes": 87867582
+    },
+    {
+      "old_path": "results/8-17 binary addition w8 h64 plot4 seed0",
+      "new_path": "results/development/pilots/binary_addition/8-17 binary addition w8 h64 plot4 seed0",
+      "status": "development_pilot",
+      "reason": "8-bit/variable-length/MLP extension; not the current 4-bit width-16 main table",
+      "confidence": "task_identity_and_current_manuscript",
+      "file_count": 10,
+      "bytes": 783319
+    },
+    {
+      "old_path": "results/8-18 binary addition variable length gru h64 plot4 seed0",
+      "new_path": "results/development/pilots/binary_addition/8-18 binary addition variable length gru h64 plot4 seed0",
+      "status": "development_pilot",
+      "reason": "8-bit/variable-length/MLP extension; not the current 4-bit width-16 main table",
+      "confidence": "task_identity_and_current_manuscript",
+      "file_count": 63,
+      "bytes": 9316554
+    },
+    {
+      "old_path": "results/8-18 binary addition w8 mlp8 h64 plot4 seed0",
+      "new_path": "results/development/pilots/binary_addition/8-18 binary addition w8 mlp8 h64 plot4 seed0",
+      "status": "development_pilot",
+      "reason": "8-bit/variable-length/MLP extension; not the current 4-bit width-16 main table",
+      "confidence": "task_identity_and_current_manuscript",
+      "file_count": 10,
+      "bytes": 960829
+    },
+    {
+      "old_path": "results/8-19 binary addition cross length gru h64 plot4 seed0",
+      "new_path": "results/development/pilots/binary_addition/8-19 binary addition cross length gru h64 plot4 seed0",
+      "status": "development_pilot",
+      "reason": "8-bit/variable-length/MLP extension; not the current 4-bit width-16 main table",
+      "confidence": "task_identity_and_current_manuscript",
+      "file_count": 1,
+      "bytes": 360345
+    },
+    {
+      "old_path": "results/8-2 standardized binary addition rerun",
+      "new_path": "results/archive/neurips_2026_revision_period/binary_addition/8-2 standardized binary addition rerun",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 686,
+      "bytes": 64346890
+    },
+    {
+      "old_path": "results/8-25 binary addition d8 corrected 10seed local cpu",
+      "new_path": "results/archive/neurips_2026_revision_period/binary_addition/8-25 binary addition d8 corrected 10seed local cpu",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 2179,
+      "bytes": 48665075
+    },
+    {
+      "old_path": "results/8-25 binary addition d8 corrected heldout 10seed local cpu",
+      "new_path": "results/archive/neurips_2026_revision_period/binary_addition/8-25 binary addition d8 corrected heldout 10seed local cpu",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 2179,
+      "bytes": 48675741
+    },
+    {
+      "old_path": "results/8-26 binary addition paired current-code seed0",
+      "new_path": "results/paper/iclr_2027/binary_addition/8-26 binary addition paired current-code seed0",
+      "status": "paper_source",
+      "reason": "Reused unrestricted DAS/PLOT-DAS source, seeds 0-4 at hidden width 16; older date remains a current paper source",
+      "confidence": "confirmed_by_manuscript_and_artifacts",
+      "file_count": 42,
+      "bytes": 44563555
+    },
+    {
+      "old_path": "results/8-3 ioi blind plot oracle das",
+      "new_path": "results/archive/neurips_2026_revision_period/ioi/8-3 ioi blind plot oracle das",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 18,
+      "bytes": 34289409
+    },
+    {
+      "old_path": "results/8-3 ioi brute force das",
+      "new_path": "results/archive/neurips_2026_revision_period/ioi/8-3 ioi brute force das",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 14,
+      "bytes": 26517977
+    },
+    {
+      "old_path": "results/8-3 ioi plot brute force das k1-144",
+      "new_path": "results/archive/neurips_2026_revision_period/ioi/8-3 ioi plot brute force das k1-144",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 62,
+      "bytes": 64255823
+    },
+    {
+      "old_path": "results/8-3 ioi plot brute force das k1-6",
+      "new_path": "results/archive/neurips_2026_revision_period/ioi/8-3 ioi plot brute force das k1-6",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 34,
+      "bytes": 28484514
+    },
+    {
+      "old_path": "results/8-6 mcqa",
+      "new_path": "results/archive/neurips_2026_revision_period/mcqa/8-6 mcqa",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 3706,
+      "bytes": 681540185
+    },
+    {
+      "old_path": "results/8-8 mcqa pca dbm full-vector rerun",
+      "new_path": "results/archive/neurips_2026_revision_period/mcqa/8-8 mcqa pca dbm full-vector rerun",
+      "status": "historical",
+      "reason": "July/August revision-period result; not selected as a current source above",
+      "confidence": "date_period_inferred",
+      "file_count": 1417,
+      "bytes": 134417878
+    },
+    {
+      "old_path": "results/9-12 mcqa single-stage combined seed0",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-12 mcqa single-stage combined seed0",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 5,
+      "bytes": 535491
+    },
+    {
+      "old_path": "results/9-12 mcqa single-stage finer widths seed0",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-12 mcqa single-stage finer widths seed0",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 57,
+      "bytes": 49121489
+    },
+    {
+      "old_path": "results/9-12 mcqa single-stage native seed0",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-12 mcqa single-stage native seed0",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 36,
+      "bytes": 47943076
+    },
+    {
+      "old_path": "results/9-13 mcqa token positions balanced OT seed0",
+      "new_path": "results/supporting/iclr_2027/mcqa/9-13 mcqa token positions balanced OT seed0",
+      "status": "supporting_completed",
+      "reason": "Token-position ablation",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 126,
+      "bytes": 8699606
+    },
+    {
+      "old_path": "results/9-14 mcqa plot-das artifact audit",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-14 mcqa plot-das artifact audit",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 37,
+      "bytes": 6203236
+    },
+    {
+      "old_path": "results/9-14 mcqa single-stage uot seed0",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-14 mcqa single-stage uot seed0",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 89,
+      "bytes": 96151901
+    },
+    {
+      "old_path": "results/9-14 mcqa token positions UOT seed0",
+      "new_path": "results/supporting/iclr_2027/mcqa/9-14 mcqa token positions UOT seed0",
+      "status": "supporting_completed",
+      "reason": "Token-position follow-up",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 205,
+      "bytes": 17535696
+    },
+    {
+      "old_path": "results/9-15 mcqa single-stage pca uot seed0",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-15 mcqa single-stage pca uot seed0",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 70,
+      "bytes": 139302291
+    },
+    {
+      "old_path": "results/9-17 mcqa das coordinate uot seed0",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-17 mcqa das coordinate uot seed0",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 27,
+      "bytes": 78154463
+    },
+    {
+      "old_path": "results/9-18 mcqa das dense topk seed0",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-18 mcqa das dense topk seed0",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 128,
+      "bytes": 77638728
+    },
+    {
+      "old_path": "results/9-18 mcqa single-stage uot seeds1-3",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-18 mcqa single-stage uot seeds1-3",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 60,
+      "bytes": 14308627
+    },
+    {
+      "old_path": "results/9-19 binary addition staging OT comparison seed0",
+      "new_path": "results/development/iclr_2027_preliminary/binary_addition/9-19 binary addition staging OT comparison seed0",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 84,
+      "bytes": 9098903
+    },
+    {
+      "old_path": "results/9-19 binary addition staging UOT beta sweep seed0",
+      "new_path": "results/development/iclr_2027_preliminary/binary_addition/9-19 binary addition staging UOT beta sweep seed0",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 86,
+      "bytes": 9852869
+    },
+    {
+      "old_path": "results/9-19 binary addition staging comparison",
+      "new_path": "results/development/incomplete_or_excluded/binary_addition/9-19 binary addition staging comparison",
+      "status": "excluded_or_plan",
+      "reason": "Stopped, discarded timing, partial pilot or plan; not final paper evidence",
+      "confidence": "documented_in_existing_index",
+      "file_count": 7,
+      "bytes": 36704803
+    },
+    {
+      "old_path": "results/9-20 binary addition staging five seeds",
+      "new_path": "results/development/iclr_2027_preliminary/binary_addition/9-20 binary addition staging five seeds",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 718,
+      "bytes": 76787858
+    },
+    {
+      "old_path": "results/9-21 mcqa global staged five seeds",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-21 mcqa global staged five seeds",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 1873,
+      "bytes": 572550323
+    },
+    {
+      "old_path": "results/9-22 binary addition six-seed selected-settings",
+      "new_path": "results/supporting/iclr_2027/binary_addition/9-22 binary addition six-seed selected-settings",
+      "status": "supporting_completed",
+      "reason": "Selected-setting companion summary; primary report uses full-grid serial runtime",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 4,
+      "bytes": 85567
+    },
+    {
+      "old_path": "results/9-22 binary addition staging parallel timing discarded",
+      "new_path": "results/development/incomplete_or_excluded/binary_addition/9-22 binary addition staging parallel timing discarded",
+      "status": "excluded_or_plan",
+      "reason": "Stopped, discarded timing, partial pilot or plan; not final paper evidence",
+      "confidence": "documented_in_existing_index",
+      "file_count": 107,
+      "bytes": 10307186
+    },
+    {
+      "old_path": "results/9-22 binary addition staging seed5 full",
+      "new_path": "results/development/iclr_2027_preliminary/binary_addition/9-22 binary addition staging seed5 full",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 167,
+      "bytes": 18940477
+    },
+    {
+      "old_path": "results/9-22 binary addition staging six seeds serial",
+      "new_path": "results/paper/iclr_2027/binary_addition/9-22 binary addition staging six seeds serial",
+      "status": "paper_source",
+      "reason": "Unrestricted global/staged native/PCA OT main comparison; paper uses seeds 0-4 at width 16",
+      "confidence": "confirmed_by_manuscript_and_artifacts",
+      "file_count": 964,
+      "bytes": 114208389
+    },
+    {
+      "old_path": "results/9-22 mcqa capped DBM and DAS five seeds A40",
+      "new_path": "results/paper/iclr_2027/mcqa/9-22 mcqa capped DBM and DAS five seeds A40",
+      "status": "paper_source",
+      "reason": "DBM baseline sources; Full DAS portion superseded by September 24 corrected runs",
+      "confidence": "confirmed_by_manuscript_and_artifacts",
+      "file_count": 1566,
+      "bytes": 499611038
+    },
+    {
+      "old_path": "results/9-22 mcqa global staged five seeds A40",
+      "new_path": "results/paper/iclr_2027/mcqa/9-22 mcqa global staged five seeds A40",
+      "status": "paper_source",
+      "reason": "Original global/staged UOT candidates and partition evidence; runtime table superseded by full-beta replay",
+      "confidence": "confirmed_by_manuscript_and_artifacts",
+      "file_count": 1817,
+      "bytes": 579720722
+    },
+    {
+      "old_path": "results/9-23 binary addition capped five seeds",
+      "new_path": "results/supporting/iclr_2027/binary_addition/9-23 binary addition capped five seeds",
+      "status": "supporting_completed",
+      "reason": "Separate capped comparison; not the unrestricted main table",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 2314,
+      "bytes": 76585955
+    },
+    {
+      "old_path": "results/9-23 binary addition uncapped comparison",
+      "new_path": "results/paper/iclr_2027/binary_addition/9-23 binary addition uncapped comparison",
+      "status": "paper_source",
+      "reason": "Derived table and handle index joining original runs; not an independent fresh run",
+      "confidence": "confirmed_by_manuscript_and_artifacts",
+      "file_count": 2,
+      "bytes": 530243
+    },
+    {
+      "old_path": "results/9-23 mcqa MIB DAS L24 d1152 A40",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-23 mcqa MIB DAS L24 d1152 A40",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 11,
+      "bytes": 3194320
+    },
+    {
+      "old_path": "results/9-23 mcqa MIB DAS L24 d1152 ten seeds A40",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-23 mcqa MIB DAS L24 d1152 ten seeds A40",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 61,
+      "bytes": 16039153
+    },
+    {
+      "old_path": "results/9-23 mcqa global staged OT five seeds plan",
+      "new_path": "results/development/incomplete_or_excluded/mcqa/9-23 mcqa global staged OT five seeds plan",
+      "status": "excluded_or_plan",
+      "reason": "Stopped, discarded timing, partial pilot or plan; not final paper evidence",
+      "confidence": "documented_in_existing_index",
+      "file_count": 2,
+      "bytes": 2161
+    },
+    {
+      "old_path": "results/9-24 heq cpu paper rerun left grid",
+      "new_path": "results/paper/iclr_2027/heq/9-24 heq cpu paper rerun left grid",
+      "status": "paper_source",
+      "reason": "Saved DAS runs, fixed banks, original PLOT trials and broad epsilon ablation",
+      "confidence": "confirmed_by_manuscript_and_artifacts",
+      "file_count": 199,
+      "bytes": 27051897
+    },
+    {
+      "old_path": "results/9-24 heq cpu plot 6eps stable rerun",
+      "new_path": "results/paper/iclr_2027/heq/9-24 heq cpu plot 6eps stable rerun",
+      "status": "paper_source",
+      "reason": "Current stable six-epsilon PLOT comparison with saved DAS, seeds 1-10",
+      "confidence": "confirmed_by_manuscript_and_artifacts",
+      "file_count": 47,
+      "bytes": 12025560
+    },
+    {
+      "old_path": "results/9-24 mcqa UOT budget1152 full beta five seeds A40",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa UOT budget1152 full beta five seeds A40",
+      "status": "paper_source",
+      "reason": "Current five-seed native/PCA global/staged UOT main-table reporting, full beta replay",
+      "confidence": "confirmed_by_manuscript_and_artifacts",
+      "file_count": 1384,
+      "bytes": 526717806
+    },
+    {
+      "old_path": "results/9-24 mcqa corrected DAS five seeds A40",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40",
+      "status": "paper_source",
+      "reason": "Current saved Full DAS/PLOT-DAS main-table sources, corrected MIB loss and substring score",
+      "confidence": "confirmed_by_manuscript_and_artifacts",
+      "file_count": 849,
+      "bytes": 694045160
+    },
+    {
+      "old_path": "results/9-24 mcqa single stage matching seed0 stopped",
+      "new_path": "results/development/incomplete_or_excluded/mcqa/9-24 mcqa single stage matching seed0 stopped",
+      "status": "excluded_or_plan",
+      "reason": "Stopped, discarded timing, partial pilot or plan; not final paper evidence",
+      "confidence": "documented_in_existing_index",
+      "file_count": 28,
+      "bytes": 1008708
+    },
+    {
+      "old_path": "results/9-25 mcqa KL four PLOT methods five seeds A40",
+      "new_path": "results/supporting/iclr_2027/mcqa/9-25 mcqa KL four PLOT methods five seeds A40",
+      "status": "supporting_completed",
+      "reason": "Completed KL/family-wise four-method ablation",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 1097,
+      "bytes": 476763449
+    },
+    {
+      "old_path": "results/9-25 mcqa PLOT DAS KL stage A five seeds A40",
+      "new_path": "results/supporting/iclr_2027/mcqa/9-25 mcqa PLOT DAS KL stage A five seeds A40",
+      "status": "supporting_completed",
+      "reason": "Completed KL Stage-A DAS follow-up; final collected results verified, excludes failed strict-scorer attempt",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 460,
+      "bytes": 211363289
+    },
+    {
+      "old_path": "results/9-25 mcqa effect signatures seed0 A40",
+      "new_path": "results/supporting/iclr_2027/mcqa/9-25 mcqa effect signatures seed0 A40",
+      "status": "supporting_completed",
+      "reason": "Seed-0 effect-signature ablation; pre-fix TV diagnostics excluded",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 172,
+      "bytes": 15121466
+    },
+    {
+      "old_path": "results/9-25 mcqa effect signatures seeds1-4 A40",
+      "new_path": "results/supporting/iclr_2027/mcqa/9-25 mcqa effect signatures seeds1-4 A40",
+      "status": "supporting_completed",
+      "reason": "Effect-signature ablation completion, paired with seed 0",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 465,
+      "bytes": 40995440
+    },
+    {
+      "old_path": "results/9-25 mcqa two stage cosine KL five seeds A40",
+      "new_path": "results/supporting/iclr_2027/mcqa/9-25 mcqa two stage cosine KL five seeds A40",
+      "status": "supporting_completed",
+      "reason": "Five-seed cosine/KL follow-up",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 184,
+      "bytes": 3696510
+    },
+    {
+      "old_path": "results/9-25 mcqa two stage cosine full-layer five seeds A40",
+      "new_path": "results/supporting/iclr_2027/mcqa/9-25 mcqa two stage cosine full-layer five seeds A40",
+      "status": "supporting_completed",
+      "reason": "Five-seed alternative-matching ablation",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 290,
+      "bytes": 6015275
+    },
+    {
+      "old_path": "results/9-25 mcqa two stage cosine full-layer seed0 A40",
+      "new_path": "results/development/iclr_2027_preliminary/mcqa/9-25 mcqa two stage cosine full-layer seed0 A40",
+      "status": "preliminary_or_superseded",
+      "reason": "September pilot/audit or predecessor; retained for provenance, not selected current table evidence",
+      "confidence": "existing_index_and_current_source_comparison",
+      "file_count": 72,
+      "bytes": 1562517
+    },
+    {
+      "old_path": "results/9-6 binary addition paired dbm full-vector 10seed local cpu",
+      "new_path": "results/supporting/iclr_2027/binary_addition/9-6 binary addition paired dbm full-vector 10seed local cpu",
+      "status": "supporting_completed",
+      "reason": "Unrestricted baseline comparison source referenced by the derived report",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 4254,
+      "bytes": 32154896
+    },
+    {
+      "old_path": "results/9-9 binary addition mcqa-style pca bands 10seed local cpu",
+      "new_path": "results/supporting/iclr_2027/binary_addition/9-9 binary addition mcqa-style pca bands 10seed local cpu",
+      "status": "supporting_completed",
+      "reason": "Earlier PCA-band source referenced by the derived report; not the new one-/two-stage table rows",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 23,
+      "bytes": 29706538
+    },
+    {
+      "old_path": "results/mcqa_staged_native_family_ot_stage_a_5seed_a40_20260925",
+      "new_path": "results/supporting/iclr_2027/mcqa/9-25 mcqa staged native balanced OT Stage A five seeds A40",
+      "status": "supporting_completed",
+      "reason": "Completed five-seed balanced-OT versus UOT Stage-A-only comparison",
+      "confidence": "confirmed_by_artifacts_and_project_chats",
+      "file_count": 39,
+      "bytes": 356432
+    }
+  ],
+  "source_directories": [
+    {
+      "old_path": "experiments/binary_addition_c1",
+      "new_path": "experiments/archive/early_tasks/binary_addition_c1"
+    },
+    {
+      "old_path": "experiments/two_digit_addition",
+      "new_path": "experiments/archive/early_tasks/two_digit_addition"
+    },
+    {
+      "old_path": "experiments/mcqa_block_focus",
+      "new_path": "experiments/archive/mcqa_exploration/mcqa_block_focus"
+    },
+    {
+      "old_path": "experiments/mcqa_broad_sweep",
+      "new_path": "experiments/archive/mcqa_exploration/mcqa_broad_sweep"
+    },
+    {
+      "old_path": "experiments/mcqa_layerwise",
+      "new_path": "experiments/archive/mcqa_exploration/mcqa_layerwise"
+    },
+    {
+      "old_path": "experiments/mcqa_diagnostics",
+      "new_path": "experiments/archive/mcqa_exploration/mcqa_diagnostics"
+    },
+    {
+      "old_path": "experiments/notebook_demos",
+      "new_path": "experiments/archive/demos/notebook_demos"
+    },
+    {
+      "old_path": "experiments/heq_intervention_heatmaps",
+      "new_path": "experiments/archive/figure_utilities/heq_intervention_heatmaps"
+    }
+  ],
+  "note": "Results are local and Git-ignored. Period labels are not exclusive venue attribution; confidence records whether a source was positively identified.",
+  "artifact_files": [
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_all_tasks.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_all_tasks.csv",
+      "bytes": 810
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed0.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed0.csv",
+      "bytes": 162
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed0_halfa.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed0_halfa.csv",
+      "bytes": 81
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed0_halfb.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed0_halfb.csv",
+      "bytes": 81
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed1.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed1.csv",
+      "bytes": 162
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed1_halfa.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed1_halfa.csv",
+      "bytes": 81
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed1_halfb.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed1_halfb.csv",
+      "bytes": 81
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed2.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed2.csv",
+      "bytes": 162
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed2_halfa.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed2_halfa.csv",
+      "bytes": 81
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed2_halfb.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed2_halfb.csv",
+      "bytes": 81
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed3.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed3.csv",
+      "bytes": 162
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed3_halfa.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed3_halfa.csv",
+      "bytes": 81
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed3_halfb.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed3_halfb.csv",
+      "bytes": 81
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed4.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed4.csv",
+      "bytes": 162
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed4_halfa.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed4_halfa.csv",
+      "bytes": 81
+    },
+    {
+      "old_path": "experiments/mcqa_staging_budget/full_das_corrected_seed4_halfb.csv",
+      "new_path": "results/paper/iclr_2027/mcqa/9-24 mcqa corrected DAS five seeds A40/task_tables/full_das_corrected_seed4_halfb.csv",
+      "bytes": 81
+    }
+  ]
+}
