@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 
 import torch
@@ -11,9 +12,9 @@ from torch.utils.data import DataLoader
 from .data import MCQAPairBank, MCQAPairDataset
 from .intervention import DASSubspaceIntervention, run_das_residual_intervention
 from .metrics import (
-    cross_entropy_for_bank,
-    das_metrics_from_logits,
+    cross_entropy_for_das,
     das_prediction_details_from_logits,
+    das_metrics_from_logits,
 )
 from .pca import LayerPCABasis
 from .sites import SiteLike, site_token_position_ids, site_total_width
@@ -25,7 +26,7 @@ class DASConfig:
 
     method_name: str = "das"
     batch_size: int = 16
-    max_epochs: int = 5
+    max_epochs: int = 100
     min_epochs: int = 1
     plateau_patience: int = 1
     plateau_rel_delta: float = 5e-3
@@ -35,6 +36,8 @@ class DASConfig:
     store_candidate_holdout_metrics: bool = False
     restarts: int = 1
     verbose: bool = True
+    evaluate_holdout: bool = True
+    selected_checkpoint_path: Path | None = None
 
 
 def _sync_if_cuda(device: torch.device) -> None:
@@ -143,7 +146,8 @@ def train_das_candidate(
                 pca_bases_by_id=pca_bases_by_id,
             )
             mini_bank = _mini_bank_from_batch(bank, batch)
-            loss = cross_entropy_for_bank(logits, mini_bank)
+            # Match MIB's token-level cross-entropy over the full vocabulary.
+            loss = cross_entropy_for_das(logits, mini_bank)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -308,7 +312,7 @@ def run_das_pipeline(
                 train_calibrate_seconds += float(train_seconds) + float(calibration_seconds)
                 holdout_metrics_for_candidate = None
                 current_candidate_holdout_seconds = 0.0
-                if config.store_candidate_holdout_metrics:
+                if config.store_candidate_holdout_metrics and config.evaluate_holdout:
                     _sync_if_cuda(device)
                     candidate_holdout_start = perf_counter()
                     holdout_metrics_for_candidate = evaluate_das_candidate(
@@ -373,21 +377,34 @@ def run_das_pipeline(
                         )
     if best is None or best_intervention is None or best_site is None:
         raise RuntimeError(f"Failed to select a DAS candidate for {train_bank.target_var}")
-    _sync_if_cuda(device)
-    final_holdout_start = perf_counter()
-    holdout_metrics = evaluate_das_candidate(
-        model=model,
-        bank=holdout_bank,
-        site=best_site,
-        intervention=best_intervention,
-        batch_size=config.batch_size,
-        device=device,
-        tokenizer=tokenizer,
-        pca_bases_by_id=pca_bases_by_id,
-        return_details=True,
-    )
-    _sync_if_cuda(device)
-    final_holdout_seconds = perf_counter() - final_holdout_start
+    if config.selected_checkpoint_path is not None:
+        checkpoint_path = Path(config.selected_checkpoint_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "state_dict": {key: value.detach().cpu() for key, value in best_intervention.state_dict().items()},
+                "selected_record": best,
+            },
+            checkpoint_path,
+        )
+    holdout_metrics = None
+    final_holdout_seconds = 0.0
+    if config.evaluate_holdout:
+        _sync_if_cuda(device)
+        final_holdout_start = perf_counter()
+        holdout_metrics = evaluate_das_candidate(
+            model=model,
+            bank=holdout_bank,
+            site=best_site,
+            intervention=best_intervention,
+            batch_size=config.batch_size,
+            device=device,
+            tokenizer=tokenizer,
+            pca_bases_by_id=pca_bases_by_id,
+            return_details=True,
+        )
+        _sync_if_cuda(device)
+        final_holdout_seconds = perf_counter() - final_holdout_start
     _sync_if_cuda(device)
     selected_calibration_start = perf_counter()
     selected_calibration_metrics = evaluate_das_candidate(
@@ -404,12 +421,10 @@ def run_das_pipeline(
     _sync_if_cuda(device)
     selected_calibration_seconds = perf_counter() - selected_calibration_start
     total_wall_seconds = perf_counter() - total_start
-    result = {
-        **best,
-        "split": holdout_bank.split,
-        **holdout_metrics,
+    result = {**best, "split": holdout_bank.split, **holdout_metrics} if holdout_metrics is not None else {
+        **best, "split": calibration_bank.split, **selected_calibration_metrics,
     }
-    if config.verbose:
+    if config.verbose and holdout_metrics is not None:
         print(
             f"[{config.method_name.upper()}] holdout variable={train_bank.target_var} "
             f"site={best_site.label} dim={int(best['subspace_dim'])} "
@@ -419,6 +434,10 @@ def run_das_pipeline(
         "target_var": train_bank.target_var,
         "selection_split": "calibration",
         "test_used_for_selection": False,
+        "test_evaluated": bool(config.evaluate_holdout),
+        "selected_checkpoint_path": (
+            str(config.selected_checkpoint_path) if config.selected_checkpoint_path is not None else None
+        ),
         "runtime_seconds": float(total_wall_seconds),
         "core_method_seconds": float(total_wall_seconds),
         "wall_runtime_seconds": float(total_wall_seconds),

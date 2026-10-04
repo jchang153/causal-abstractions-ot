@@ -38,7 +38,7 @@ class CompareExperimentConfig:
     ot_lambdas_by_var: dict[str, tuple[float, ...]] | None = None
     cosine_temperature: float = 1.0
     bruteforce_temperature: float = 1.0
-    das_max_epochs: int = 5
+    das_max_epochs: int = 100
     das_min_epochs: int = 1
     das_plateau_patience: int = 1
     das_plateau_rel_delta: float = 5e-3
@@ -206,6 +206,13 @@ def run_comparison(
                         subspace_dims=config.das_subspace_dims,
                         store_candidate_holdout_metrics=config.das_store_candidate_holdout_metrics,
                         restarts=config.das_restarts,
+                        evaluate_holdout=bool(config.evaluate_test),
+                        selected_checkpoint_path=(
+                            config.output_path.with_name(
+                                f"{config.output_path.stem}_{target_var}_selected.pt"
+                            )
+                            if not config.evaluate_test else None
+                        ),
                     ),
                 )
             else:

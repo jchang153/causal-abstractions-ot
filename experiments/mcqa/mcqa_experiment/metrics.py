@@ -205,7 +205,7 @@ def _family_iia_metrics(
 
 def cross_entropy_for_das(logits: torch.Tensor, bank: MCQAPairBank) -> torch.Tensor:
     """Compute DAS training loss on full next-token logits."""
-    return F.cross_entropy(logits, bank.answer_token_ids.to(logits.device))
+    return F.cross_entropy(logits.float(), bank.answer_token_ids.to(logits.device))
 
 
 def _decoded_full_vocab_top1(logits: torch.Tensor, tokenizer) -> tuple[torch.Tensor, list[str]]:
@@ -345,6 +345,45 @@ def metrics_from_logits(logits: torch.Tensor, bank: MCQAPairBank, tokenizer=None
 def das_metrics_from_logits(logits: torch.Tensor, bank: MCQAPairBank, tokenizer=None) -> dict[str, object]:
     """Compute the same normalized full-vocabulary IIA used by every MCQA method."""
     return full_vocab_iia_metrics(logits, bank, tokenizer)
+
+
+def mib_mcqa_das_metrics_from_logits(
+    logits: torch.Tensor, bank: MCQAPairBank, tokenizer
+) -> dict[str, object]:
+    """Legacy diagnostic: score MIB's one-token MCQA substring checker.
+
+    MIB decodes its greedy generated token with ``skip_special_tokens=True``
+    and checks whether the causal model's label (including its initial space)
+    occurs in that decoded text. Our bank stores stripped answer symbols, so
+    the initial space is restored here. DAS selection and reported IIA use
+    ``das_metrics_from_logits`` instead.
+    """
+    if tokenizer is None:
+        raise ValueError("tokenizer is required for MIB MCQA DAS scoring")
+    if logits.ndim != 2:
+        raise ValueError(f"Expected [batch, vocab] logits, got shape={tuple(logits.shape)}")
+    expected_symbols = [str(text) for text in bank.expected_answer_texts]
+    if any(len(symbol) != 1 or not symbol.isupper() for symbol in expected_symbols):
+        raise ValueError("MIB MCQA scoring requires one uppercase answer symbol per example")
+    token_ids = logits.argmax(dim=-1).detach().cpu().tolist()
+    decoded = tokenizer.batch_decode([[int(token_id)] for token_id in token_ids], skip_special_tokens=True)
+    expected = [" " + symbol for symbol in expected_symbols]
+    if len(decoded) != len(expected):
+        raise ValueError("Decoded predictions and expected answers have different lengths")
+    correct = [label in output for label, output in zip(expected, decoded)]
+    total = len(correct)
+    score = sum(correct) / total if total else 0.0
+    strict = full_vocab_iia_metrics(logits, bank, tokenizer)
+    return {
+        "metric_name": "mib_mcqa_generated_substring_v1",
+        "iia_acc": score,
+        "checker_acc": score,
+        "decoded_answer_acc": score,
+        "exact_acc": score,
+        "mib_correct_count": sum(correct),
+        "mib_total_count": total,
+        "strict_normalized_full_vocab_iia_acc": strict["iia_acc"],
+    }
 
 
 def prediction_details_from_logits(

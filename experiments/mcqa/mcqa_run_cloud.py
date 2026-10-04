@@ -161,6 +161,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-pool-size", type=int)
     parser.add_argument("--methods", help="Comma-separated, e.g. ot,uot,das")
     parser.add_argument("--target-vars", help="Comma-separated, e.g. answer_pointer,answer_token")
+    parser.add_argument("--training-seed", type=int, help="Seed Python, NumPy, and PyTorch before model loading and DAS training.")
+    parser.add_argument(
+        "--pair-bank-target-vars",
+        help="Variables used to form shared train/calibration/test pair banks; methods still run only --target-vars.",
+    )
     parser.add_argument(
         "--counterfactual-names",
         help="Comma-separated, e.g. answerPosition,randomLetter,answerPosition_randomLetter",
@@ -193,6 +198,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--das-learning-rate", type=float)
     parser.add_argument("--das-restarts", type=int)
     parser.add_argument("--das-subspace-dims", help="Comma-separated integers")
+    parser.add_argument("--filter-batch-size", type=int, help="Batch size for factual filtering, separate from intervention/training batch size.")
+    parser.add_argument("--calibration-only", action="store_true", help="Do not evaluate DAS test data; save each layer's calibration winner checkpoint.")
     parser.add_argument("--results-root")
     parser.add_argument("--results-timestamp")
     parser.add_argument("--signatures-dir")
@@ -250,6 +257,11 @@ def _override_base_run(
     target_vars = _parse_csv_strings(args.target_vars)
     if target_vars is not None:
         base_run.TARGET_VARS = target_vars
+    if args.training_seed is not None:
+        base_run.TRAINING_SEED = int(args.training_seed)
+    pair_bank_target_vars = _parse_csv_strings(args.pair_bank_target_vars)
+    if pair_bank_target_vars is not None:
+        base_run.PAIR_BANK_TARGET_VARS = pair_bank_target_vars
     counterfactual_names = _parse_csv_strings(args.counterfactual_names)
     if counterfactual_names is not None:
         base_run.COUNTERFACTUAL_NAMES = counterfactual_names
@@ -260,6 +272,7 @@ def _override_base_run(
         base_run.TOKEN_POSITION_IDS = None if args.token_position_ids == "all" else _parse_csv_strings(args.token_position_ids)
     if args.batch_size is not None:
         base_run.BATCH_SIZE = int(args.batch_size)
+    base_run.FILTER_BATCH_SIZE = None if args.filter_batch_size is None else int(args.filter_batch_size)
 
     resolutions = _parse_csv_resolutions(args.resolutions)
     if resolutions is not None:
@@ -300,6 +313,7 @@ def _override_base_run(
     das_subspace_dims = _parse_csv_ints(args.das_subspace_dims)
     if das_subspace_dims is not None:
         base_run.DAS_SUBSPACE_DIMS = das_subspace_dims
+    base_run.EVALUATE_TEST = not bool(args.calibration_only)
 
     base_run.PROMPT_HF_LOGIN = bool(args.prompt_hf_login)
     base_run.RUN_TIMESTAMP = results_timestamp
@@ -315,6 +329,8 @@ def _override_base_run(
         "dataset_config": base_run.MCQA_DATASET_CONFIG,
         "dataset_size": base_run.DATASET_SIZE,
         "split_seed": base_run.SPLIT_SEED,
+        "training_seed": base_run.TRAINING_SEED,
+        "pair_bank_target_vars": list(base_run.PAIR_BANK_TARGET_VARS or base_run.TARGET_VARS),
         "train_pool_size": base_run.TRAIN_POOL_SIZE,
         "calibration_pool_size": base_run.CALIBRATION_POOL_SIZE,
         "test_pool_size": base_run.TEST_POOL_SIZE,
@@ -324,6 +340,7 @@ def _override_base_run(
         "layers": base_run.LAYERS,
         "token_position_ids": base_run.TOKEN_POSITION_IDS,
         "batch_size": base_run.BATCH_SIZE,
+        "filter_batch_size": base_run.FILTER_BATCH_SIZE or base_run.BATCH_SIZE,
         "resolutions": list(base_run.RESOLUTIONS),
         "ot_epsilons": list(base_run.OT_EPSILONS),
         "uot_beta_neurals": list(base_run.UOT_BETA_NEURALS),
@@ -339,6 +356,7 @@ def _override_base_run(
         "das_learning_rate": base_run.DAS_LEARNING_RATE,
         "das_restarts": base_run.DAS_RESTARTS,
         "das_subspace_dims": list(base_run.DAS_SUBSPACE_DIMS),
+        "evaluate_test": bool(base_run.EVALUATE_TEST),
         "prompt_hf_login": base_run.PROMPT_HF_LOGIN,
         "run_dir": str(base_run.RUN_DIR),
         "signatures_dir": str(base_run.SIGNATURES_DIR),

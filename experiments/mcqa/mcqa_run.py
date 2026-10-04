@@ -12,11 +12,13 @@ from datetime import datetime
 import gc
 import hashlib
 import json
+import random
 from pathlib import Path
 import os
 from time import perf_counter
 
 from huggingface_hub import login as hf_login
+import numpy as np
 import torch
 
 from mcqa_experiment.compare_runner import CompareExperimentConfig, run_comparison
@@ -60,6 +62,7 @@ MCQA_DATASET_CONFIG = None
 # MCQA_DATASET_CONFIG = "4_answer_choices"
 DATASET_SIZE = 2000  # Cap raw rows loaded from the dataset before factual filtering.
 SPLIT_SEED = 0
+TRAINING_SEED = None  # Explicitly set for reproducible multi-seed DAS runs.
 TRAIN_POOL_SIZE = 200
 CALIBRATION_POOL_SIZE = 200
 TEST_POOL_SIZE = 200
@@ -67,12 +70,14 @@ TEST_POOL_SIZE = 200
 # Experiment
 METHODS = ["ot"]
 TARGET_VARS = ["answer_pointer", "answer_token"]
+PAIR_BANK_TARGET_VARS = None  # Usually the same as TARGET_VARS; may include both for comparable splits.
 COUNTERFACTUAL_NAMES = ["answerPosition", "randomLetter", "answerPosition_randomLetter"]
 
 LAYERS = "auto"
 TOKEN_POSITION_IDS = ["correct_symbol", "correct_symbol_period", "last_token"]
 
 BATCH_SIZE = 64 
+FILTER_BATCH_SIZE = None  # Use BATCH_SIZE unless a comparable cohort requires a fixed filter batch.
 
 RESOLUTIONS = [16, 32, 48, 64, 128, 144, 192, 256, 288, 384, 576, 768]
 OT_EPSILONS = [0.5, 1.0, 2.0]
@@ -83,12 +88,13 @@ OT_LAMBDAS = [0.5, 1.0, 2.0]
 CALIBRATION_METRIC = "iia_acc"
 CALIBRATION_FAMILY_WEIGHTS = [1.0, 1.0, 1.0]
 
-DAS_MAX_EPOCHS = 1000
+DAS_MAX_EPOCHS = 100
 DAS_MIN_EPOCHS = 5
 DAS_PLATEAU_PATIENCE = 1
 DAS_PLATEAU_REL_DELTA = 1e-3
 DAS_LEARNING_RATE = 1e-3
 DAS_RESTARTS = 1
+EVALUATE_TEST = True
 DAS_SUBSPACE_DIMS = [
     32,
     64,
@@ -189,7 +195,7 @@ def build_run_context() -> dict[str, object]:
     model, tokenizer, causal_model, token_positions, filtered_datasets = load_filtered_mcqa_pipeline(
         model_name=MODEL_NAME,
         device=DEVICE,
-        batch_size=BATCH_SIZE,
+        batch_size=FILTER_BATCH_SIZE or BATCH_SIZE,
         dataset_size=DATASET_SIZE,
         hf_token=hf_token,
         dataset_path=MCQA_DATASET_PATH,
@@ -205,7 +211,7 @@ def build_run_context() -> dict[str, object]:
         token_positions=token_positions,
         datasets_by_name=filtered_datasets,
         counterfactual_names=tuple(COUNTERFACTUAL_NAMES),
-        target_vars=tuple(TARGET_VARS),
+        target_vars=tuple(PAIR_BANK_TARGET_VARS or TARGET_VARS),
         split_seed=SPLIT_SEED,
         train_pool_size=TRAIN_POOL_SIZE,
         calibration_pool_size=CALIBRATION_POOL_SIZE,
@@ -450,6 +456,7 @@ def execute_run_context(*, context: dict[str, object]) -> None:
                     das_learning_rate=DAS_LEARNING_RATE,
                     das_restarts=DAS_RESTARTS,
                     das_subspace_dims=tuple(DAS_SUBSPACE_DIMS),
+                    evaluate_test=bool(EVALUATE_TEST),
                     resolution=resolved_resolution,
                     layers=tuple(selected_layers),
                     token_position_ids=None if TOKEN_POSITION_IDS is None else tuple(TOKEN_POSITION_IDS),
@@ -475,14 +482,17 @@ def execute_run_context(*, context: dict[str, object]) -> None:
         OUTPUT_PATH,
         {
             "kind": "mcqa_full_das" if is_full_das_protocol else "mcqa_diagnostic_grid",
-            "paper_eligible": bool(is_full_das_protocol),
+            "paper_eligible": bool(is_full_das_protocol and EVALUATE_TEST),
             "holdout_policy": (
-                "DAS selects layer/dimension on calibration and evaluates only the selected handle on test"
+                "DAS calibration-only shard; no test evaluation"
+                if is_full_das_protocol and not EVALUATE_TEST
+                else "DAS selects layer/dimension on calibration and evaluates only the selected handle on test"
                 if is_full_das_protocol
                 else "test is evaluated for every requested top-level configuration"
             ),
             "data": data_metadata,
             "partition_protocol": MCQA_PARTITION_PROTOCOL,
+            "training_seed": TRAINING_SEED,
             "runs": all_payloads,
         },
     )
@@ -490,6 +500,12 @@ def execute_run_context(*, context: dict[str, object]) -> None:
 
 
 def main() -> None:
+    if TRAINING_SEED is not None:
+        random.seed(int(TRAINING_SEED))
+        np.random.seed(int(TRAINING_SEED))
+        torch.manual_seed(int(TRAINING_SEED))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(TRAINING_SEED))
     context = build_run_context()
     execute_run_context(context=context)
 

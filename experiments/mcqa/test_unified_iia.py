@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from mcqa_experiment.checking import (
     checker_accuracy,
@@ -17,7 +18,9 @@ from mcqa_experiment.checking import (
 )
 from mcqa_experiment.metrics import (
     STRUCTURED_LABEL_DIM,
+    cross_entropy_for_das,
     das_metrics_from_logits,
+    mib_mcqa_das_metrics_from_logits,
     metrics_from_logits,
     prediction_details_from_logits,
 )
@@ -45,6 +48,31 @@ class FakeTokenizer:
     def decode(self, token_ids: list[int]) -> str:
         assert len(token_ids) == 1
         return self.text_by_id.get(int(token_ids[0]), "<other>")
+
+    def batch_decode(self, token_ids: list[list[int]], skip_special_tokens: bool = False) -> list[str]:
+        assert skip_special_tokens
+        return [self.decode(ids) for ids in token_ids]
+
+
+def test_mib_das_checker_preserves_space_and_case() -> None:
+    bank = make_bank(["C", "B", "D"], families=["answerPosition"] * 3)
+    metrics = mib_mcqa_das_metrics_from_logits(
+        logits_with_top_ids([3, 52, 53]), bank, tokenizer=FakeTokenizer()
+    )
+    assert metrics["metric_name"] == "mib_mcqa_generated_substring_v1"
+    assert metrics["iia_acc"] == pytest.approx(1 / 3)
+    assert metrics["strict_normalized_full_vocab_iia_acc"] == pytest.approx(1.0)
+
+
+def test_mib_das_loss_uses_full_vocabulary() -> None:
+    bank = make_bank(["A"], families=["answerPosition"])
+    logits = torch.zeros((1, 80))
+    logits[0, 1] = 4.0
+    logits[0, 50] = 9.0  # A non-answer token must contribute to the denominator.
+    actual = cross_entropy_for_das(logits, bank)
+    expected = F.cross_entropy(logits, bank.answer_token_ids)
+    assert torch.allclose(actual, expected)
+    assert actual.item() > 4.0
 
 
 def make_bank(
