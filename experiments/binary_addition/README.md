@@ -2,10 +2,10 @@
 
 ## Current paper versus earlier studies
 
-The ICLR 2027 / arXiv v2 main table uses width 16 and seeds 0-4: unrestricted
-September 22 global/staged OT from `run_staging_comparison.py` / `run_staging_suite.py`,
-and DAS/PLOT-DAS reused from the August 26 paired run of `run_progressive_plot.py`.
-The September 23 dimension-capped suite is a separate follow-up. The 8-bit,
+The version v4 main table uses width 16 and seeds 0-4: unrestricted
+global/staged OT from `run_staging_comparison.py` / `run_staging_suite.py`,
+and DAS/PLOT-DAS reused from the paired run of `run_progressive_plot.py`.
+The dimension-capped suite is a separate follow-up. The 8-bit,
 variable-length, cross-length and residual-MLP pilots below are not main-table runs.
 
 Saved binary DAS used learning rate $10^{-2}$, two restarts and at most 100 epochs.

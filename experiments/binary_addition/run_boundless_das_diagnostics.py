@@ -27,7 +27,7 @@ from experiments.binary_addition.run_progressive_plot import _fit_records_for_ro
 from experiments.binary_addition.sites import FullStateSite
 
 
-RUN_DIR = ROOT / "results" / "7-29 boundless das" / "bdas_seed0_diagnostics"
+RUN_DIR = ROOT / "results" / "versions/v3/historical/mixed/boundless_das" / "bdas_seed0_diagnostics"
 ROWS = ("C1", "C2", "C3")
 SOURCE_POLICY = "structured_26_top3carry_c2x5_c3x7_no_random"
 

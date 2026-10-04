@@ -2,8 +2,8 @@
 
 ## Historical supporting benchmark
 
-The August 3 IOI studies are retained from the earlier revision period. IOI is not
-one of the three main benchmarks in the current ICLR 2027 / arXiv v2 manuscript.
+The IOI studies are retained as version v3. IOI is not
+one of the three main benchmarks in the current version v4 manuscript.
 See [experiment history](../../docs/experiment_history.md) for its result grouping.
 
 This folder implements the Indirect Object Identification causal-variable track

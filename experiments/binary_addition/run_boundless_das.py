@@ -29,7 +29,7 @@ from experiments.binary_addition.run_progressive_plot import _fit_records_for_ro
 from experiments.binary_addition.sites import FullStateSite
 
 
-DEFAULT_RUN_DIR = ROOT / "results" / "7-29 boundless das" / "binary_addition_bdas_h16_10seeds"
+DEFAULT_RUN_DIR = ROOT / "results" / "versions/v3/historical/mixed/boundless_das" / "binary_addition_bdas_h16_10seeds"
 SOURCE_POLICY = "structured_26_top3carry_c2x5_c3x7_no_random"
 
 
@@ -57,7 +57,7 @@ def _checkpoint(seed: int, hidden_size: int) -> Path:
     return (
         ROOT
         / "results"
-        / "7-26 binary addition local baselines"
+        / "versions/v3/historical/binary_addition/binary_addition_local_baselines"
         / "binary_addition_mib_baselines_10seeds"
         / "checkpoints"
         / f"gru_h{hidden_size}_seed{seed}.pt"

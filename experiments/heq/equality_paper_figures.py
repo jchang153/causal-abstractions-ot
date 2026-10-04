@@ -21,8 +21,8 @@ METHOD_ORDER = ("ot", "uot", "das")
 METHOD_LABELS = {"ot": "OT", "uot": "UOT", "das": "DAS"}
 METHOD_COLORS = {"ot": "#59a14f", "uot": "#76b7b2", "das": "#e15759"}
 DEFAULT_STRATEGY_NAME = "shared_balanced_wx_yz_only"
-DEFAULT_STRATEGY_RESULTS = Path("results/20260402_123611_equality_calibration_strategy_sweep/equality_calibration_strategy_sweep.json")
-DEFAULT_EPSILON_RESULTS = Path("results/20260404_173020_equality_clean_epsilon_sweep/equality_clean_epsilon_sweep.json")
+DEFAULT_STRATEGY_RESULTS = Path("results/versions/v1/historical/heq/calibration_strategy_sweep/equality_calibration_strategy_sweep.json")
+DEFAULT_EPSILON_RESULTS = Path("results/versions/v1/historical/heq/epsilon_sweep/equality_clean_epsilon_sweep.json")
 
 
 def load_json(path: Path) -> dict:

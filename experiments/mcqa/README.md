@@ -2,12 +2,12 @@
 
 ## Current paper versus the latest code
 
-The main-table sources are the September 24 full-beta UOT replay and corrected
-Full DAS/PLOT-DAS, plus the September 22 DBM baseline. Five-seed signature and
-matching ablations live in the September 25 supporting studies. The completed
+The main-table sources are the full-beta UOT replay and corrected
+Full DAS/PLOT-DAS, plus the DBM baseline. Five-seed signature and
+matching ablations live in the supporting studies. The completed
 KL Stage-A DAS follow-up is distinct from its retained failed attempts.
 
-Saved September DAS scores use the MIB generated-answer substring relation;
+Saved DAS scores use the MIB generated-answer substring relation;
 current `das.py` selects and scores with strict normalized full-vocabulary top-1
 IIA. Follow [BASELINE_DAS.md](BASELINE_DAS.md) for current-code experiments, and
 [paper provenance](../../docs/experiment_history.md) for frozen historical results.

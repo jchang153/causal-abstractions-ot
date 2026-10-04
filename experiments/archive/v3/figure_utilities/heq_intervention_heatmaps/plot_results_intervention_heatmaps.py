@@ -23,7 +23,7 @@ from experiments.heq.equality_experiment.scm import load_equality_problem
 from pyvene import RotatedSpaceIntervention
 
 
-RESULTS_DIR = Path("results/20260413_220248_equality")
+RESULTS_DIR = Path("results/versions/v1/historical/heq/intervention_heatmaps")
 SEED_RUN_PATH = RESULTS_DIR / "seed_1" / "equality_run_results.json"
 OUTPUT_PATH = RESULTS_DIR / "method_intervention_heatmaps.png"
 

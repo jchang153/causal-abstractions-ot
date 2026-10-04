@@ -1,20 +1,19 @@
 # Experiment catalog
 
-The current manuscript is the ICLR 2027 revision / October 2026 arXiv v2 working
-source. [Paper provenance](../docs/experiment_history.md) identifies the exact
-saved runs behind its tables. A folder's newest file is not proof that its
-results were used in the paper.
+The current paper experiments are version v4. [Paper provenance](../docs/experiment_history.md)
+identifies the exact saved runs behind its tables. Earlier implementations are
+preserved in version folders under `archive/`.
 
 ## Current implementations and paper workflows
 
 | Folder | Role | Entry points and status |
 |---|---|---|
-| [common/](common/) | Shared primitives across submission generations | Runtime, pyvene helpers and variable-width MLP |
-| [heq/](heq/README.md) | Main HEQ benchmark | `heq_rerun/` is the September 24 paper recipe; older `equality_run.py` and epsilon wrappers remain for previous protocols |
+| [common/](common/) | Shared primitives across experiment versions | Runtime, pyvene helpers and variable-width MLP |
+| [heq/](heq/README.md) | Main HEQ benchmark | `heq_rerun/` is the paper recipe; older `equality_run.py` and epsilon wrappers remain for previous protocols |
 | [binary_addition/](binary_addition/README.md) | Main 4-bit recurrent benchmark | `run_staging_suite.py` and `run_staging_comparison.py`: new one-/two-stage direct PLOT; `run_progressive_plot.py`: original DAS source reused in the table |
 | [mcqa/](mcqa/README.md) | Main Gemma-2-2B benchmark and DAS | [BASELINE_DAS.md](mcqa/BASELINE_DAS.md) is the tracked standalone current-code recipe; legacy staged sweeps are retained |
-| [mcqa_staging_budget/](mcqa_staging_budget/README.md) | September paper runs | `run_focused.py`, corrected DAS evaluation, full-beta replay and ablation launch/collect scripts |
-| [ioi/](ioi/README.md) | Earlier supporting benchmark | August 3 GPT-2/MIB runs; not a main experiment in the latest manuscript |
+| [mcqa_staging_budget/](mcqa_staging_budget/README.md) | paper runs | `run_focused.py`, corrected DAS evaluation, full-beta replay and ablation launch/collect scripts |
+| [ioi/](ioi/README.md) | Earlier supporting benchmark | GPT-2/MIB runs; not a main experiment in the latest manuscript |
 
 The standalone MCQA baseline and shared implementations are committed. The
 newer `heq/heq_rerun/` executable package, binary-addition staging runners and
@@ -30,14 +29,14 @@ relative symlinks; imports and historical commands can keep using them.
 
 | Canonical folder | Purpose | Historical association |
 |---|---|---|
-| [archive/early_tasks/binary_addition_c1/](archive/early_tasks/binary_addition_c1/) | Fixed-C1 MLP task | Early task development, not the recurrent main benchmark |
-| [archive/early_tasks/two_digit_addition/](archive/early_tasks/two_digit_addition/) | Decimal-addition implementation/helpers | Early task development; shared by fixed-C1 code |
-| [archive/mcqa_exploration/mcqa_broad_sweep/](archive/mcqa_exploration/mcqa_broad_sweep/) | Earlier broad cluster sweeps | Previous MCQA protocols, including family-weighted selection |
-| [archive/mcqa_exploration/mcqa_block_focus/](archive/mcqa_exploration/mcqa_block_focus/) | Block-focused OT/DAS search | Earlier site/grid exploration |
-| [archive/mcqa_exploration/mcqa_layerwise/](archive/mcqa_exploration/mcqa_layerwise/) | Layerwise OT analysis | Earlier localization exploration |
-| [archive/mcqa_exploration/mcqa_diagnostics/](archive/mcqa_exploration/mcqa_diagnostics/) | Filtering diagnostic notebook | Historical diagnostic, not a paper result source |
-| [archive/demos/notebook_demos/](archive/demos/notebook_demos/) | Original DAS/addition notebooks | Teaching and early explorations |
-| [archive/figure_utilities/heq_intervention_heatmaps/](archive/figure_utilities/heq_intervention_heatmaps/) | Earlier HEQ heatmap utility | Old result layout, not the September rerun figure path |
+| [archive/v1/early_tasks/binary_addition_c1/](archive/v1/early_tasks/binary_addition_c1/) | Fixed-C1 MLP task | Early task development, not the recurrent main benchmark |
+| [archive/v1/early_tasks/two_digit_addition/](archive/v1/early_tasks/two_digit_addition/) | Decimal-addition implementation/helpers | Early task development; shared by fixed-C1 code |
+| [archive/v2/mcqa_exploration/mcqa_broad_sweep/](archive/v2/mcqa_exploration/mcqa_broad_sweep/) | Earlier broad cluster sweeps | Previous MCQA protocols, including family-weighted selection |
+| [archive/v2/mcqa_exploration/mcqa_block_focus/](archive/v2/mcqa_exploration/mcqa_block_focus/) | Block-focused OT/DAS search | Earlier site/grid exploration |
+| [archive/v2/mcqa_exploration/mcqa_layerwise/](archive/v2/mcqa_exploration/mcqa_layerwise/) | Layerwise OT analysis | Earlier localization exploration |
+| [archive/v2/mcqa_exploration/mcqa_diagnostics/](archive/v2/mcqa_exploration/mcqa_diagnostics/) | Filtering diagnostic notebook | Historical diagnostic, not a paper result source |
+| [archive/v1/demos/notebook_demos/](archive/v1/demos/notebook_demos/) | Original DAS/addition notebooks | Teaching and early explorations |
+| [archive/v3/figure_utilities/heq_intervention_heatmaps/](archive/v3/figure_utilities/heq_intervention_heatmaps/) | Earlier HEQ heatmap utility | Old result layout, not the rerun figure path |
 
 Archival scripts preserve their original scientific settings. Their old
 selection objectives may no longer be accepted by the evolving current shared

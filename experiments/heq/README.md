@@ -2,8 +2,7 @@
 
 ## Current paper source
 
-The latest paper comparison uses `heq_rerun/plot_6eps_10seed.py`: the September 24
-stable six-epsilon PLOT rerun, with the saved September 24 DAS runs, over seeds
+The latest paper comparison uses `heq_rerun/plot_6eps_10seed.py`: the stable six-epsilon PLOT rerun, with the saved DAS runs, over seeds
 1-10. The seed-7 handle figure and broad epsilon ablation use the corresponding
 rerun artifacts. See [paper provenance](../../docs/experiment_history.md).
 
